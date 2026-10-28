@@ -28,33 +28,38 @@ from app.services.source_service import SourceService
 SCAN_MAX_TABLES = 20      # 小范围扫描预算
 SCAN_SAMPLE_ROWS = 200    # 画像采样预算
 VALIDATE_CANDIDATES = 5   # 验证候选数预算
-VALIDATE_QUERIES = 30     # 验证总查询预算（每候选 ≤4 条聚合查询）
+VALIDATE_QUERIES = 120    # 验证总 SQL 语句预算（结构核对 information_schema 查询
+                          # 与窗口/JOIN 聚合逐语句计数，含失败尝试）
 WINDOW_ROWS = 200         # 证据窗口
 
 
 def build_connector_factory(settings: Settings):
     def factory(params: dict) -> MySQLConnector:
-        return MySQLConnector(MySQLConnectionConfig(
-            host=params["host"], port=int(params["port"]),
-            database=params["database"], username=params["username"],
-            password=params.get("password") or settings.mysql_password,
-            charset=settings.mysql_charset,
-            connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
-            read_timeout_seconds=settings.mysql_read_timeout_seconds,
-        ))
+        return MySQLConnector(
+            MySQLConnectionConfig(
+                host=params["host"], port=int(params["port"]),
+                database=params["database"], username=params["username"],
+                password=params.get("password") or settings.mysql_password,
+                charset=settings.mysql_charset,
+                connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
+                read_timeout_seconds=settings.mysql_read_timeout_seconds,
+            ),
+            statement_counter=params.get("statement_counter"))
     return factory
 
 
 def build_probe_factory(settings: Settings):
     def factory(params: dict) -> MySQLRelationshipProbe:
-        return MySQLRelationshipProbe(MySQLConnectionConfig(
-            host=params["host"], port=int(params["port"]),
-            database=params["database"], username=params["username"],
-            password=params.get("password") or settings.mysql_password,
-            charset=settings.mysql_charset,
-            connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
-            read_timeout_seconds=settings.mysql_read_timeout_seconds,
-        ))
+        return MySQLRelationshipProbe(
+            MySQLConnectionConfig(
+                host=params["host"], port=int(params["port"]),
+                database=params["database"], username=params["username"],
+                password=params.get("password") or settings.mysql_password,
+                charset=settings.mysql_charset,
+                connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
+                read_timeout_seconds=settings.mysql_read_timeout_seconds,
+            ),
+            statement_counter=params.get("statement_counter"))
     return factory
 
 
@@ -68,8 +73,8 @@ def main() -> None:
         try:
             print("== M3 真实只读验证演示（临时元数据/凭证目录）==")
             print(f"预算：扫描 ≤{SCAN_MAX_TABLES} 表 × 采样 {SCAN_SAMPLE_ROWS} 行；"
-                  f"验证 ≤{VALIDATE_CANDIDATES} 候选 × ≤{VALIDATE_QUERIES} 条聚合查询"
-                  f"（窗口 {WINDOW_ROWS} 行）\n")
+                  f"验证 ≤{VALIDATE_CANDIDATES} 候选 × ≤{VALIDATE_QUERIES} 条 SQL 语句"
+                  f"（结构核对+聚合逐语句计数；窗口 {WINDOW_ROWS} 行；并发额度=进程内共享）\n")
 
             # 1) 注册默认源（DATA_MYSQL_*）并做小范围只读扫描
             source_service = SourceService(
@@ -115,7 +120,7 @@ def main() -> None:
                   f"needs_review={validation['candidates_needs_review']} "
                   f"stale={validation['candidates_stale_marked']} "
                   f"skipped={validation['candidates_skipped']} "
-                  f"queries={validation['queries_used']}")
+                  f"sql_statements={validation['queries_used']}")
             for result in validation["results"]:
                 print(f"    - {result['relationship_key'][:12]} → {result['status']}"
                       f"｜阻断：{result.get('blocking') or '无'}")

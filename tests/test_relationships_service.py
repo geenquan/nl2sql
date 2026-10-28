@@ -67,10 +67,15 @@ def _service(env, *, rows=None, catalog=None, alter_table=None,
     catalog = catalog or env["catalog"]
 
     def connector_factory(params):
-        return FakeM3Connector(catalog, alter_table=alter_table)
+        return FakeM3Connector(catalog, alter_table=alter_table,
+                               statement_counter=params.get("statement_counter"))
 
     def probe_factory(params):
-        return probe if probe is not None else FakeRelationshipProbe(rows)
+        if probe is not None:
+            probe._counter = params.get("statement_counter")
+            return probe
+        return FakeRelationshipProbe(rows,
+                                     statement_counter=params.get("statement_counter"))
 
     return RelationshipService(
         metadata_repository=repo or env["repo"],
@@ -142,14 +147,17 @@ class TestDiscovery:
                      started_at="2026-10-28T01:00:00+00:00")
         seed_profiles(env["repo"], catalog2)
         run2 = service.discover_relationships(env["source_id"])
-        assert run2["stale_marked"] >= 1  # booking.guest_id 等旧证据转 stale
-        effective = {
-            r["relationship_key"]: r
-            for r in env["repo"].list_relationships(env["source_id"])
-        }
-        stale = [r for r in effective.values() if r["status"] == "stale"]
+        assert run2["stale_marked"] >= 1  # booking.guest_id 等旧证据在其旧链转 stale
+        # 旧链 stale（快照先行：旧链按快照查询，不遮挡新快照候选）
+        old_chain = service.list_relationships(env["source_id"], snapshot_id="snap-m3")
+        stale = [r for r in old_chain if r["status"] == "stale"]
         assert any(r["source_table"] == "booking" and r["source_columns"] == ["guest_id"]
                    for r in stale)
+        # 新快照链不受旧 stale 遮挡：默认列表（=发布快照 snap-2）可见新候选
+        published = service.list_relationships(env["source_id"])
+        assert all(r["status"] != "stale" for r in published)
+        assert any(r["source_table"] == "booking" and r["source_columns"] == ["guest_id"]
+                   for r in published)
 
     def test_missing_table_in_complete_new_snapshot_marks_stale(self, env):
         service = _service(env, settings=_settings(
@@ -205,7 +213,7 @@ class TestValidation:
         run = service.validate_batch(env["source_id"], limit=12)
         assert run["status"] in ("succeeded", "partial")
         assert run["candidates_validated"] >= 7
-        assert run["queries_used"] > 0 and run["queries_used"] <= run["budget"]["max_queries"]
+        assert run["queries_used"] > 0 and run["queries_used"] <= run["budget"]["max_sql_statements"]
         validated = service.list_relationships(env["source_id"], status="validated")
         pairs = {(r["source_table"], tuple(r["source_columns"]),
                   r["target_table"]) for r in validated}
@@ -427,12 +435,22 @@ class TestStaleAndRevalidate:
         assert effective["status"] == "validated"
         assert effective["evidence"] is not None
 
-    def test_revalidate_requires_stale(self, env):
+    def test_revalidate_requires_stale_or_validatable(self, env):
         service = _service(env)
         service.discover_relationships(env["source_id"])
-        record = service.list_relationships(env["source_id"])[0]
-        with pytest.raises(ValueError, match="stale"):
+        service.validate_batch(env["source_id"], limit=10)
+        # validated 链不可直接重验（需先 revert 或标记 stale）
+        record = next(
+            r for r in service.list_relationships(env["source_id"], status="validated")
+            if r["source_columns"] == ["guest_id"])
+        with pytest.raises(ValueError, match="不可重验"):
             service.revalidate(env["source_id"], record["relationship_key"])
+        # candidate 链（目标快照内）可重验（等同于验证）
+        candidate = next(
+            r for r in service.list_relationships(env["source_id"])
+            if r["status"] == "candidate")
+        run = service.revalidate(env["source_id"], candidate["relationship_key"])
+        assert run["run_type"] == "validation"
 
     def test_paths_exclude_stale_edges(self, env):
         service = _service(env)

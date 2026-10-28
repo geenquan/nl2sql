@@ -201,12 +201,12 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 | `RELATIONSHIP_TOPK_PER_FIELD` | `5`，每个引用方列最多保留的 Top-K 目标（防同名泛配对） |
 | `RELATIONSHIP_DISCOVERY_DEADLINE_SECONDS` | `60`，召回处理期限（纯本地元数据计算） |
 | `RELATIONSHIP_VALIDATION_MAX_CANDIDATES` | `10`，单次验证最多处理的候选数 |
-| `RELATIONSHIP_VALIDATION_MAX_QUERIES` | `120`，单次验证总查询数预算（所有候选共享，不嵌套放大） |
+| `RELATIONSHIP_VALIDATION_MAX_QUERIES` | `120`，单次验证**总 SQL 语句数**预算（结构核对 information_schema 查询与窗口/JOIN 聚合逐语句计数，含失败尝试；所有候选共享，不嵌套放大；操作组开始前按估计下界准入） |
 | `RELATIONSHIP_QUERY_TIMEOUT_MS` | `15000`，单条聚合查询期限提示（毫秒） |
 | `RELATIONSHIP_VALIDATION_DEADLINE_SECONDS` | `300`，单次验证运行总期限（单调时钟贯穿） |
 | `RELATIONSHIP_SAMPLE_WINDOW_ROWS` | `500`，证据采样窗口行数（窗口未截断才记 exact 口径） |
 | `RELATIONSHIP_EXACT_MAX_ROWS` | `50000`，成本门槛：右端行数估计超此值且连接列无索引时拒绝 JOIN 探测（降级 unknown） |
-| `RELATIONSHIP_MAX_CONCURRENT_VALIDATIONS` | `1`，并发验证上限（当前实现串行执行=1，由执行模型直接保证；配置保留用于未来并行化） |
+| `RELATIONSHIP_MAX_CONCURRENT_VALIDATIONS` | `1`，并发验证上限（**进程内共享信号量**：同一 Python 进程所有服务实例共用，额度覆盖打开连接/结构核对/探查全程，等待受运行期限约束；**单进程语义**——多 worker/多进程部署各自独立，不构成跨进程全局保证） |
 | `RELATIONSHIP_COVERAGE_THRESHOLD` | `0.995`，自动 validated 的前向覆盖率阈值（exact 口径；仅高覆盖率不能单独升级） |
 | `RELATIONSHIP_PATH_MAX_HOPS` / `_MAX_PATHS` / `_MAX_NODES` / `_DEADLINE_SECONDS` | `3` / `5` / `200` / `10`，路径搜索预算（默认仅 validated 非 stale 边） |
 
@@ -223,8 +223,21 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
   （MySQL ≥5.7.8 顶层 SELECT 生效；MariaDB 不支持该提示，未知提示被忽略并
   回退为客户端 read_timeout——支持范围以此为准，不宣称所有版本都有服务端期限）。
 - **口径与门槛**：窗口行数 < `RELATIONSHIP_SAMPLE_WINDOW_ROWS`（未截断）记
-  `exact`，达到上限记 `sample`；成本门槛/预算耗尽记 `unknown`（gated 附原因）。
-  `sample` 口径不能自动升级 validated（策略要求 exact 前向覆盖达标）。
+  `exact`，达到上限记 `sample`；预算/期限耗尽记 `unknown`（gated 附原因）。
+  `sample` 口径与超期证据（deadline_exceeded）都不能自动升级 validated（策略
+  要求 exact 前向覆盖达标且期限内完成）。
+- **JOIN 匹配规模控制**：完整右表 JOIN 仅当右端连接键**结构唯一**（主键/唯一索引
+  恰为连接列，按序前导可用，每左行 ≤1 次索引定位）；其余（非唯一右键/组合索引缺
+  前导列/无索引/行数未知或低估或超大）一律**双侧有界窗口 JOIN**（各 ≤W 行、中间
+  结果 ≤W×W 对，受控计数，口径降级 sample）。**不以行数估计作为完整表 JOIN 的
+  安全依据**（InnoDB 估计是优化器近似值且可能低估）。
+- **跨快照语义**：同一逻辑关系在不同快照是独立证据链；查询先限定快照再链内
+  解析有效修订（默认当前发布快照，`?snapshot_id=` 显式查询历史链；旧链 stale/
+  人工结论不遮挡新链候选也不被继承）；重验明确目标快照并重新解析两端完整标识
+  （表/字段消失报不可重验）；expected_revision 按目标快照链校验。
+- **MariaDB 说明**：`MAX_EXECUTION_TIME` 提示仅 MySQL ≥5.7.8 顶层 SELECT 生效；
+  MariaDB 忽略该提示，回退**客户端 read_timeout——是放弃读取，不等于服务端取消
+  语句**（服务端可能继续执行至完成）。
 - **元数据存储**：`relationships` / `relationship_runs` 两表随仓储 `create_all`
   追加建表（兼容既有数据库，不删除/不重建用户已有表）。
 - **真实只读演示**：`python scripts/m3_real_validation.py`——元数据/凭证写

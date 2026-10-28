@@ -158,16 +158,22 @@ class TestPlaceholderAndEmpty:
 
 
 class TestCostGateAndBudget:
-    def test_large_unindexed_right_table_gated(self):
+    def test_large_unindexed_right_table_uses_bounded_window_join(self):
         tables = _catalog_by_name()
-        # 目标表无主键/无索引且行数估计超门槛 → JOIN 降级 unknown
+        # 目标表无主键/无索引（连接键结构不唯一）：行数估计再大也不做完整表
+        # JOIN → 双侧有界窗口（受控计数），不依赖行数估计作安全依据
         tables["guest"]["row_count_estimate"] = 100000
         tables["guest"]["primary_key"] = []
         tables["guest"]["indexes"] = []
         record = _record_for("booking", "guest_id", "guest", "id")
-        evidence, _, _ = _collect(record, tables=tables)
-        assert evidence["coverage"]["forward"]["basis"] == "unknown"
-        assert any("cost_gate" in g["reason"] for g in evidence["gated"])
+        evidence, _, probe = _collect(record, tables=tables)
+        forward = evidence["coverage"]["forward"]
+        assert forward["right_mode"] == "windowed"
+        assert forward["method"] == "bounded_window_join_aggregate"
+        assert "W×W" in forward["note"]
+        # 右端请求确实带了有界窗口限制
+        join_request = probe.join_requests[-1] if hasattr(probe, "join_requests") else None
+        del join_request
 
     def test_query_budget_exhaustion_gates_metrics(self):
         evidence, collector, _ = _collect(
@@ -184,14 +190,15 @@ class TestCostGateAndBudget:
         assert evidence["source_side"]["basis"] == "unknown"
         assert evidence["coverage"]["forward"]["basis"] == "unknown"
 
-    def test_row_count_unknown_without_index_gated(self):
+    def test_row_count_unknown_still_bounded(self):
         tables = _catalog_by_name()
+        # 行数估计缺失（不能作为安全依据）：无主键/无索引 → 有界窗口而非完整 JOIN
         tables["guest"]["row_count_estimate"] = None
         tables["guest"]["primary_key"] = []
         tables["guest"]["indexes"] = []
         evidence, _, _ = _collect(
             _record_for("booking", "guest_id", "guest", "id"), tables=tables)
-        assert any("row_count_unknown" in g["reason"] for g in evidence["gated"])
+        assert evidence["coverage"]["forward"]["right_mode"] == "windowed"
 
 
 class TestStructureCheck:

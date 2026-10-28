@@ -52,27 +52,31 @@ def workspace(tmp_path: Path):
 
 def _connector_factory(settings: Settings):
     def factory(params: dict) -> MySQLConnector:
-        return MySQLConnector(MySQLConnectionConfig(
-            host=params["host"], port=int(params["port"]),
-            database=params["database"], username=params["username"],
-            password=params.get("password") or settings.mysql_password,
-            charset=settings.mysql_charset,
-            connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
-            read_timeout_seconds=settings.mysql_read_timeout_seconds,
-        ))
+        return MySQLConnector(
+            MySQLConnectionConfig(
+                host=params["host"], port=int(params["port"]),
+                database=params["database"], username=params["username"],
+                password=params.get("password") or settings.mysql_password,
+                charset=settings.mysql_charset,
+                connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
+                read_timeout_seconds=settings.mysql_read_timeout_seconds,
+            ),
+            statement_counter=params.get("statement_counter"))
     return factory
 
 
 def _probe_factory(settings: Settings):
     def factory(params: dict) -> MySQLRelationshipProbe:
-        return MySQLRelationshipProbe(MySQLConnectionConfig(
-            host=params["host"], port=int(params["port"]),
-            database=params["database"], username=params["username"],
-            password=params.get("password") or settings.mysql_password,
-            charset=settings.mysql_charset,
-            connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
-            read_timeout_seconds=settings.mysql_read_timeout_seconds,
-        ))
+        return MySQLRelationshipProbe(
+            MySQLConnectionConfig(
+                host=params["host"], port=int(params["port"]),
+                database=params["database"], username=params["username"],
+                password=params.get("password") or settings.mysql_password,
+                charset=settings.mysql_charset,
+                connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
+                read_timeout_seconds=settings.mysql_read_timeout_seconds,
+            ),
+            statement_counter=params.get("statement_counter"))
     return factory
 
 
@@ -169,7 +173,8 @@ def test_discover_and_validate_on_real_catalog(
         settings=Settings(
             _env_file=None,
             relationship_validation_max_candidates=3,
-            relationship_validation_max_queries=15,
+            # 预算口径=实际 SQL 语句数（结构核对 information_schema 查询计入）
+            relationship_validation_max_queries=60,
             relationship_sample_window_rows=100,
         ),
     )
@@ -183,7 +188,7 @@ def test_discover_and_validate_on_real_catalog(
     validation = relationship_service.validate_batch(
         source_id, limit=3, allow_partial=allow_partial)
     assert validation["status"] in ("succeeded", "partial")
-    assert validation["queries_used"] <= validation["budget"]["max_queries"]
+    assert validation["queries_used"] <= validation["budget"]["max_sql_statements"]
     # 状态只允许候选/已验证/待审核之一——不为演示降低门槛
     for result in validation["results"]:
         assert result["status"] in ("validated", "needs_review")
@@ -200,4 +205,52 @@ def test_discover_and_validate_on_real_catalog(
         assert "password" not in payload.lower() or "user_password" in payload
         if record.get("evidence"):
             for query in record["evidence"]["queries"]:
-                assert set(query) <= {"template", "table", "elapsed_ms", "timeout_ms"}
+                assert set(query) <= {"template", "table", "elapsed_ms", "sql_statements"}
+                assert query["sql_statements"] >= 1  # 实际语句计数（含结构核对）
+
+
+def test_native_multi_column_distinct_avoids_separator_collision(
+    settings: Settings,
+) -> None:
+    """真实 MySQL 语义验证（只读常量 SELECT，不建表/不读业务数据）：
+    值包含 CHAR(31) 时 CONCAT_WS 拼接去重会碰撞（旧缺陷，已复现=1）；
+    原生多列 COUNT(DISTINCT a, b) 按元组比较（=2）。"""
+    from sqlalchemy import text
+
+    connector = MySQLConnector(MySQLConnectionConfig(
+        host=settings.mysql_host, port=settings.mysql_port,
+        database=settings.mysql_database, username=settings.mysql_username,
+        password=settings.mysql_password, charset=settings.mysql_charset,
+        connect_timeout_seconds=settings.mysql_connect_timeout_seconds,
+        read_timeout_seconds=settings.mysql_read_timeout_seconds,
+    ))
+    try:
+        with connector.engine.connect() as connection:
+            row = connection.execute(text(
+                # 两个不同元组：('a', 'b<US>c') 与 ('a<US>b', 'c')
+                # CONCAT_WS(CHAR(31), ...) 后同为 'a<US>b<US>c' → 碰撞
+                "SELECT "
+                "COUNT(DISTINCT w.c1, w.c2) AS native_cnt, "
+                "COUNT(DISTINCT CONCAT_WS(CHAR(31), w.c1, w.c2)) AS concat_cnt "
+                "FROM (SELECT 'a' AS c1, CONCAT('b', CHAR(31), 'c') AS c2 "
+                "      UNION ALL "
+                "      SELECT CONCAT('a', CHAR(31), 'b'), 'c') AS w"
+            )).mappings().first()
+            assert int(row["native_cnt"]) == 2  # 新方案：元组语义，无碰撞
+            assert int(row["concat_cnt"]) == 1  # 旧方案确实碰撞（缺陷复现）
+
+            # NULL / 空串 / 数字与字符串：多列 DISTINCT 语义核对
+            row2 = connection.execute(text(
+                "SELECT COUNT(DISTINCT w.c1, w.c2) AS cnt FROM ("
+                "SELECT NULL AS c1, 'x' AS c2 UNION ALL "   # NULL 行排除
+                "SELECT NULL, 'y' UNION ALL "
+                "SELECT 'x', '' UNION ALL "                  # 空串是值
+                "SELECT 'x', ' ' UNION ALL "
+                "SELECT 1, 'a' UNION ALL "                   # 数字与字符串 typed 区分
+                "SELECT '1', 'a') AS w"
+            )).mappings().first()
+            # ('x','')/('x',' ')/(1 或 '1','a')：MySQL 常量混合类型比较会合并
+            # 1 与 '1'（真实查询中同列类型一致，不触发该合并）
+            assert int(row2["cnt"]) == 3
+    finally:
+        connector.close()

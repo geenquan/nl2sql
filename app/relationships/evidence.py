@@ -48,7 +48,14 @@ def _now_iso() -> str:
 
 @dataclass
 class ValidationBudget:
-    """整次验证共享的预算（查询数/期限/窗口/成本门槛；不嵌套放大）。"""
+    """整次验证共享的预算（SQL 语句数/期限/窗口/成本门槛；不嵌套放大）。
+
+    修复轮口径：max_queries 计**实际执行的 SQL 语句数**（结构核对的
+    information_schema 查询、窗口与 JOIN 聚合都逐语句计数；一次包含多条
+    SQL 的方法调用不得记为 1）。check_group(estimated) 在每个操作组开始前
+    用下界估计做准入（剩余不足即不启动该组，避免"最后一组"超发），
+    完成后按实际语句数核销（可能高于估计，如实记录）。
+    """
 
     max_queries: int
     per_query_timeout_ms: int
@@ -56,6 +63,26 @@ class ValidationBudget:
     sample_window_rows: int
     exact_max_rows: int
     clock: Callable[[], float] = _time.monotonic  # 直接以函数为默认值（可注入）
+    counter: Any = None  # StatementCounter；None 时回退内部计数（按探查调用 1 条/次）
+
+    def __post_init__(self) -> None:
+        self._fallback_statements = 0
+
+    def statements_used(self) -> int:
+        return self.counter.count if self.counter is not None else self._fallback_statements
+
+    def note_statements(self, count: int) -> None:
+        """无 counter 时的回退核销（每次探查调用按 1 条语句计）。"""
+        if self.counter is None:
+            self._fallback_statements += count
+
+    def exhausted(self) -> bool:
+        return self.statements_used() >= self.max_queries
+
+    def check_group(self, estimated_statements: int) -> bool:
+        """操作组准入：未超期且剩余语句预算 ≥ 估计下界。"""
+        return (not self.expired()
+                and self.statements_used() + estimated_statements <= self.max_queries)
 
     def remaining_ms(self) -> int:
         if self.deadline_monotonic is None:
@@ -71,11 +98,38 @@ class ValidationBudget:
 
 
 class EvidenceCollector:
-    """对选定候选执行有界只读证据采集（探查端口，无任意 SQL）。"""
+    """对选定候选执行有界只读证据采集（探查端口，无任意 SQL）。
 
-    def __init__(self, probe: RelationshipProbe) -> None:
+    修复轮：每个操作组前做预算准入（check_group），执行后按实际 SQL 语句
+    数核销（counter 计数，失败尝试同样计入）；每条查询返回后检查期限，
+    超期即停止后续采集并标记 evidence["deadline_exceeded"]（超期证据不得
+    升级 validated，由 decide_status 阻断）。
+    """
+
+    def __init__(self, probe: RelationshipProbe, counter: Any = None) -> None:
         self.probe = probe
-        self.queries_used = 0
+        self.counter = counter
+        self.queries_used = 0  # 探查调用数（兼容记录；预算按 SQL 语句数）
+        self._budget: ValidationBudget | None = None
+
+    def _gate_budget(self, evidence: dict[str, Any], metric: str,
+                     estimated: int = 1) -> bool:
+        """操作组准入；不足或超期时记 gated 并返回 False。"""
+        if self._budget is None:
+            return True
+        if self._budget.expired():
+            evidence["gated"].append({"metric": metric, "reason": "budget:deadline_exceeded"})
+            evidence["deadline_exceeded"] = True
+            return False
+        if not self._budget.check_group(estimated):
+            evidence["gated"].append({
+                "metric": metric,
+                "reason": "budget:sql_statements_exhausted"
+                f"（已用 {self._budget.statements_used()}"
+                f"/{self._budget.max_queries}，组估计 ≥{estimated}）",
+            })
+            return False
+        return True
 
     # -- 结构一致性（快照 vs 源库） ---------------------------------------------
 
@@ -117,6 +171,7 @@ class EvidenceCollector:
         budget: ValidationBudget,
     ) -> dict[str, Any]:
         """采集一个候选的全部指标；预算/期限耗尽的指标记 gated（unknown）。"""
+        self._budget = budget
         source_columns = list(record["source_columns"])
         target_columns = list(record["target_columns"])
         evidence: dict[str, Any] = {
@@ -125,6 +180,7 @@ class EvidenceCollector:
             "policy_version": VALIDATION_POLICY_VERSION,
             "queries": [],
             "gated": [],
+            "deadline_exceeded": False,
             "notes": [PLACEHOLDER_NOTE],
         }
 
@@ -146,10 +202,11 @@ class EvidenceCollector:
         # 2) 双向 JOIN 覆盖（前向 A→B；反向 B→A，方向不混淆）
         forward = self._join_coverage(
             source_table, source_columns, source_strings, source_window,
-            target_table, target_columns, budget, evidence)
+            target_table, target_columns, target_window, budget, evidence)
         backward = self._join_coverage(
             target_table, target_columns, target_strings, target_window,
-            source_table, source_columns, budget, evidence, reverse=True)
+            source_table, source_columns, source_window, budget, evidence,
+            reverse=True)
         evidence["coverage"] = {"forward": forward, "backward": backward}
 
         # 3) 唯一性与基数观察（结构唯一性由服务层按快照元数据计算后传入）
@@ -179,6 +236,41 @@ class EvidenceCollector:
                     "唯一性口径需人工复核")
         return evidence
 
+    # -- 内部：预算化执行 ---------------------------------------------------------
+
+    def _run_query(
+        self,
+        evidence: dict[str, Any],
+        template: str,
+        table: dict[str, Any],
+        budget: ValidationBudget,
+        call: Callable[[], Any],
+    ) -> Any | None:
+        """执行一个探查调用：组准入 → 计数测量 → 返回后期限检查。
+
+        counter 存在时按实际 SQL 语句数核销（语句发出即计数，失败尝试同样
+        计入）；返回后若已超期，标记 deadline_exceeded 并返回 None（调用方
+        不再使用该结果且后续指标全部 gated）。
+        """
+        before = self.counter.count if self.counter is not None else None
+        started = budget.clock()
+        try:
+            result = call()
+        finally:
+            self.queries_used += 1
+        elapsed_ms = int((budget.clock() - started) * 1000)
+        if self.counter is not None and before is not None:
+            statements = self.counter.count - before
+        else:
+            statements = 1
+            budget.note_statements(1)  # 无计数器回退：探查调用按 1 条语句核销
+        evidence["queries"].append(self._query_log(
+            template, table, elapsed_ms, statements))
+        if budget.expired():
+            # 查询返回后检查：超期结果不得用于自动升级 validated
+            evidence["deadline_exceeded"] = True
+        return result
+
     # -- 内部：单侧窗口 -----------------------------------------------------------
 
     def _window(
@@ -189,9 +281,7 @@ class EvidenceCollector:
         budget: ValidationBudget,
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
-        if budget.expired() or self.queries_used >= budget.max_queries:
-            evidence["gated"].append(
-                {"metric": f"window:{table['table_name']}", "reason": "budget"})
+        if not self._gate_budget(evidence, f"window:{table['table_name']}"):
             return {"basis": "unknown", "gated": "budget"}
         pk = tuple(table.get("primary_key") or [])
         request = WindowMetricsRequest(
@@ -203,14 +293,11 @@ class EvidenceCollector:
             string_columns=string_columns,
             timeout_ms=budget.remaining_ms(),
         )
-        started = budget.clock()
-        try:
-            result = self.probe.window_metrics(request)
-        finally:
-            self.queries_used += 1
-        elapsed_ms = int((budget.clock() - started) * 1000)
-        evidence["queries"].append(self._query_log(
-            "window_metrics", table, elapsed_ms, request.timeout_ms))
+        result = self._run_query(
+            evidence, "window_metrics", table, budget,
+            lambda: self.probe.window_metrics(request))
+        if result is None:
+            return {"basis": "unknown", "gated": "deadline_exceeded_after_query"}
         basis = "sample" if result.truncated else "exact"
         meaningful = max(result.non_null_rows - result.empty_string_rows, 0)
         return {
@@ -241,25 +328,41 @@ class EvidenceCollector:
         left_window: dict[str, Any],
         right_table: dict[str, Any],
         right_columns: list[str],
+        right_window: dict[str, Any],
         budget: ValidationBudget,
         evidence: dict[str, Any],
         *,
         reverse: bool = False,
     ) -> dict[str, Any]:
         direction = "backward" if reverse else "forward"
-        if budget.expired() or self.queries_used >= budget.max_queries:
-            evidence["gated"].append(
-                {"metric": f"join.{direction}", "reason": "budget"})
+        if not self._gate_budget(evidence, f"join.{direction}"):
             return {"basis": "unknown", "gated": "budget"}
-        # 成本门槛：右端大表且连接列无索引 → 降级 unknown（不偷偷全表 JOIN）
-        gate_reason = self._join_cost_gate(right_table, right_columns, budget)
-        if gate_reason:
+        # 成本门槛：决定右端模式（full：完整表受控 / windowed：双侧有界窗口 /
+        # gated：拒绝执行降级 unknown）
+        mode, gate_reason = self._join_cost_mode(right_table, right_columns, budget)
+        if mode is None:
             evidence["gated"].append(
-                {"metric": f"join.{direction}", "reason": gate_reason})
+                {"metric": f"join.{direction}", "reason": gate_reason or ""})
             return {"basis": "unknown", "gated": gate_reason}
         left_pk = tuple(left_table.get("primary_key") or [])
         right_pk = list(right_table.get("primary_key") or [])
         right_presence = right_pk[0] if right_pk else right_columns[0]
+        request_kwargs: dict[str, Any] = {}
+        method = "bounded_left_window_left_join_aggregate"
+        basis = left_window.get("basis", "unknown")
+        notes = ["NULL 键不匹配且不入分母；空串匹配已从有意义匹配中扣除"]
+        if mode == "windowed":
+            request_kwargs = {
+                "right_order_by": tuple(right_pk),
+                "right_limit": budget.sample_window_rows,
+            }
+            method = "bounded_window_join_aggregate"
+            notes.append(
+                "右端键非唯一（展开量不可控）：改为双侧有界窗口 JOIN"
+                f"（各 ≤{budget.sample_window_rows} 行，中间结果 ≤W×W 对）；"
+                "右端窗口截断时未匹配可能来自窗口缺失，口径降级 sample")
+            if right_window.get("truncated"):
+                basis = "sample"  # 右窗未覆盖整表：覆盖结论只能是样本口径
         request = JoinMetricsRequest(
             left_schema=left_table["schema_name"],
             left_table=left_table["table_name"],
@@ -272,15 +375,13 @@ class EvidenceCollector:
             right_presence_column=right_presence,
             string_join_columns=left_strings,
             timeout_ms=budget.remaining_ms(),
+            **request_kwargs,
         )
-        started = budget.clock()
-        try:
-            result = self.probe.join_metrics(request)
-        finally:
-            self.queries_used += 1
-        elapsed_ms = int((budget.clock() - started) * 1000)
-        evidence["queries"].append(self._query_log(
-            f"join_metrics:{direction}", left_table, elapsed_ms, request.timeout_ms))
+        result = self._run_query(
+            evidence, f"join_metrics:{direction}:{mode}", left_table, budget,
+            lambda: self.probe.join_metrics(request))
+        if result is None:
+            return {"basis": "unknown", "gated": "deadline_exceeded_after_query"}
 
         # 分母=左窗非空键行数（NULL 键行排除在覆盖率之外并单独报告）；
         # 探查的 unmatched 含 NULL 键行，需扣除窗口口径的 NULL 行数
@@ -309,9 +410,9 @@ class EvidenceCollector:
             if matched_rows is not None else None)
         ratio = (meaningful_matched / denominator) if denominator else None
         fanout = (inner_join_rows / matched_rows) if matched_rows else None
-        basis = left_window.get("basis", "unknown")
         return {
             "direction": f"{left_table['table_name']}→{right_table['table_name']}",
+            "right_mode": mode,
             "denominator": denominator,
             "denominator_note": "左窗非空键行数（NULL 键行不计入覆盖率分母）",
             "matched": meaningful_matched,
@@ -323,36 +424,56 @@ class EvidenceCollector:
             "ratio": round(ratio, 6) if ratio is not None else None,
             "basis": basis,
             "truncated": left_window.get("truncated"),
+            "right_truncated": (right_window.get("truncated")
+                                if mode == "windowed" else False),
             "inner_join_rows": inner_join_rows,
             "fanout_ratio": round(fanout, 6) if fanout is not None else None,
             "distinct_right_matched": result.distinct_right_matched,
-            "method": "bounded_left_window_left_join_aggregate",
-            "note": "NULL 键不匹配且不入分母；空串匹配已从有意义匹配中扣除",
+            "method": method,
+            "note": "；".join(notes),
         }
 
     # -- 内部：工具 -------------------------------------------------------------
 
-    def _join_cost_gate(
+    @staticmethod
+    def _leading_prefix(columns: list[str], index_columns: list[str]) -> bool:
+        """连接列必须构成索引的**前导列前缀**（按序），集合包含不算可用。"""
+        return list(index_columns[:len(columns)]) == list(columns)
+
+    def _join_cost_mode(
         self,
         right_table: dict[str, Any],
         right_columns: list[str],
         budget: ValidationBudget,
-    ) -> str | None:
-        """右端探测成本门槛：大表且无覆盖索引 → 拒绝 JOIN，降级 unknown。"""
-        right_set = set(right_columns)
-        indexed = right_set.issubset(set(right_table.get("primary_key") or [])) or any(
-            right_set.issubset(set(idx.get("columns") or []))
-            for idx in (right_table.get("indexes") or [])
+    ) -> tuple[str | None, str | None]:
+        """右端 JOIN 模式判定（修复轮：前导索引 + 右端键唯一性 + 受控计数）。
+
+        返回 ("full", None)：**仅当**右端连接键结构唯一（主键/唯一索引恰为
+        连接列，按序）——该约束本身自带可用前导索引，每个左窗行经索引定位
+        匹配 ≤1 行，完整右表探测成本受控；
+        ("windowed", None)：其余一切情形（右端键非唯一、组合索引缺前导列、
+        无索引、行数未知/低估/超大）→ 双侧有界窗口 JOIN（各 ≤W 行，中间
+        结果 ≤W×W 对，受控计数，口径降级 sample）。**不使用行数估计作为
+        完整表 JOIN 的安全依据**（估计是优化器近似值且可能低估，不是硬
+        上限）；估计只作为证据字段如实记录；
+        (None, reason)：保留降级出口（当前唯一触发：预算/期限，由调用方
+        在进入本方法前处理；此返回值供未来策略扩展）。
+        """
+        pk = list(right_table.get("primary_key") or [])
+        right = list(right_columns)
+        structurally_unique = (
+            pk == right
+            or any(idx.get("unique") and list(idx.get("columns") or []) == right
+                   for idx in (right_table.get("indexes") or []))
         )
-        estimate = right_table.get("row_count_estimate")
-        if estimate is None:
-            return None if indexed else "cost_gate:row_count_unknown(且连接列无索引)"
-        if estimate > budget.exact_max_rows and not indexed:
-            return (
-                f"cost_gate:right_table_too_large(row_estimate={estimate}"
-                f">{budget.exact_max_rows} 且连接列无索引)"
-            )
-        return None
+        if structurally_unique and (
+            self._leading_prefix(right, pk)
+            or any(self._leading_prefix(right, list(idx.get("columns") or []))
+                   for idx in (right_table.get("indexes") or []))
+        ):
+            return "full", None
+        del budget  # 行数估计不参与 JOIN 安全判定（只记录在证据中）
+        return "windowed", None
 
     @staticmethod
     def _column_types(table: dict[str, Any]) -> dict[str, str]:
@@ -441,13 +562,13 @@ class EvidenceCollector:
 
     @staticmethod
     def _query_log(
-        template: str, table: dict[str, Any], elapsed_ms: int, timeout_ms: int
+        template: str, table: dict[str, Any], elapsed_ms: int, statements: int
     ) -> dict[str, Any]:
         return {
             "template": template,  # SQL 模板名；不保存 SQL 文本与业务参数值
             "table": f"{table['schema_name']}.{table['table_name']}",
             "elapsed_ms": elapsed_ms,
-            "timeout_ms": timeout_ms,
+            "sql_statements": statements,  # 该操作实际执行的语句数（含失败尝试）
         }
 
 
@@ -466,6 +587,11 @@ def decide_status(
     不修改 record。任何单项不满足都阻断自动 validated（宁可待审核）。
     """
     blocking: list[str] = []
+
+    if evidence.get("deadline_exceeded"):
+        blocking.append(
+            "deadline_exceeded:证据采集期间或之后超过运行期限，"
+            "超期证据不得自动升级 validated（重跑验证获取新鲜证据）")
 
     type_verdict = record.get("type_verdict", "unknown")
     if type_verdict != "compatible":

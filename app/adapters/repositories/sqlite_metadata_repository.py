@@ -804,15 +804,27 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
         conn: Any,
     ) -> int:
         key = record["relationship_key"]
-        current = conn.execute(
+        # 修订号全局单调（唯一约束 relationship_key+revision 仲裁跨快照并发）；
+        # expected_revision 的过期校验限定在**目标快照链内**（同一逻辑关系
+        # 的不同快照是独立证据链，他快照的写入不构成本链的版本冲突）。
+        global_current = conn.execute(
             select(func.max(self._relationships.c.revision)).where(
                 self._relationships.c.relationship_key == key
             )
         ).scalar()
-        if expected_revision is not None and (current or 0) != expected_revision:
-            raise RevisionConflictError(
-                f"修订冲突：最新修订为 {current or 0}，提交基于 {expected_revision}")
-        revision = (current or 0) + 1
+        snapshot_id = record.get("snapshot_id")
+        if expected_revision is not None:
+            chain_current = conn.execute(
+                select(func.max(self._relationships.c.revision)).where(
+                    self._relationships.c.relationship_key == key,
+                    self._relationships.c.snapshot_id == snapshot_id,
+                )
+            ).scalar()
+            if (chain_current or 0) != expected_revision:
+                raise RevisionConflictError(
+                    f"修订冲突：该快照链最新修订为 {chain_current or 0}，"
+                    f"提交基于 {expected_revision}")
+        revision = (global_current or 0) + 1
         row = {**record, "revision": revision}
         try:
             conn.execute(
@@ -820,7 +832,7 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
                     id=_new_id(),
                     relationship_key=key,
                     source_id=row["source_id"],
-                    snapshot_id=row.get("snapshot_id"),
+                    snapshot_id=snapshot_id,
                     status=row.get("status", "candidate"),
                     revision=revision,
                     inference_source=row.get("inference_source", "rules"),
@@ -830,7 +842,8 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
                 )
             )
         except IntegrityError:
-            # 并发窗口下唯一约束 (relationship_key, revision) 为最终仲裁者。
+            # 并发窗口下唯一约束 (relationship_key, revision) 为最终仲裁者
+            # （跨快照并发分配到同一修订号时其一失败，安全侧冲突）。
             raise RevisionConflictError(
                 "并发修订冲突：关系已被其他写入更新，请刷新后重试") from None
         return revision
@@ -877,8 +890,18 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
             self._relationships.c.relationship_key == relationship_key
         )
 
-    def get_effective_relationship(self, relationship_key: str) -> dict[str, Any] | None:
-        rows = self.get_relationship_history(relationship_key)
+    def get_effective_relationship(
+        self, relationship_key: str, snapshot_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """快照内有效修订：snapshot_id 给定时**先限定快照，再解析该链**；
+        不跨快照合并——旧快照的 stale/人工结论不遮挡其他快照的候选。"""
+        if snapshot_id is not None:
+            rows = self._load_relationship_rows(and_(
+                self._relationships.c.relationship_key == relationship_key,
+                self._relationships.c.snapshot_id == snapshot_id,
+            ))
+        else:
+            rows = self.get_relationship_history(relationship_key)
         if not rows:
             return None
         return select_effective_relationship(rows)
@@ -890,22 +913,22 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
         status: str | None = None,
         effective_only: bool = True,
     ) -> list[dict[str, Any]]:
-        rows = self._load_relationship_rows(
-            self._relationships.c.source_id == source_id
-        )
-        if effective_only:
-            # 按逻辑键分组（跨快照共享键），每组取有效修订
-            groups: dict[str, list[dict[str, Any]]] = {}
-            for row in rows:  # rows 已按 key 分组、修订倒序
-                groups.setdefault(row["relationship_key"], []).append(row)
-            selected = [select_effective_relationship(group) for group in groups.values()]
-        else:
-            latest: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                latest.setdefault(row["relationship_key"], row)
-            selected = list(latest.values())
+        """列出关系：**先限定快照（如给定），再按 (relationship_key, snapshot_id)
+        链内解析有效修订**；不做跨快照合并——同一逻辑关系在不同快照各有一条
+        结果，snapshot_id=None 时返回全部链（供快照比较/过期判定用）。"""
+        conditions = [self._relationships.c.source_id == source_id]
         if snapshot_id is not None:
-            selected = [r for r in selected if r.get("snapshot_id") == snapshot_id]
+            conditions.append(self._relationships.c.snapshot_id == snapshot_id)
+        rows = self._load_relationship_rows(and_(*conditions))
+        groups: dict[tuple[str, Any], list[dict[str, Any]]] = {}
+        for row in rows:  # rows 已按 key 分组、修订倒序
+            groups.setdefault(
+                (row["relationship_key"], row.get("snapshot_id")), []).append(row)
+        if effective_only:
+            selected = [select_effective_relationship(group)
+                        for group in groups.values()]
+        else:
+            selected = [group[0] for group in groups.values()]
         if status is not None:
             selected = [r for r in selected if r.get("status") == status]
         return sorted(

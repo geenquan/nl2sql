@@ -155,16 +155,24 @@ def map_inspector_to_table_metadata(
 
 
 class MySQLConnector(DataSourceConnector):
-    """MySQL 适配器。业务层不得依赖该类的内部实现。"""
+    """MySQL 适配器。业务层不得依赖该类的内部实现。
+
+    statement_counter（可选）：经工厂参数注入后，引擎上挂 SQLAlchemy
+    `before_cursor_execute` 事件逐语句计数（含 Inspector 内部语句与失败
+    尝试）；不注入时行为与历史完全一致（扫描链路不受影响）。
+    """
 
     def __init__(
         self,
         connection_config: MySQLConnectionConfig,
         engine_factory: Callable[[MySQLConnectionConfig], Engine] | None = None,
+        statement_counter: Any = None,
     ) -> None:
         self._config = connection_config
         self._engine: Engine | None = None
         self._engine_factory = engine_factory or self._create_engine
+        self._statement_counter = statement_counter
+        self._counter_attached = False
 
     @staticmethod
     def _create_engine(config: MySQLConnectionConfig) -> Engine:
@@ -194,6 +202,14 @@ class MySQLConnector(DataSourceConnector):
     def engine(self) -> Engine:
         if self._engine is None:
             self._engine = self._engine_factory(self._config)
+            if self._statement_counter is not None and not self._counter_attached:
+                from sqlalchemy import event
+
+                event.listen(
+                    self._engine, "before_cursor_execute",
+                    lambda *args, **kwargs: self._statement_counter.increment(),
+                )
+                self._counter_attached = True
         return self._engine
 
     def close(self) -> None:

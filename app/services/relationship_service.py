@@ -1,15 +1,25 @@
-"""M3 关系用例编排：发现、验证、审核、过期与图查询。
+"""M3 关系用例编排：发现、验证、审核、过期与图查询（修复轮加固）。
 
 执行与安全约束：
 - 候选发现只读本地持久化的 M1/M2 结果，不连接源库；数据验证由显式操作
   触发，经专用 RelationshipProbe 执行系统构造的有界聚合查询（无任意 SQL）；
-- 验证预算（候选数/查询数/期限/窗口/成本门槛）在整次运行共享，不嵌套放大；
-  预算耗尽/超时/异常都正常收尾，不停留 running；
+- 快照语义（修复轮）：同一逻辑键在不同快照是**独立证据链**——查询一律
+  先限定快照再解析链内有效修订（默认当前发布快照；不回退借用旧快照的
+  validated 证据；旧快照 stale/人工结论不遮挡新快照候选，也不未经审核
+  继承为新快照结论）；历史修订全保留，可显式查询历史快照；重验显式选择
+  目标快照并重新解析两端完整标识（表/字段消失则明确报告不可重验）；
+- 验证并发：进程内共享额度（ValidationSlotLimiter，单进程语义；多进程
+  部署各自独立，不构成跨进程保证）；额度覆盖打开连接、结构核对与探查
+  全程；等待额度受运行期限约束，超时收尾不停留 running；
+- 预算与期限：预算按**实际执行的 SQL 语句数**核销（结构核对的
+  information_schema 查询一并计数；语句发出即计数，失败尝试计入）；
+  单调时钟截止贯穿：等待额度/打开连接/每组查询前检查、请求超时取剩余
+  期限、每条查询返回后检查、判定前再检查；超期证据不得升级 validated；
+  操作组开始前按估计下界准入，不在预算耗尽后执行"最后一组"；
 - 结果发布沿用 M2「候选写入—成功发布」：整次运行的关系修订 + 运行记录
-  单事务提交，失败运行零残留（基础设施失败不发布部分"已验证"结果）；
-- 人工审核 expected_revision 仓储内原子乐观锁（409）；机器修订不覆盖
-  人工结论；人工可撤销；stale/拒绝必须改变有效结果；
-- 验证前核对源库结构与输入快照一致；不一致时不绑定证据，转 stale；
+  单事务提交，失败运行零残留；已有有效关系不受失败/超期运行污染；
+- 人工审核 expected_revision 仓储内原子乐观锁（按目标快照链校验，409）；
+  机器修订不覆盖人工结论；stale/拒绝必须改变有效结果；
 - 错误消息沿用固定安全文案：未预期异常只含类型名+阶段+对象标识；
   连接类错误透出连接器已脱敏的 reason；不记录业务值/SQL/参数明文。
 """
@@ -46,6 +56,10 @@ from app.relationships.evidence import (
     decide_status,
     structure_changed,
 )
+from app.relationships.execution import (
+    StatementCounter,
+    ValidationSlotLimiter,
+)
 from app.relationships.graph import (
     PathSearchBudget,
     build_graph,
@@ -56,6 +70,17 @@ from app.security.credentials import CredentialStore
 
 _REVIEW_ACTIONS = {"confirm": "validated", "reject": "rejected", "revert": "candidate"}
 _VALIDATABLE_STATUSES = ("candidate", "evidence_collected", "needs_review")
+# 结构核对操作组估计下界：每表至少 1 条 information_schema 查询（真实
+# Inspector 为多条，按实际计数核销；估计只用于组准入）
+_STRUCTURE_GROUP_ESTIMATE = 2
+
+
+class _BudgetExceeded(Exception):
+    """内部哨兵：操作组预算准入不足（该候选本轮不执行，收尾为跳过）。"""
+
+
+class _DeadlineExceededRun(Exception):
+    """内部哨兵：运行期限已到（收尾为 failed/partial，不停留 running）。"""
 
 
 class RelationshipService:
@@ -107,6 +132,10 @@ class RelationshipService:
         if source is None:
             raise ResourceNotFoundError("source", f"数据源不存在：{source_id}")
         return source
+
+    def _published_snapshot_id(self, source_id: str) -> str | None:
+        published = self._repo.get_published_snapshot(source_id)
+        return published["snapshot_id"] if published else None
 
     # -- 候选发现（纯本地） -------------------------------------------------------
 
@@ -278,14 +307,15 @@ class RelationshipService:
         new_tables_by_id: dict[str, dict[str, Any]],
         run: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """快照比较过期：对带证据的旧关系，结构变化（或完整快照中表消失）
-        追加 stale 修订；缺失于部分快照的表不当作消失（沿用 M1 目录语义）。"""
+        """快照比较过期：对带证据的旧链，结构变化（或完整快照中表消失）
+        在**其所属链内**追加 stale 修订；缺失于部分快照的表不当作消失。
+        旧链的 stale 不遮挡新快照候选（列表按快照先行过滤）。"""
         new_by_name = {
             (t["schema_name"], t["table_name"]): t for t in new_tables_by_id.values()
         }
         stale_records: list[dict[str, Any]] = []
-        effective = self._repo.list_relationships(source_id, effective_only=True)
-        for record in effective:
+        # 全部链（每键每快照一条有效结果）：旧链独立判定
+        for record in self._repo.list_relationships(source_id, effective_only=True):
             if record.get("snapshot_id") == new_snapshot_id:
                 continue
             if record.get("status") not in ("evidence_collected", "validated", "needs_review"):
@@ -333,27 +363,36 @@ class RelationshipService:
 
     # -- 数据验证（显式触发、有界、只读） -----------------------------------------
 
-    def validate_relationship(self, source_id: str, relationship_key: str) -> dict[str, Any]:
+    def validate_relationship(
+        self, source_id: str, relationship_key: str, *,
+        snapshot_id: str | None = None, allow_partial: bool = False,
+    ) -> dict[str, Any]:
+        """对单条关系发起验证：默认**当前发布快照**内的链（与其他查询规则
+        一致）；显式 snapshot_id 可验证历史链（诊断用）。"""
         self._require_source(source_id)
-        record = self._repo.get_effective_relationship(relationship_key)
+        snapshot_id, input_complete = self._resolve_snapshot(
+            source_id, snapshot_id, allow_partial)
+        record = self._repo.get_effective_relationship(
+            relationship_key, snapshot_id=snapshot_id)
         if record is None or record.get("source_id") != source_id:
             raise ResourceNotFoundError(
-                "relationship", f"关系不存在：{relationship_key}")
-        if record.get("status") == "stale":
-            # stale → evidence_collected（重验路径）
-            pass
-        elif record.get("status") not in _VALIDATABLE_STATUSES:
+                "relationship",
+                f"关系在目标快照内不存在：{relationship_key}"
+                "（可改用 revalidate 对目标快照重绑重验，或传 snapshot_id 验证历史链）")
+        if record.get("status") not in _VALIDATABLE_STATUSES + ("stale",):
             raise ValueError(
                 f"当前状态 {record.get('status')} 不可发起验证"
                 f"（validated/rejected 请先 revert 或标记 stale 后重验）")
-        return self._run_validation(source_id, [record])
+        return self._run_validation(
+            source_id, [record], input_complete=input_complete)
 
     def validate_batch(
         self, source_id: str, *, limit: int | None = None,
         snapshot_id: str | None = None, allow_partial: bool = False,
     ) -> dict[str, Any]:
         self._require_source(source_id)
-        snapshot_id, _ = self._resolve_snapshot(source_id, snapshot_id, allow_partial)
+        snapshot_id, input_complete = self._resolve_snapshot(
+            source_id, snapshot_id, allow_partial)
         limit = min(
             limit or self._settings.relationship_validation_max_candidates,
             self._settings.relationship_validation_max_candidates,
@@ -365,13 +404,23 @@ class RelationshipService:
         ][:limit]
         if not candidates:
             raise ResourceNotFoundError(
-                "relationship", "发布快照内没有可验证的候选关系（先执行发现）")
-        return self._run_validation(source_id, candidates)
+                "relationship", "目标快照内没有可验证的候选关系（先执行发现）")
+        return self._run_validation(
+            source_id, candidates, input_complete=input_complete)
 
     def _run_validation(
-        self, source_id: str, records: list[dict[str, Any]]
+        self, source_id: str, records: list[dict[str, Any]],
+        *, input_complete: bool | None = None,
     ) -> dict[str, Any]:
-        """按优先级串行验证（并发=1 由执行模型保证）；预算整次共享。"""
+        """验证执行（修复轮）：进程内共享并发额度 + SQL 语句预算 + 期限贯穿。
+
+        - 并发：等待额度受运行期限约束（超时收尾 failed，未执行任何查询）；
+          额度覆盖打开连接、结构核对与探查全程；异常路径 finally 释放；
+        - 预算：按实际 SQL 语句数核销（含结构核对与失败尝试）；每组查询
+          开始前按估计下界准入；耗尽即停，不执行"最后一组"；
+        - 期限：单调时钟截止贯穿等待/连接/每组查询/返回后/判定前；
+          超期证据标记 deadline_exceeded，策略不得升级 validated。
+        """
         run = {
             "run_id": uuid4().hex,
             "source_id": source_id,
@@ -380,20 +429,24 @@ class RelationshipService:
             "status": "running",
             "started_at": now_iso(),
             "finished_at": None,
+            "input_complete": input_complete,
             "candidates_planned": len(records),
             "candidates_validated": 0,
             "candidates_needs_review": 0,
             "candidates_stale_marked": 0,
             "candidates_skipped": 0,
-            "queries_used": 0,
+            "queries_used": 0,  # 实际执行的 SQL 语句数（含结构核对与失败尝试）
             "budget": {
                 "max_candidates": len(records),
-                "max_queries": self._settings.relationship_validation_max_queries,
+                "max_sql_statements": self._settings.relationship_validation_max_queries,
                 "per_query_timeout_ms": self._settings.relationship_query_timeout_ms,
                 "deadline_seconds": self._settings.relationship_validation_deadline_seconds,
                 "sample_window_rows": self._settings.relationship_sample_window_rows,
                 "exact_max_rows": self._settings.relationship_exact_max_rows,
-                "concurrency": 1,  # 串行执行；配置项保留用于未来并行化
+                "concurrency": {
+                    "limit": self._settings.relationship_max_concurrent_validations,
+                    "scope": "process",  # 单进程共享；多进程部署各自独立
+                },
             },
             "results": [],
             "errors": [],
@@ -402,6 +455,7 @@ class RelationshipService:
         self._repo.save_relationship_run(run)
         started = self._clock()
         deadline = started + self._settings.relationship_validation_deadline_seconds
+        counter = StatementCounter()
         budget = ValidationBudget(
             max_queries=self._settings.relationship_validation_max_queries,
             per_query_timeout_ms=self._settings.relationship_query_timeout_ms,
@@ -409,62 +463,101 @@ class RelationshipService:
             sample_window_rows=self._settings.relationship_sample_window_rows,
             exact_max_rows=self._settings.relationship_exact_max_rows,
             clock=self._clock,
+            counter=counter,
         )
+        concurrency_limit = self._settings.relationship_max_concurrent_validations
         connector = None
         probe = None
         new_records: list[dict[str, Any]] = []
+        slot_acquired = False
         try:
-            connector, probe = self._open_source_connection(source_id)
-            collector = EvidenceCollector(probe)
-            for record in sorted(
-                records, key=lambda r: -((r.get("scores") or {}).get("total_weighted", 0.0)),
-            ):
-                if budget.expired() or collector.queries_used >= budget.max_queries:
-                    run["candidates_skipped"] += len(records) - len(new_records) - run["candidates_skipped"]
+            try:
+                # 1) 进程内共享并发额度（等待受期限约束；False=超时未获额度）
+                wait_seconds = deadline - self._clock()
+                if not ValidationSlotLimiter.acquire(concurrency_limit,
+                                                     timeout=wait_seconds):
                     run["errors"].append({
-                        "reason": "budget_exceeded",
-                        "message": "验证预算（查询数/期限）耗尽，剩余候选本轮未验证",
+                        "reason": "concurrency_slot_timeout",
+                        "message": "等待验证并发额度超时（运行期限耗尽），本次未执行任何查询",
                     })
-                    break
-                try:
-                    new_record = self._validate_one(
-                        record, connector, collector, budget, run)
-                except DataSourceConnectionError as exc:
-                    run["candidates_skipped"] += 1
+                    raise _DeadlineExceededRun
+                slot_acquired = True
+                # 2) 打开连接前检查期限
+                if budget.expired():
                     run["errors"].append({
-                        "reason": f"source_query_failed:{exc.reason}",
-                        "message": str(exc),
+                        "reason": "deadline_exceeded",
+                        "message": "获得并发额度后运行期限已耗尽，未打开源库连接",
                     })
-                    continue
-                except Exception as exc:  # 单候选未预期异常：隔离，固定安全文案
-                    run["candidates_skipped"] += 1
+                    raise _DeadlineExceededRun
+                connector, probe = self._open_source_connection(source_id, counter)
+                structure_cache: dict[tuple[str, str], dict[str, Any]] = {}
+                collector = EvidenceCollector(probe, counter)
+                for record in sorted(
+                    records,
+                    key=lambda r: -((r.get("scores") or {}).get("total_weighted", 0.0)),
+                ):
+                    if budget.expired() or budget.exhausted():
+                        run["candidates_skipped"] += (
+                            len(records) - len(new_records) - run["candidates_skipped"])
+                        run["errors"].append({
+                            "reason": "budget_exceeded",
+                            "message": (
+                                f"验证预算耗尽（SQL 语句 {budget.statements_used()}"
+                                f"/{budget.max_queries} 或期限到期），剩余候选本轮未验证"),
+                        })
+                        break
+                    try:
+                        new_record = self._validate_one(
+                            record, connector, collector, budget, run, structure_cache)
+                    except _DeadlineExceededRun:
+                        raise  # 期限到：停止处理剩余候选，交由外层收尾
+                    except _BudgetExceeded:
+                        run["candidates_skipped"] += 1
+                        run["errors"].append({
+                            "reason": "budget_exceeded",
+                            "message": "结构核对操作组预算不足（估计下界不满足），该候选本轮跳过",
+                        })
+                        continue
+                    except DataSourceConnectionError as exc:
+                        run["candidates_skipped"] += 1
+                        run["errors"].append({
+                            "reason": f"source_query_failed:{exc.reason}",
+                            "message": str(exc),
+                        })
+                        continue
+                    except Exception as exc:  # 单候选未预期异常：隔离，固定安全文案
+                        run["candidates_skipped"] += 1
+                        run["errors"].append({
+                            "reason": "internal_error",
+                            "message": self._safe_internal(
+                                exc, run["run_id"], "关系验证",
+                                record.get("relationship_key")),
+                        })
+                        continue
+                    if new_record is not None:
+                        new_records.append(new_record)
+                        if new_record["status"] == "validated":
+                            run["candidates_validated"] += 1
+                        elif new_record["status"] == "needs_review":
+                            run["candidates_needs_review"] += 1
+                        elif new_record["status"] == "stale":
+                            run["candidates_stale_marked"] += 1
+            except _DeadlineExceededRun:
+                if not any(e["reason"] == "deadline_exceeded" for e in run["errors"]):
                     run["errors"].append({
-                        "reason": "internal_error",
-                        "message": self._safe_internal(
-                            exc, run["run_id"], "关系验证",
-                            record.get("relationship_key")),
+                        "reason": "deadline_exceeded",
+                        "message": "运行期限耗尽，已停止后续验证（结构核对/证据采集未完成）",
                     })
-                    continue
-                if new_record is not None:
-                    new_records.append(new_record)
-                    if new_record["status"] == "validated":
-                        run["candidates_validated"] += 1
-                    elif new_record["status"] == "needs_review":
-                        run["candidates_needs_review"] += 1
-                    elif new_record["status"] == "stale":
-                        run["candidates_stale_marked"] += 1
-            run["queries_used"] = collector.queries_used
-        except CredentialStoreError as exc:
-            run["errors"].append({"reason": "credential_store_error", "message": str(exc)})
-        except DataSourceConnectionError as exc:
-            run["errors"].append({"reason": f"source_connection_failed:{exc.reason}",
-                                  "message": str(exc)})
-        except Exception as exc:  # 兜底收尾：failed，零残留
-            run["status"] = "failed"
-            run["errors"].append({
-                "reason": "internal_error",
-                "message": self._safe_internal(exc, run["run_id"], "关系验证"),
-            })
+            except CredentialStoreError as exc:
+                run["errors"].append({"reason": "credential_store_error", "message": str(exc)})
+            except DataSourceConnectionError as exc:
+                run["errors"].append({"reason": f"source_connection_failed:{exc.reason}",
+                                      "message": str(exc)})
+            except Exception as exc:  # 兜底收尾：failed，零残留
+                run["errors"].append({
+                    "reason": "internal_error",
+                    "message": self._safe_internal(exc, run["run_id"], "关系验证"),
+                })
         finally:
             if probe is not None:
                 try:
@@ -476,18 +569,27 @@ class RelationshipService:
                     connector.close()
                 except Exception:
                     pass
+            if slot_acquired:
+                try:
+                    ValidationSlotLimiter.release(concurrency_limit)
+                except Exception:
+                    pass  # 越界释放为编程错误；不覆盖主要结果
+            run["queries_used"] = counter.count
         run["finished_at"] = now_iso()
         run["elapsed_ms"] = int((self._clock() - started) * 1000)
-        if run["status"] != "failed":
+        if any(e["reason"] in ("deadline_exceeded", "concurrency_slot_timeout")
+               for e in run["errors"]) and not new_records:
+            run["status"] = "failed"
+        elif run["errors"] and not new_records and not run["results"]:
             # 连接/凭证等启动失败且零候选处理 → failed（不伪装 partial 成功）
-            if run["errors"] and not new_records and not run["results"]:
-                run["status"] = "failed"
-            elif run["candidates_skipped"] or run["errors"]:
-                run["status"] = "partial"
-            else:
-                run["status"] = "succeeded"
+            run["status"] = "failed"
+        elif run["candidates_skipped"] or run["errors"]:
+            run["status"] = "partial"
+        else:
+            run["status"] = "succeeded"
         if run["status"] == "failed":
             # 失败运行零残留：仅保存运行记录，不发布任何"已验证"修订
+            # （已有有效关系不受本次失败/超期运行污染）
             self._repo.save_relationship_run(run)
         else:
             try:
@@ -508,8 +610,11 @@ class RelationshipService:
         collector: EvidenceCollector,
         budget: ValidationBudget,
         run: dict[str, Any],
+        structure_cache: dict[tuple[str, str], dict[str, Any]],
     ) -> dict[str, Any] | None:
-        # 1) 结构一致性：源库 vs 输入快照（不一致不绑定证据 → stale）
+        # 1) 结构一致性：源库 vs 输入快照（不一致不绑定证据 → stale）。
+        #    同表结构核对在**本运行内**复用（缓存仅运行内有效，不跨运行信任）；
+        #    每次核对按实际 SQL 语句计数，组前按估计下界准入。
         snapshot_tables: dict[str, dict[str, Any]] = {}
         for side, schema, table_name, table_id in (
             ("source", record["source_schema"], record["source_table"],
@@ -522,8 +627,16 @@ class RelationshipService:
             if snapshot is None:
                 raise ValueError("输入快照中找不到表元数据，无法验证")
             snapshot_tables[side] = snapshot
-            live = self._live_table_dict(
-                connector.get_table_metadata(schema, table_name))
+            cache_key = (schema, table_name)
+            live = structure_cache.get(cache_key)
+            if live is None:
+                if budget.expired():
+                    raise _DeadlineExceededRun
+                if not budget.check_group(_STRUCTURE_GROUP_ESTIMATE):
+                    raise _BudgetExceeded
+                live = self._live_table_dict(
+                    connector.get_table_metadata(schema, table_name))
+                structure_cache[cache_key] = live
             if not EvidenceCollector.structure_matches(snapshot, live):
                 stale_record = {
                     **record,
@@ -550,8 +663,10 @@ class RelationshipService:
         # 2) 证据采集（有界只读聚合；标识符来自快照元数据白名单）
         evidence = collector.collect(
             record, snapshot_tables["source"], snapshot_tables["target"], budget)
+        # 3) 判定前再次检查期限：超期证据不得升级 validated（策略内阻断）
+        if budget.expired():
+            evidence["deadline_exceeded"] = True
 
-        # 3) 验证策略判定
         updated = {
             **record,
             "evidence": evidence,
@@ -605,12 +720,14 @@ class RelationshipService:
             ],
         }
 
-    def _open_source_connection(self, source_id: str) -> tuple[Any, Any]:
+    def _open_source_connection(
+        self, source_id: str, counter: StatementCounter | None = None
+    ) -> tuple[Any, Any]:
         source = self._require_source(source_id)
         password = self._credentials.get(source["credential_ref"])
         if password is None:
             raise CredentialStoreError("凭证不存在或已被删除，无法建立只读验证连接")
-        params = {
+        params: dict[str, Any] = {
             "dialect": source["dialect"],
             "host": source["host"],
             "port": source["port"],
@@ -618,6 +735,8 @@ class RelationshipService:
             "username": source["username"],
             "password": SecretStr(password),
         }
+        if counter is not None:
+            params["statement_counter"] = counter  # 适配器逐 SQL 语句计数
         connector = self._connector_factory(params)
         try:
             probe = self._probe_factory(params)
@@ -626,7 +745,7 @@ class RelationshipService:
             raise
         return connector, probe
 
-    # -- 查询 -----------------------------------------------------------------
+    # -- 查询（默认当前发布快照；显式 snapshot_id 查历史） -----------------------
 
     def list_relationships(
         self, source_id: str, *, status: str | None = None,
@@ -634,23 +753,41 @@ class RelationshipService:
     ) -> list[dict[str, Any]]:
         self._require_source(source_id)
         if snapshot_id is None:
-            published = self._repo.get_published_snapshot(source_id)
-            snapshot_id = published["snapshot_id"] if published else None
+            snapshot_id = self._published_snapshot_id(source_id)
         if snapshot_id is None:
             return []
         return self._repo.list_relationships(
             source_id, snapshot_id=snapshot_id, status=status,
             effective_only=effective_only)
 
-    def get_relationship(self, relationship_key: str, *, effective: bool = True) -> dict[str, Any]:
-        record = (
-            self._repo.get_effective_relationship(relationship_key)
-            if effective else
-            (self._repo.get_relationship_history(relationship_key) or [None])[0]
-        )
-        if record is None:
+    def get_relationship(
+        self, relationship_key: str, *, effective: bool = True,
+        snapshot_id: str | None = None,
+    ) -> dict[str, Any]:
+        """详情默认解析记录所属数据源的**当前发布快照**链（与列表/图一致，
+        不回退旧快照证据）；显式 snapshot_id 查询历史链。"""
+        history = self._repo.get_relationship_history(relationship_key)
+        if not history:
             raise ResourceNotFoundError(
                 "relationship", f"关系不存在：{relationship_key}")
+        if snapshot_id is None:
+            snapshot_id = self._published_snapshot_id(history[0]["source_id"])
+            if snapshot_id is None:
+                raise ResourceNotFoundError(
+                    "relationship",
+                    f"数据源没有发布快照，无法定位关系默认视图：{relationship_key}"
+                    "（可传 snapshot_id 查询历史快照）")
+        if effective:
+            record = self._repo.get_effective_relationship(
+                relationship_key, snapshot_id=snapshot_id)
+        else:
+            record = next(
+                (r for r in history if r.get("snapshot_id") == snapshot_id), None)
+        if record is None:
+            raise ResourceNotFoundError(
+                "relationship",
+                f"关系在快照 {snapshot_id} 内不存在：{relationship_key}"
+                "（默认查询当前发布快照；可传 snapshot_id 查询历史快照）")
         return record
 
     def get_relationship_history(self, relationship_key: str) -> list[dict[str, Any]]:
@@ -672,6 +809,32 @@ class RelationshipService:
 
     # -- 人工审核 / 过期 / 重验 -------------------------------------------------
 
+    def _chain_latest(
+        self, relationship_key: str, expected_revision: int
+    ) -> dict[str, Any]:
+        """按 expected_revision 定位目标修订及其快照链内最新修订。
+
+        审核语义：expected_revision 指向的修订决定**目标快照链**；链内最新
+        修订必须等于 expected_revision（否则 409）。其他快照链的写入不构成
+        本链冲突（修订号全局单调，跨链并发由唯一约束安全仲裁）。
+        """
+        history = self._repo.get_relationship_history(relationship_key)
+        if not history:
+            raise ResourceNotFoundError(
+                "relationship", f"关系不存在：{relationship_key}")
+        target = next(
+            (r for r in history if r.get("revision") == expected_revision), None)
+        if target is None:
+            raise RevisionConflictError(
+                f"修订冲突：修订 {expected_revision} 不存在（可能已被并发覆盖）")
+        chain = [r for r in history if r.get("snapshot_id") == target.get("snapshot_id")]
+        latest_in_chain = chain[0]
+        if latest_in_chain["revision"] != expected_revision:
+            raise RevisionConflictError(
+                f"修订冲突：该快照链最新修订为 {latest_in_chain['revision']}，"
+                f"提交基于 {expected_revision}")
+        return latest_in_chain
+
     def submit_review(
         self,
         relationship_key: str,
@@ -681,16 +844,9 @@ class RelationshipService:
         expected_revision: int,
         note: str | None = None,
     ) -> int:
-        history = self._repo.get_relationship_history(relationship_key)
-        if not history:
-            raise ResourceNotFoundError(
-                "relationship", f"关系不存在：{relationship_key}")
-        latest = history[0]
         if action not in _REVIEW_ACTIONS:
             raise ValueError(f"未知审核动作：{action}")
-        if latest["revision"] != expected_revision:
-            raise RevisionConflictError(
-                f"修订冲突：最新修订为 {latest['revision']}，提交基于 {expected_revision}")
+        latest = self._chain_latest(relationship_key, expected_revision)
         target = _REVIEW_ACTIONS[action]
         allowed = RELATIONSHIP_TRANSITIONS.get(latest.get("status"), ())
         # 同状态重复提交：仅 confirm 允许（人工再确认强化结论）；
@@ -718,6 +874,7 @@ class RelationshipService:
                 "scope": (latest.get("validation") or {}).get("scope"),
             }
         updated.pop("revision", None)
+        # 仓储按目标快照链原子校验并写入（全局修订号唯一约束仲裁并发）
         return self._repo.save_relationship(updated, expected_revision=expected_revision)
 
     def mark_stale(
@@ -728,7 +885,10 @@ class RelationshipService:
         if not history:
             raise ResourceNotFoundError(
                 "relationship", f"关系不存在：{relationship_key}")
-        latest = history[0]
+        if expected_revision is not None:
+            latest = self._chain_latest(relationship_key, expected_revision)
+        else:
+            latest = history[0]  # 未指定版本：作用于全局最新修订所属链
         updated = {
             **latest,
             "status": "stale",
@@ -741,15 +901,94 @@ class RelationshipService:
         updated.pop("revision", None)
         return self._repo.save_relationship(updated, expected_revision=expected_revision)
 
-    def revalidate(self, source_id: str, relationship_key: str) -> dict[str, Any]:
-        record = self._repo.get_effective_relationship(relationship_key)
-        if record is None or record.get("source_id") != source_id:
+    def revalidate(
+        self, source_id: str, relationship_key: str, *,
+        snapshot_id: str | None = None, allow_partial: bool = False,
+    ) -> dict[str, Any]:
+        """显式重验：**明确选择目标快照**（默认当前发布快照；部分快照需
+        allow_partial 并记录 input_complete=false），重新解析两端表与字段
+        的完整标识后验证：
+
+        - 目标快照链存在且可验证（stale/candidate/evidence_collected/
+          needs_review）→ 在该链上验证（使用目标快照 table_id，不借用旧链）；
+        - 目标快照无该链 → 按两端 (schema, table, columns) 在目标快照内重绑：
+          字段仍存在且映射合法 → 绑定目标快照的新链验证（证据绑目标快照）；
+          表或字段已消失 → 明确报告不可重验（400），不拿旧 table_id 比较；
+        - 旧快照的人工确认不继承：重绑链从 candidate 起步，验证结论独立。
+        """
+        self._require_source(source_id)
+        target_snapshot, input_complete = self._resolve_snapshot(
+            source_id, snapshot_id, allow_partial)
+        target_record = self._repo.get_effective_relationship(
+            relationship_key, snapshot_id=target_snapshot)
+        if target_record is not None and target_record.get("source_id") == source_id:
+            if target_record.get("status") not in _VALIDATABLE_STATUSES + ("stale",):
+                raise ValueError(
+                    f"目标快照链当前状态 {target_record.get('status')} 不可重验"
+                    f"（validated/rejected 请先 revert 或标记 stale）")
+            return self._run_validation(
+                source_id, [target_record], input_complete=input_complete)
+
+        history = self._repo.get_relationship_history(relationship_key)
+        if not history or history[0].get("source_id") != source_id:
             raise ResourceNotFoundError(
                 "relationship", f"关系不存在：{relationship_key}")
-        if record.get("status") != "stale":
+        old_record = history[0]
+        rebound, missing = self._rebind_to_snapshot(old_record, target_snapshot)
+        if missing:
             raise ValueError(
-                f"仅 stale 关系可重验；当前状态 {record.get('status')}")
-        return self._run_validation(source_id, [record])
+                "不可重验：目标快照中缺少 " + "；".join(missing)
+                + "（表或字段已消失；请确认目标快照或重新发现）")
+        return self._run_validation(
+            source_id, [rebound], input_complete=input_complete)
+
+    def _rebind_to_snapshot(
+        self, record: dict[str, Any], target_snapshot: str
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """按两端完整标识把关系重绑到目标快照；返回 (重绑记录, 缺失清单)。"""
+        tables = {
+            (t["schema_name"], t["table_name"]): t
+            for t in self._repo.list_table_metadata(
+                record["source_id"], snapshot_id=target_snapshot)
+        }
+        missing: list[str] = []
+        bound: list[dict[str, Any]] = []
+        for side in ("source", "target"):
+            schema = record[f"{side}_schema"]
+            table_name = record[f"{side}_table"]
+            columns = list(record[f"{side}_columns"])
+            table = tables.get((schema, table_name))
+            if table is None:
+                missing.append(f"{schema}.{table_name}")
+                continue
+            column_names = {c["name"] for c in table.get("columns") or []}
+            absent = [c for c in columns if c not in column_names]
+            if absent:
+                missing.append(f"{schema}.{table_name}({','.join(absent)})")
+                continue
+            bound.append(table)
+        if missing or len(bound) != 2:
+            return None, missing
+        rebound = {
+            **record,
+            "snapshot_id": target_snapshot,
+            "source_table_id": bound[0]["table_id"],
+            "target_table_id": bound[1]["table_id"],
+            "evidence": None,   # 旧证据不带入新链
+            "validation": None,
+            "status": "candidate",
+            "inference_source": "rules",
+            "run_id": None,
+            "reviewed_by": None,
+            "review_note": None,
+            "recall_reasons": list(record.get("recall_reasons") or []) + [{
+                "origin": "revalidate_rebind",
+                "detail": f"从快照 {record.get('snapshot_id')} 重绑到 {target_snapshot}"
+                          "（重新解析两端完整标识；旧链人工结论不继承）",
+            }],
+        }
+        rebound.pop("revision", None)
+        return rebound, []
 
     # -- 图与路径 -------------------------------------------------------------
 
@@ -759,8 +998,7 @@ class RelationshipService:
     ) -> dict[str, Any]:
         self._require_source(source_id)
         if snapshot_id is None:
-            published = self._repo.get_published_snapshot(source_id)
-            snapshot_id = published["snapshot_id"] if published else None
+            snapshot_id = self._published_snapshot_id(source_id)
         if snapshot_id is None:
             return {"source_id": source_id, "snapshot_id": None,
                     "nodes": [], "edges": [], "mermaid": "graph LR\n    empty[(无数据)]",
@@ -775,7 +1013,8 @@ class RelationshipService:
         graph["source_id"] = source_id
         graph["snapshot_id"] = snapshot_id
         graph["status_note"] = (
-            "候选/拒绝/过期边均可见（状态字段区分）；默认路径搜索仅使用 validated 边")
+            "候选/拒绝/过期边均可见（状态字段区分）；默认路径搜索仅使用 validated 边"
+            "；边仅来自所示快照（不与其他快照混用）")
         if mermaid:
             graph["mermaid"] = to_mermaid(graph)
         return graph
@@ -787,8 +1026,7 @@ class RelationshipService:
     ) -> dict[str, Any]:
         self._require_source(source_id)
         if snapshot_id is None:
-            published = self._repo.get_published_snapshot(source_id)
-            snapshot_id = published["snapshot_id"] if published else None
+            snapshot_id = self._published_snapshot_id(source_id)
         records = self._repo.list_relationships(
             source_id, snapshot_id=snapshot_id, effective_only=True)
         budget = PathSearchBudget(

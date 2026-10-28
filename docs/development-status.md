@@ -1,6 +1,6 @@
 # 开发交接报告
 
-更新时间：2026-10-28（M3 跨表关系发现与验证完成，含真实只读演示；此前 M1 完成、M2 主体完成 Embedding 未接入）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-28（M3 修复轮：跨快照链语义、共享并发额度、SQL 语句级预算与期限、JOIN 成本门槛、组合键去重碰撞；真实只读复验通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
 
 ## 当前环境
 
@@ -9,6 +9,107 @@
 - 依赖：**PyMySQL 1.2.3**（MySQL 驱动）；**httpx 0.28.1 转为运行时依赖**（DeepSeek 客户端
   使用，未引入供应商 SDK）。其余与 M0 基线一致（fastapi 0.162.0 / sqlalchemy 2.1.6 等）。
   **M3 未引入任何新第三方依赖**（纯标准库 + 既有 fastapi/sqlalchemy/pymysql）。
+
+## M3 修复轮（2026-10-28，五组问题全部先复现后修复）
+
+### 1. 跨快照有效关系选择与重验【P1】
+
+- **根因**：仓储先跨快照按逻辑键解析有效修订、再过滤 snapshot_id——旧快照的 stale/
+  人工修订遮挡新快照候选；重验沿用旧快照 table_id 比较新结构，永远 mismatch。
+- **修复**（`sqlite_metadata_repository.py` / `relationship_service.py` /
+  `ports/repositories.py` / 路由）：同一逻辑键的不同快照是**独立证据链**——
+  查询一律**先限定快照，再链内解析有效修订**（`list_relationships` /
+  `get_effective_relationship(key, snapshot_id)`）；默认列表/详情/图/路径统一
+  当前发布快照规则，不回退借用旧快照 validated 证据；旧快照 stale/人工确认/拒绝
+  不遮挡新快照候选、也不未经审核继承为新快照结论（同结构新快照链从 candidate 起步）；
+  历史修订全保留（`?snapshot_id=` 显式查询）。**重验明确选择目标快照**（默认发布快照，
+  部分快照需 allow_partial 且记录 input_complete=false）：目标链存在则在该链验证；
+  不存在则按两端 (schema, table, columns) 在目标快照重绑后验证（证据绑目标快照）；
+  表/字段消失明确报 400 不可重验。**expected_revision 按目标快照链校验**（修订号
+  全局单调分配；跨链并发由 (key, revision) 唯一约束安全仲裁，可能表现为安全侧 409）。
+- **回归**：`TestCrossSnapshotChains`（9 项）——旧 validated→加列→新候选可见→重验；
+  同结构不继承；旧人工不遮挡 + 新链独立审核；链内冲突域；表/字段消失不可重验；
+  默认 vs 显式历史查询；图/路径不混快照；跨快照幂等。
+
+### 2. 共享验证并发限制【P1】
+
+- **根因**："串行循环"只约束单请求内部；两个并发请求探查峰值达 2。
+- **修复**（`relationships/execution.py` 新增 + 服务）：`ValidationSlotLimiter` 进程内
+  共享信号量（按上限值复用，同一进程所有服务实例共用）；额度覆盖**打开源库连接、
+  结构核对与数据探查全程**（等待期间不占用连接组）；单条/批量/重验同一入口；
+  等待受运行期限约束（超时 `concurrency_slot_timeout` 收尾 failed，未执行任何查询）；
+  异常/超时/连接创建失败 finally 释放。**作用范围=单进程**：多进程部署（多 worker）
+  各自独立，不构成跨进程全局保证（文档明示；跨进程仲裁需外部协调服务，本轮不引入）。
+- **回归**：`TestSharedConcurrencyLimit`（6 项，真实线程）——同实例/不同实例两请求
+  峰值=1；单条+批量+重验交错峰值=1；首请求异常释放额度后第二请求成功；
+  等待期间期限耗尽；limiter 超时语义。
+
+### 3. 查询数与期限预算覆盖完整过程【P1】
+
+- **根因**：结构核对（连接器 Inspector，每表多条 SQL）完全未计数（预算 1 时实际执行
+  2 次元数据调用）；期限只在查询前检查，证据查询返回超期后策略仍可发布 validated。
+- **修复**：`StatementCounter` 经工厂参数注入连接器与探查（SQLAlchemy
+  `before_cursor_execute` **逐语句计数**，含 Inspector 内部语句与失败尝试；语句发出
+  即计数）；运行预算口径改为**实际 SQL 语句数**（run 字段 `queries_used`=
+  语句数、budget `max_sql_statements`；证据 queries 逐条记 `sql_statements`）；
+  操作组（结构核对/每条聚合）开始前按**估计下界准入**（不足即不启动该组，不执行
+  "最后一组"），完成后按实际核销；同表结构核对**运行内缓存**（仅本运行有效，不跨
+  运行信任过期结构）；单调时钟截止贯穿**等待额度→打开连接→每组查询前→请求超时取
+  剩余期限→每条查询返回后→判定前**；超期证据标记 `deadline_exceeded`，
+  `decide_status` 阻断升级 validated（已有有效关系不受失败/超期运行污染）。
+- **回归**：`TestBudgetAndDeadlineCoverage`（7 项，可控时钟/替身）——总预算 1 结构
+  核对不绕过（0 语句执行）；结构核对按实际语句计数；多候选共享语句预算；结构核对
+  阶段超期；指标查询返回后超期不升级；发布前超期；预算耗尽收尾且旧结果不变。
+
+### 4. JOIN 成本门槛与重复匹配规模控制【P1】
+
+- **根因**：索引可用性用**无序集合包含**判断——组合索引 (tenant_id, code) 仅以 code
+  连接也放行（缺前导列索引不可用）；左窗 JOIN 完整右表，非唯一右键可产生巨大匹配量，
+  一行聚合结果不代表工作量有界。
+- **修复**（`evidence.py::_join_cost_mode` + 探查）：索引判断改为**按序前导列前缀**
+  匹配；完整右表 JOIN **仅当右端连接键结构唯一**（主键/唯一索引恰为连接列，自带
+  可用前导索引，每左行 ≤1 次索引定位）；其余一切情形（非唯一右键/缺前导列/无索引/
+  行数未知或低估或超大）一律**双侧有界窗口 JOIN**（各 ≤W 行、中间结果 ≤W×W 对，
+  受控计数，口径降级 sample 并注明）；**不再以行数估计作为完整表 JOIN 的安全依据**
+  （估计是优化器近似值且可能低估，不是硬上限；估计只作证据字段记录）；数据库
+  执行期限与运行期限保留。修复中另发现并修复窗口化右端派生表缺 presence 列导致
+  的真实 MySQL `Unknown column` 错误（真实库复验抓出）。
+- **回归**：`TestJoinCostMode`（6 项）——组合唯一键完整映射 full；缺前导列 windowed；
+  唯一键前导可用 full / 非唯一右端 windowed；大量重复键右端请求确实受限（≤W）；
+  行数低估不作为安全依据；小表正常关系 full+exact。
+
+### 5. 组合键去重碰撞【P2】
+
+- **根因**（真实 MySQL 只读常量查询复现）：`CONCAT_WS(CHAR(31), ...)` 拼接去重在
+  字段值包含 CHAR(31) 时碰撞——两个不同元组拼接后同为 1 个值（应为 2）。
+- **修复**（`mysql_probe.py`）：全部改用**原生多列 `COUNT(DISTINCT a, b)`**
+  （窗口 distinct_values、组合主键 left_rows_seen、distinct_right_matched 三处；
+  右端去重逐列 CASE 包裹，presence NULL→全列 NULL→被多列 DISTINCT 排除）。
+  原生语义：按元组比较、任一列 NULL 的行自动排除（与窗口"全列非空"口径一致）、
+  字段顺序与原始类型保留。不用哈希替代。
+- **回归**：替身元组语义（CHAR(31) 边界/NULL/空串/真重复）；**SQL 构造断言**
+  （三处均无 CONCAT_WS、含原生多列 DISTINCT；窗口化右端为有界派生表）；
+  **真实 MySQL 常量 SELECT 测试**（native=2 vs concat=1 碰撞复现；NULL/空串/
+  数字-字符串混合语义）——不建表、不读业务数据。
+
+### 验证（修复轮后）
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | **531 passed, 9 skipped**（修复轮新增 34 项离线回归；skipped=默认关闭的真实集成） |
+| `python -m ruff check app tests scripts` / `pip check` | 全部通过 |
+| `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q` | **8 passed, 1 skipped**（新增 CHAR(31) 常量 SELECT 语义测试；1 skipped 为 M2 真实模型项） |
+| 真实只读演示（hotel，临时目录） | 18 表扫描 → 67 候选 → 5 候选验证 **sql_statements=34**（语句级如实计数）→ 1 validated + 4 needs_review（阻断原因如实）→ 审核/stale/重验/图闭环 |
+
+### 口径纠正（覆盖此前不准确描述）
+
+- ~~"并发=1 由串行循环保证"~~ → **进程内共享并发额度**（单进程 scope；多进程部署
+  各自独立，不构成跨进程保证）。
+- ~~"每候选最多 4 条聚合查询"~~ → 每候选 ≤4 次**探查调用**，另加结构核对
+  information_schema 查询（真实库约每表 5-8 条语句，运行内同表缓存）；预算与
+  `queries_used` 一律按**实际 SQL 语句数**计。
+- MariaDB 无 `MAX_EXECUTION_TIME`：回退**客户端 read_timeout——是放弃读取，
+  不等于服务端取消语句**（支持范围已在配置文档明示）。
 
 ## M3 跨表关系发现与验证（2026-10-28 完成）
 
@@ -52,7 +153,7 @@ incompatible 不召回，人工登记保留）；时间条件缺失（多对多�
 | 高置信错误（自动 validated 但标签为负例） | **0** | 验证层全部 9 条 validated 均为正例 |
 | 基数判断准确率 | **1.000**（9/9 many_to_one） | evidence.cardinality_observed 与标注一致 |
 | 路径用例 | **通过** | 3 跳 booking_item→booking→guest/room→tenant 可达；自关联防环（employee→employee 0 条）；有向不逆向（booking→payment 0 条） |
-| 单候选查询成本 | **≤4 条聚合查询/候选**（2 窗口 + 2 JOIN），运行 queries_used ≤ 预算 | 合成集与真实演示均符合 |
+| 单候选查询成本 | **≤4 次探查调用/候选**（2 窗口 + 2 JOIN）+ 结构核对语句（真实库约每表 5-8 条，运行内同表缓存）；预算与 queries_used 按实际 SQL 语句数计 | 合成集与真实演示均符合 |
 
 ### 真实只读验证（hotel 库，2026-10-28）
 
@@ -78,15 +179,17 @@ incompatible 不召回，人工登记保留）；时间条件缺失（多对多�
 | `python -m ruff check app tests scripts` | **All checks passed** |
 | `python -m pip check` | **No broken requirements found** |
 | M3 新增测试文件 | domain（键/状态机/有效解析 19）、repository（修订/乐观锁/并发/批原子 15）、discovery（召回/负例/TopK/期限/幂等 19）、evidence（口径/分母/膨胀/占位/门槛/预算/策略 23）、service（编排/审核并发/stale/重验/零残留/安全文案 26）、graph（图/路径/防环/预算 12）、api（端到端 11）、eval（指标/基线/路径/成本 9） |
-| 真实集成 | `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q` → **7 passed, 1 skipped**（5 项 M1 + 2 项 M3：探查端口有界聚合与脱敏、小预算真实发现验证链路；1 skipped 为 M2 真实模型项，需另加 NL2SQL_SEMANTICS_INTEGRATION=1，本轮未调用模型） |
+| 真实集成 | `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q` → 修复轮后 **8 passed, 1 skipped**（5 项 M1 + 3 项 M3：探查端口有界聚合与脱敏、小预算真实发现验证链路、CHAR(31) 常量 SELECT 语义；1 skipped 为 M2 真实模型项，需另加 NL2SQL_SEMANTICS_INTEGRATION=1，本轮未调用模型） |
 
 ### M3 已知限制（如实保留）
 
 - **数据分布漂移不自动识别**：结构漂移（列/类型/约束/索引变化、完整快照表消失）
   会自动 stale；纯数据分布变化（如覆盖率下降）需人工标记 stale/重验或下次验证时
   由策略降级——不声称自动发现所有漂移（定时漂移检测在 M8）。
-- 验证串行执行（并发=1 由执行模型直接保证；`RELATIONSHIP_MAX_CONCURRENT_VALIDATIONS`
-  配置保留用于未来并行化，未实际并行）。
+- 验证并发为**进程内共享额度**（`RELATIONSHIP_MAX_CONCURRENT_VALIDATIONS`，
+  默认 1；同一 Python 进程所有服务实例共用信号量，覆盖连接/核对/探查全程）；
+  **单进程语义**——多进程部署各自独立，不构成跨进程全局保证，跨进程仲裁需外部
+  协调服务（未引入）。
 - MariaDB 不支持 `MAX_EXECUTION_TIME` 提示：回退客户端 read_timeout（单查询服务端
   期限仅 MySQL ≥5.7.8 SELECT 支持，范围已在配置文档明示）。
 - 编码映射类跨族类型关系（字符串↔整数）不自动召回也不做隐式转换 JOIN；

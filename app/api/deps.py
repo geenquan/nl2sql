@@ -59,7 +59,9 @@ def _connector_factory() -> ConnectorFactory:
                 "read_timeout_seconds", settings.mysql_read_timeout_seconds
             ),
         )
-        return MySQLConnector(config)
+        # M3 验证运行注入语句计数（可选；不注入时行为与历史一致）
+        return MySQLConnector(config,
+                              statement_counter=params.get("statement_counter"))
 
     return factory
 
@@ -140,7 +142,8 @@ def _probe_factory() -> ProbeFactory:
                 "read_timeout_seconds", settings.mysql_read_timeout_seconds
             ),
         )
-        return MySQLRelationshipProbe(config)
+        return MySQLRelationshipProbe(
+            config, statement_counter=params.get("statement_counter"))
 
     return factory
 

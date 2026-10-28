@@ -82,17 +82,26 @@ class TestRevisionAppend:
         assert len(ok) == 1 and ok[0] == 2
         assert len(conflicts) == 1 and isinstance(conflicts[0], RevisionConflictError)
 
-    def test_list_relationships_across_snapshots_keeps_human(self, repo):
+    def test_list_relationships_snapshot_first_independent_chains(self, repo):
+        # 修复轮：同一逻辑键的不同快照是独立证据链——不指定快照时各链独立
+        # 解析（每键每快照一条），旧链人工确认不遮挡新链候选、也不被继承
         repo.save_relationship(_record(key="rel-a", snapshot_id="snap-1",
                                        status="validated", inference_source="human"))
         repo.save_relationship(_record(key="rel-a", snapshot_id="snap-2",
                                        status="candidate"))
         listed = repo.list_relationships("src-m3")
-        assert len(listed) == 1  # 同一逻辑键只出一条有效结果
-        assert listed[0]["status"] == "validated"  # 人工不被新快照机器修订覆盖
-        assert listed[0]["snapshot_id"] == "snap-1"
+        assert len(listed) == 2  # 两条链各一条，互不合并
+        by_snapshot = {r["snapshot_id"]: r["status"] for r in listed}
+        assert by_snapshot == {"snap-1": "validated", "snap-2": "candidate"}
+        # 快照先行：指定 snap-2 只见新链候选（旧人工确认不遮挡）
         snap2 = repo.list_relationships("src-m3", snapshot_id="snap-2")
-        assert snap2 == []  # snap-2 的机器修订不是有效结果
+        assert [r["status"] for r in snap2] == ["candidate"]
+        # 链内语义不变：机器修订不覆盖人工
+        repo.save_relationship(_record(key="rel-a", snapshot_id="snap-1",
+                                       status="candidate"))
+        snap1 = repo.list_relationships("src-m3", snapshot_id="snap-1")
+        assert snap1[0]["status"] == "validated"
+        assert snap1[0]["inference_source"] == "human"
 
 
 class TestBatchAtomicity:

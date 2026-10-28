@@ -170,8 +170,11 @@ class RelationshipRepository(ABC):
         """按修订号倒序返回该逻辑关系的全部修订（跨快照）。"""
 
     @abstractmethod
-    def get_effective_relationship(self, relationship_key: str) -> dict[str, Any] | None:
-        ...
+    def get_effective_relationship(
+        self, relationship_key: str, snapshot_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """快照内有效修订：snapshot_id 给定时先限定快照再解析该链
+        （不跨快照合并；None=跨快照按修订号整体解析，仅诊断用）。"""
 
     @abstractmethod
     def list_relationships(
@@ -181,7 +184,8 @@ class RelationshipRepository(ABC):
         status: str | None = None,
         effective_only: bool = True,
     ) -> list[dict[str, Any]]:
-        """列出关系（默认 effective；snapshot_id 过滤证据快照）。"""
+        """列出关系：先限定快照（如给定），再按 (relationship_key, snapshot_id)
+        链内解析有效修订；snapshot_id=None 返回全部链（每键每快照一条）。"""
 
     @abstractmethod
     def save_relationship_run(self, run: dict[str, Any]) -> None:

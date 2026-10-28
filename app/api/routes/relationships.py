@@ -89,9 +89,11 @@ def get_run(run_id: str, service: RelationshipServiceDep) -> dict:
 )
 def get_relationship(
     relationship_key: str, service: RelationshipServiceDep,
-    effective: bool = True,
+    effective: bool = True, snapshot_id: str | None = None,
 ) -> dict:
-    return service.get_relationship(relationship_key, effective=effective)
+    """默认解析当前发布快照链；显式 snapshot_id 查询历史快照链。"""
+    return service.get_relationship(
+        relationship_key, effective=effective, snapshot_id=snapshot_id)
 
 
 @router.get(
@@ -108,9 +110,12 @@ def get_history(relationship_key: str, service: RelationshipServiceDep) -> list[
 )
 def validate_relationship(
     relationship_key: str, source_id: str, service: RelationshipServiceDep,
+    snapshot_id: str | None = None, allow_partial: bool = False,
 ) -> dict:
-    """对单个关系触发有界只读验证（stale 关系即重验路径）。"""
-    return service.validate_relationship(source_id, relationship_key)
+    """对单个关系触发有界只读验证（默认当前发布快照；显式 snapshot_id 验证历史链）。"""
+    return service.validate_relationship(
+        source_id, relationship_key, snapshot_id=snapshot_id,
+        allow_partial=allow_partial)
 
 
 @router.post(
@@ -147,9 +152,12 @@ def mark_stale(
 )
 def revalidate(
     relationship_key: str, source_id: str, service: RelationshipServiceDep,
+    snapshot_id: str | None = None, allow_partial: bool = False,
 ) -> dict:
-    """对 stale 关系执行显式重验（重新采集证据并判定）。"""
-    return service.revalidate(source_id, relationship_key)
+    """显式重验：明确目标快照（默认发布快照），重新解析两端完整标识后验证。"""
+    return service.revalidate(
+        source_id, relationship_key, snapshot_id=snapshot_id,
+        allow_partial=allow_partial)
 
 
 @router.get(

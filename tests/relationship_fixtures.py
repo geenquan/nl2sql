@@ -298,13 +298,24 @@ def synthetic_rows() -> dict[tuple[str, str], list[dict[str, Any]]]:
 
 
 class FakeRelationshipProbe(RelationshipProbe):
-    """内存探查替身：按合成数据计算窗口/JOIN 指标（typed 语义）。"""
+    """内存探查替身：按合成数据计算窗口/JOIN 指标（typed 语义）。
 
-    def __init__(self, rows: dict[tuple[str, str], list[dict[str, Any]]] | None = None):
+    statement_counter（可选）：模拟真实适配器的逐 SQL 计数——每次调用恰
+    1 条语句，语句发出即计数（失败尝试同样计入）；join 支持 right_limit
+    有界右窗（与真实探查口径一致）。
+    """
+
+    def __init__(self, rows: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
+                 statement_counter=None):
         self.rows = rows if rows is not None else synthetic_rows()
+        self._counter = statement_counter
         self.window_requests: list[WindowMetricsRequest] = []
         self.join_requests: list[JoinMetricsRequest] = []
         self.closed = False
+
+    def _note_statement(self) -> None:
+        if self._counter is not None:
+            self._counter.increment()
 
     def close(self) -> None:
         self.closed = True
@@ -325,6 +336,7 @@ class FakeRelationshipProbe(RelationshipProbe):
 
     def window_metrics(self, request: WindowMetricsRequest) -> WindowMetricsResult:
         self.window_requests.append(request)
+        self._note_statement()
         rows = self._window_slice(
             self._table_rows(request.schema_name, request.table_name),
             request.order_by, request.limit)
@@ -350,10 +362,14 @@ class FakeRelationshipProbe(RelationshipProbe):
 
     def join_metrics(self, request: JoinMetricsRequest) -> JoinMetricsResult:
         self.join_requests.append(request)
+        self._note_statement()
         left = self._window_slice(
             self._table_rows(request.left_schema, request.left_table),
             request.left_order_by, request.left_limit)
         right = self._table_rows(request.right_schema, request.right_table)
+        if request.right_limit is not None:
+            right = self._window_slice(right, request.right_order_by,
+                                       request.right_limit)
         right_index: dict[tuple, int] = {}
         for row in right:
             key = tuple(row.get(c) for c in request.right_columns)
@@ -396,14 +412,24 @@ class FakeRelationshipProbe(RelationshipProbe):
 
 
 class FakeM3Connector:
-    """结构核对替身：返回与快照一致的 TableMetadata（可注入漂移）。"""
+    """结构核对替身：返回与快照一致的 TableMetadata（可注入漂移）。
 
-    def __init__(self, catalog: list[dict], *, alter_table: str | None = None):
+    statement_counter（可选）：get_table_metadata 每次计 2 条语句
+    （模拟真实 Inspector 的多条 information_schema 查询下界）。
+    """
+
+    STRUCTURE_STATEMENTS = 2
+
+    def __init__(self, catalog: list[dict], *, alter_table: str | None = None,
+                 statement_counter=None):
         self.catalog = {(t["schema_name"], t["table_name"]): t for t in catalog}
         self.alter_table = alter_table
+        self._counter = statement_counter
         self.closed = False
 
     def get_table_metadata(self, schema_name: str, table_name: str):
+        if self._counter is not None:
+            self._counter.increment(self.STRUCTURE_STATEMENTS)
         table = self.catalog.get((schema_name, table_name))
         if table is None:
             raise DataSourceConnectionError(

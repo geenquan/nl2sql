@@ -52,7 +52,9 @@ class DataSourceConnector(ABC):
 
 # 组装根用该工厂按连接参数创建 Connector；服务层不感知具体适配器类。
 # 参数键：dialect / host / port / database / username / password(SecretStr)，
-# 可选 charset / connect_timeout_seconds / read_timeout_seconds。
+# 可选 charset / connect_timeout_seconds / read_timeout_seconds；
+# 可选 statement_counter（M3 验证运行注入：适配器逐 SQL 语句计数，含
+# Inspector 内部语句与失败尝试；不注入时行为与历史一致）。
 ConnectorFactory = Callable[[dict[str, Any]], DataSourceConnector]
 
 
@@ -86,6 +88,12 @@ class JoinMetricsRequest:
 
     typed 等值比较（ON left.c = right.c），不做隐式类型转换制造匹配率；
     NULL 键不参与匹配；空串是否计入"有意义匹配"由服务层按 empty 统计扣除。
+
+    右端匹配规模控制（修复轮）：默认右端为**完整表**——仅当服务层成本门槛
+    判定安全（右端键唯一且有可用前导索引，或无索引但行数估计在小量级余量
+    内，每左行 ≤1 次匹配）时使用；right_limit 给定时右端改为**有界窗口
+    派生表**（双侧窗口各 ≤W 行，中间结果 ≤W×W 对，用于右端键非唯一等
+    展开量不可控的场景；口径降级为样本，由服务层标记）。
     """
 
     left_schema: str
@@ -100,6 +108,9 @@ class JoinMetricsRequest:
     right_presence_column: str
     string_join_columns: tuple[str, ...]  # 连接键中的字符串列（统计空键匹配）
     timeout_ms: int
+    # 右端有界窗口（None=完整表，由成本门槛决定）；给定时右端为派生表
+    right_order_by: tuple[str, ...] = ()
+    right_limit: int | None = None
 
 
 @dataclass(frozen=True)

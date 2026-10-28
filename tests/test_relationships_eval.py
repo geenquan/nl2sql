@@ -176,7 +176,7 @@ class TestValidationLevelMetrics:
             for result in run["results"]
         ]
         assert per_candidate and max(per_candidate) <= 4  # 每候选 ≤4 条聚合查询
-        assert run["queries_used"] <= run["budget"]["max_queries"]
+        assert run["queries_used"] <= run["budget"]["max_sql_statements"]
 
 
 class TestPathMetrics:

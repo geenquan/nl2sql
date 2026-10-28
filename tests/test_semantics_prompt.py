@@ -545,3 +545,116 @@ class TestFixRound2EvidenceOwnership:
         assert result["valid"] is True
         id_ev = {e["type"] for e in result["columns"]["id"]["evidence"]}
         assert "primary_key" in id_ev  # 直接证据（服务端构造的规范引用）
+
+
+class TestFixRound3QuotedSecretKeys:
+    """修复轮 3：引号包围的敏感键名不再绕过净化。"""
+
+    @pytest.mark.parametrize("text,secret", [
+        ('{"password": "ReviewDummy123"}', "ReviewDummy123"),
+        ("{'token': 'ReviewToken456'}", "ReviewToken456"),
+        ('{"a": {"api_key": "ReviewNested789"}}', "ReviewNested789"),
+        ('{"secret" : "SpacedSecret 42"}', "SpacedSecret 42"),
+        ('"Authorization": "Bearer AuthQ7788"', "AuthQ7788"),
+        ("'credential': 'Cred-9001'", "Cred-9001"),
+    ])
+    def test_quoted_keys_masked(self, text: str, secret: str) -> None:
+        cleaned = sanitize_text_for_model(text)
+        assert secret not in cleaned
+        # 不残留值的尾段（键名按设计保留，不能与键名前缀冲突的断言）
+        assert secret[-4:] not in cleaned
+
+    def test_normal_json_semantics_preserved(self) -> None:
+        cleaned = sanitize_text_for_model('{"name": "订单表", "status": 3, "amount": 12.5}')
+        assert "订单表" in cleaned and "amount" in cleaned
+
+    def test_payload_comments_never_leak_secrets(self) -> None:
+        table = {"table_name": "cfg", "table_comment": '{"password": "InTable999"}',
+                 "columns": [
+                     {"name": "id", "data_type": "bigint", "nullable": False, "comment": None},
+                     {"name": "cfg", "data_type": "json", "nullable": True,
+                      "comment": "{'token': 'InCol-456}"},
+                 ],
+                 "primary_key": ["id"], "foreign_keys": [], "indexes": []}
+        payload = build_table_analysis_payload(table, [])
+        _system, user = build_prompts(payload)
+        combined = _system + user
+        for secret in ("InTable999", "InCol-456"):
+            assert secret not in combined
+            assert secret[: max(1, len(secret) // 2)] not in combined
+
+
+class TestFixRound3PathEvidence:
+    """修复轮 3：合法路径证据通过，非法归属/值继续拒绝（成对用例）。"""
+
+    def _raw(self, evidence_id, evidence_fk):
+        return {"columns": [
+            {"column_name": "id", "category": "entity_identifier", "confidence": "high",
+             "business_name": "b", "candidate_entities": [], "evidence": evidence_id},
+            {"column_name": "customer_id", "category": "foreign_identifier_candidate",
+             "confidence": "medium", "business_name": "b", "candidate_entities": [],
+             "evidence": evidence_fk},
+        ], "table_purpose": None}
+
+    def test_primary_key_path_legal_vs_other_column(self) -> None:
+        good = self._raw([{"type": "primary_key", "ref": "constraints.primary_key:id"}],
+                         [{"type": "foreign_key", "ref": "customer_id"}])
+        assert validate_model_response(good, ["id", "customer_id"], ctx())["valid"] is True
+        bad = self._raw([{"type": "primary_key",
+                          "ref": "constraints.primary_key:customer_id"}],  # 他列主键
+                        [{"type": "foreign_key", "ref": "customer_id"}])
+        assert validate_model_response(bad, ["id", "customer_id"], ctx())["valid"] is False
+
+    def test_foreign_key_path_legal_vs_non_fk_column(self) -> None:
+        good = self._raw([{"type": "primary_key", "ref": "id"}],
+                         [{"type": "foreign_key",
+                           "ref": "constraints.foreign_key:customer_id"}])
+        assert validate_model_response(good, ["id", "customer_id"], ctx())["valid"] is True
+        bad = self._raw([{"type": "primary_key", "ref": "id"}],
+                        [{"type": "foreign_key", "ref": "constraints.foreign_key:id"}])
+        assert validate_model_response(bad, ["id", "customer_id"], ctx())["valid"] is False
+
+    def test_type_and_comment_path_with_declared_values(self) -> None:
+        good = self._raw(
+            [{"type": "column_type", "ref": "columns.id.data_type:BIGINT"}],
+            [{"type": "comment", "ref": "columns.customer_id.comment:客户ID"}])
+        assert validate_model_response(good, ["id", "customer_id"], ctx())["valid"] is True
+        wrong_type = self._raw(
+            [{"type": "column_type", "ref": "columns.id.data_type:VARCHAR"}],  # 值不符
+            [{"type": "comment", "ref": "客户ID"}])
+        assert validate_model_response(wrong_type, ["id", "customer_id"], ctx())["valid"] is False
+        wrong_comment = self._raw(
+            [{"type": "column_type", "ref": "id"}],
+            [{"type": "comment", "ref": "columns.customer_id.comment:主键"}])  # 他列注释
+        assert validate_model_response(wrong_comment, ["id", "customer_id"], ctx())["valid"] is False
+
+    def test_profile_metric_path_value_rules(self) -> None:
+        fk = [{"type": "foreign_key", "ref": "customer_id"}]
+        # 已计算指标路径（=与:分隔一致接受，归属本字段 id）
+        for ref in ("columns.id.profile.uniqueness_ratio:1.0",
+                    "columns.id.profile.uniqueness_ratio=1.0"):
+            raw = self._raw([{"type": "profile_metric", "ref": ref}], fk)
+            result = validate_model_response(raw, ["id", "customer_id"], ctx())
+            assert result["valid"] is True, ref
+        # 错误值（实际 1.0，声明 0.5）
+        bad_value = self._raw(
+            [{"type": "profile_metric",
+              "ref": "columns.id.profile.uniqueness_ratio=0.5"}], fk)
+        assert validate_model_response(bad_value, ["id", "customer_id"], ctx())["valid"] is False
+        # 跨字段路径（id 的指标挂在 customer_id 上）无效
+        cross = self._raw(
+            [{"type": "primary_key", "ref": "id"}],
+            [{"type": "profile_metric",
+              "ref": "columns.id.profile.uniqueness_ratio=1.0"}])
+        assert validate_model_response(cross, ["id", "customer_id"], ctx())["valid"] is False
+        # amount 画像 insufficient_sample：其指标路径无效（解析器级验证）
+        from app.semantics.prompt import _resolve_column_evidence
+        context = ctx()
+        assert _resolve_column_evidence(
+            "amount", "profile_metric",
+            "columns.amount.profile.uniqueness_ratio", context["columns"]["amount"]) is None
+
+    def test_standard_refs_still_pass(self) -> None:
+        raw = self._raw([{"type": "primary_key", "ref": "id"}],
+                        [{"type": "foreign_key", "ref": "customer_id"}])
+        assert validate_model_response(raw, ["id", "customer_id"], ctx())["valid"] is True

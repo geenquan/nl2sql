@@ -65,7 +65,7 @@ _INJECTION_PATTERNS = (
 # 值部分吞到句界（。；;！!？? 或串尾），覆盖 Bearer 前缀、引号包围与含空格值，
 # 不残留后半段。
 _SECRET_KEY_VALUE = re.compile(
-    r'(?i)\b(api[_-]?key|secret|token|password|passwd|pwd|credential|authorization)\b'
+    r'(?i)["\']?\b(api[_-]?key|secret|token|password|passwd|pwd|credential|authorization)\b["\']?'
     r'(\s*[:：=]\s*(bearer\s+)?("[^"]*"|\'[^\']*\'|[^。；;！!？?]*))'
 )
 _SECRET_INLINE = re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9-]{7,}")
@@ -489,10 +489,11 @@ def _resolve_column_evidence(
 ) -> tuple[str, bool] | None:
     """核验并规范化单条字段证据；返回 (规范引用, 是否直接证据) 或 None（无效）。
 
-    直接证据＝解析到当前字段自身的对象（类型/注释/主键/外键/含该列的索引名/
-    本字段已计算画像指标）。模型提供的 name_pattern/glossary_term 为任意文本，
-    无法核验归属，一律丢弃（不存储、不作为依据）；规则引擎自产的上下文证据
-    不经过本函数。上层保证规范引用非空。
+    处理顺序：先规范化路径/约束形态（columns.<本列>.<字段>[:=值]、
+    constraints.primary_key:<列>、constraints.<外键约束>:<列>）为标准引用与
+    声明值，再统一执行归属与值校验——路径与标准形态走同一套真实性检查，
+    不因兼容路径而放宽。模型提供的 name_pattern/glossary_term 为任意文本，
+    无法核验归属，一律丢弃；上层保证规范引用非空。
     """
     if column_ctx is None:
         return None
@@ -503,84 +504,97 @@ def _resolve_column_evidence(
             return False  # 不存在或 None：不是已计算事实
         if profile.get("metric_basis") in _UNUSABLE_PROFILE_BASIS:
             return False  # skipped/insufficient/无口径：不可作为证据
-        # 声明值与实际不符则不通过（数值等值，不做字符串包含）
+        # 声明值与实际不符则不通过（与表用途路径一致的数值等值规则）
         return not declared_value or _metric_value_matches(profile.get(metric), declared_value)
 
     in_primary_key = column in (column_ctx.get("primary_key") or ())
     in_foreign_key = column in (column_ctx.get("foreign_key_columns") or ())
     containing_indexes = column_ctx.get("indexes") or set()
 
-    # 标准形态
+    def _split_declared(text: str) -> tuple[str, str]:
+        # 值分隔符统一接受 : 与 =
+        for sep in (":", "="):
+            if sep in text:
+                key, _, value = text.partition(sep)
+                return key, value
+        return text, ""
+
+    normalized_ref = ref
+    # ---- 先规范化路径/约束形态（不匹配则按标准形态继续） ----
+    if ref.startswith(f"columns.{column}."):
+        segments = ref[len(f"columns.{column}."):].split(".", 2)
+        if segments[0] == "profile":
+            if evidence_type != "profile_metric" or len(segments) < 2:
+                return None
+            metric_field = segments[1] if len(segments) == 2 else segments[1] + "." + segments[2]
+            metric, declared = _split_declared(metric_field)
+            if _profile_metric_ok(metric, declared or None):
+                return metric, True
+            return None
+        field, value = _split_declared(segments[0])
+        if field == "data_type" and evidence_type == "column_type":
+            actual = str(column_ctx.get("data_type", "")).lower()
+            if value and actual != value.lower():
+                return None  # 声明的类型与实际不符
+            normalized_ref = column
+        elif field == "comment" and evidence_type == "comment":
+            comment = column_ctx.get("comment")
+            if not comment or (value and value not in comment):
+                return None
+            normalized_ref = comment
+        else:
+            return None  # 他列路径或未知字段
+    elif ref.startswith("constraints."):
+        target = ref.split(":", 1)[-1] if ":" in ref else None
+        if target != column:
+            return None  # 指向他列的约束路径无效
+        if ref.startswith("constraints.primary_key"):
+            if evidence_type != "primary_key":
+                return None
+            normalized_ref = column
+        elif evidence_type == "foreign_key":
+            normalized_ref = column
+        else:
+            return None
+
+    # ---- 统一归属与值校验（标准/值/路径形态共用） ----
     if evidence_type == "column_type":
-        if ref == column:
+        if normalized_ref == column:
             return column, True
         actual_type = str(column_ctx.get("data_type", "")).lower()
-        if actual_type and ref.lower() == actual_type:
+        if actual_type and normalized_ref.lower() == actual_type:
             return column, True
         return None
     if evidence_type == "comment":
         comment = column_ctx.get("comment")
-        if comment and ref == comment:
+        if comment and normalized_ref == comment:
             return comment, True
         return None
     if evidence_type == "primary_key":
-        if in_primary_key and ref == column:
+        if in_primary_key and normalized_ref == column:
             return column, True
         return None
     if evidence_type == "foreign_key":
-        if in_foreign_key and ref == column:
+        if in_foreign_key and normalized_ref == column:
             return column, True
         return None
     if evidence_type == "index":
         # 仅接受“包含当前字段”的真实索引名；字段名本身不能绕过索引存在性检查
-        if ref in containing_indexes:
-            return ref, True
+        if normalized_ref in containing_indexes:
+            return normalized_ref, True
         return None
     if evidence_type == "profile_metric":
-        if "=" in ref:
-            metric, _, declared = ref.partition("=")
+        if "=" in normalized_ref:
+            metric, _, declared = normalized_ref.partition("=")
             if _profile_metric_ok(metric, declared or None):
                 return metric, True
             return None
-        if _profile_metric_ok(ref, None):
-            return ref, True
-        return None
-
-    # 路径形态：columns.<本列>.<字段>[:值] / columns.<本列>.profile.<指标>[:值]
-    if ref.startswith(f"columns.{column}."):
-        segments = ref[len(f"columns.{column}."):].split(".", 2)
-        if segments[0] == "profile" and evidence_type == "profile_metric" and len(segments) >= 2:
-            metric_field = segments[1] if len(segments) == 2 else segments[1] + "." + segments[2]
-            metric, _, declared = metric_field.partition(":")
-            if _profile_metric_ok(metric, declared or None):
-                return metric, True
-            return None
-        field, _, value = segments[0].partition(":")
-        if field == "data_type" and evidence_type == "column_type":
-            actual = str(column_ctx.get("data_type", "")).lower()
-            if not value or actual == value.lower():
-                return column, True
-            return None
-        if field == "comment" and evidence_type == "comment":
-            comment = column_ctx.get("comment")
-            if comment and (not value or value in comment):
-                return comment, True
-            return None
-        return None
-    if evidence_type == "primary_key" and ref.startswith("constraints.primary_key:"):
-        target = ref.split(":", 1)[1]
-        if target == column and in_primary_key:
-            return column, True
-        return None
-    if evidence_type == "foreign_key" and ref.startswith("constraints."):
-        target = ref.split(":", 1)[-1]
-        if target == column and in_foreign_key:
-            return column, True
+        if _profile_metric_ok(normalized_ref, None):
+            return normalized_ref, True
         return None
 
     # name_pattern / glossary_term：模型提供的任意文本不可核验 → 丢弃
     return None
-
 
 def table_context_for(table: dict[str, Any], profiles: list[dict[str, Any]]) -> dict[str, Any]:
     """构建逐字段与表级证据核验上下文。"""

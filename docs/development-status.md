@@ -9,6 +9,33 @@
 - 依赖：**PyMySQL 1.2.3**（MySQL 驱动）；**httpx 0.28.1 转为运行时依赖**（DeepSeek 客户端
   使用，未引入供应商 SDK）。其余与 M0 基线一致（fastapi 0.162.0 / sqlalchemy 2.1.6 等）。
 
+## M2 修复轮 3（2026-10-28，三项小范围修复，全部先复现后修复，完全离线验证）
+
+1. **引号密钥名绕过净化【P1】**：`{"password": "X"}` 形态此前不被键值正则命中
+   （键名两侧引号阻断了分隔符匹配）。修复为键名两侧允许可选引号（单/双引号、
+   JSON 嵌套、空白、大小写、Authorization/Bearer 均覆盖），值仍完整遮蔽到句界；
+   普通非敏感 JSON 语义不变；样本开关/版本检查/默认不外发规则不变。
+   回归：`TestFixRound3QuotedSecretKeys`（6 组引号形态 + 正常 JSON + 表/列注释
+   进入提示词的端到端断言：密钥值与其尾段均不出现）。
+2. **合法路径证据被提前拒绝【P2】**：`_resolve_column_evidence` 的标准形态分支
+   先于路径解析执行且各自提前 return None，导致 `constraints.primary_key:id`
+   等合法路径永远走不到路径解析。修复为“先规范化路径/约束形态 → 再统一执行
+   归属与值校验”，标准/值/路径形态共用同一套真实性检查（主键/外键/索引/画像
+   指标不放宽；跨字段、虚构对象、错误值、None/skipped 指标继续拒绝；规范引用
+   非空不变量保留；字段与表用途画像路径使用一致的数值等值规则）。
+   回归：`TestFixRound3PathEvidence`（主键/外键/类型/注释/画像指标的合法与
+   非法成对用例 + 标准引用兼容）。
+3. **失败路径用量完整性与零尝试计数【P2】**：异常分支此前传入 `_account_usage`
+   的尝试数为 0 且把 attempts=0 强制记为 1。修复为使用异常携带的实际 attempts
+   （0 保留为 0；旧适配器缺属性时按 1 保守计数），多次尝试中存在无法确认用量
+   的请求时整体与分项完整性标记 False，已知 token 小计保留不重复累计；未修改
+   客户端重试策略与预算定义。
+   回归：`TestFixRound3FailureAccounting`（429×2→带 usage 非法 JSON、零尝试、
+   单次失败用量完整、单侧已知、旧适配器兼容五场景）。
+
+验证：`python -m pytest -q` **375 passed, 6 skipped**（本轮全部离线，未访问
+真实数据库或模型）；ruff / pip check 通过。无接口兼容变化；M2 保持 partial。
+
 ## M2 修复轮 2（2026-10-28，五项遗漏，全部先复现后修复）
 
 1. **敏感文本缺口【P1】**：键值遮蔽重写为“保留键名+完整遮蔽值到句界”（覆盖
@@ -116,7 +143,7 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| `python -m pytest -q` | **357 passed, 6 skipped**（修复轮 2 后；skipped 为真实集成，默认关闭；无残留文件） |
+| `python -m pytest -q` | **375 passed, 6 skipped**（修复轮 3 后；skipped 为真实集成，默认关闭；无残留文件） |
 | `python -m ruff check app tests scripts` | **All checks passed** |
 | `python -m pip check` | **No broken requirements found** |
 | `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q`（M1 只读复验） | **5 passed** |

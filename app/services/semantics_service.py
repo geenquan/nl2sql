@@ -329,8 +329,15 @@ class SemanticsService:
                 "message": "模型输出未通过结构校验（虚构/遗漏/无效证据），已回退规则结果",
             })
         except LLMRequestError as exc:
-            consumed += max(getattr(exc, "attempts", 0) or 1, 1)
-            _account_usage(getattr(exc, "usage", None), 0)
+            # 用异常携带的实际尝试数计量；attempts=0（未发起请求）保留为 0。
+            # 旧适配器若缺少 attempts 属性，按至少一次请求保守计数。
+            attempts = getattr(exc, "attempts", None)
+            attempts = 1 if attempts is None else attempts
+            consumed += attempts
+            if attempts > 0:
+                # 已发生请求：按实际尝试数判定完整性（含传输重试的早期尝试
+                # 用量不可确认 → False），已知 token 小计保留、不重复累计
+                _account_usage(getattr(exc, "usage", None), attempts)
             return _finalize({
                 "reason": f"model_request_failed:{exc.reason}",
                 "message": "模型调用失败（运行故障），已回退规则结果；"

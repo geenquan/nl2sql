@@ -683,3 +683,69 @@ class TestFixRound2Service:
         # 已知小计保留；早期尝试用量不可确认 → 完整性 False
         assert run["llm_prompt_tokens"] == 100
         assert run["llm_usage_complete"] is False
+
+
+class TestFixRound3FailureAccounting:
+    """修复轮 3：失败路径用量完整性与零尝试计数。"""
+
+    @staticmethod
+    def _failing(tmp_path, error: LLMRequestError, settings=None):
+        class Failing(FakeLLM):
+            def generate_structured(self, *a, **k):
+                raise error
+
+        (tmp_path).mkdir(parents=True, exist_ok=True)
+        service, _ = make_service(tmp_path, llm=Failing([]),
+                                  settings=settings or Settings(
+                                      _env_file=None, deepseek_enabled=True))
+        return service.analyze_table("src-1", "tbl-1")
+
+    def test_retries_then_invalid_json_usage_kept_incomplete(self, tmp_path):
+        # 429→429→200 非法模型 JSON（带 usage）：请求数=3、token 保留、完整性=False
+        error = LLMRequestError(
+            "invalid_response", "模型响应不是合法 JSON", attempts=3,
+            usage=LLMUsage(model_reported="m", prompt_tokens=111, completion_tokens=22,
+                           calls=1, http_attempts=3))
+        run = self._failing(tmp_path / "a", error)
+        assert run["llm_http_attempts"] == 3
+        assert run["llm_prompt_tokens"] == 111  # 已知 token 保留
+        assert run["llm_completion_tokens"] == 22
+        assert run["llm_usage_complete"] is False  # 早期 429 尝试用量不可确认
+        assert run["llm_prompt_usage_complete"] is False
+        assert run["llm_completion_usage_complete"] is False
+
+    def test_zero_attempts_preserved(self, tmp_path):
+        # 调用前已超期：attempts=0 必须保留为 0，不强制改写为 1
+        error = LLMRequestError("deadline_exceeded", "超期", attempts=0, usage=None)
+        run = self._failing(tmp_path / "b", error)
+        assert run["llm_http_attempts"] == 0
+        assert run["llm_prompt_tokens"] is None  # 未发生请求，无用量可记
+        assert run["llm_usage_complete"] is True  # 没有已发生请求 → 无未知用量
+
+    def test_single_failure_full_usage_complete(self, tmp_path):
+        error = LLMRequestError(
+            "invalid_response", "模型输出不是合法 JSON", attempts=1,
+            usage=LLMUsage(prompt_tokens=50, completion_tokens=8, calls=1, http_attempts=1))
+        run = self._failing(tmp_path / "c", error)
+        assert run["llm_http_attempts"] == 1
+        assert run["llm_prompt_tokens"] == 50
+        assert run["llm_usage_complete"] is True  # 单次尝试且用量完整
+
+    def test_one_side_known_flags(self, tmp_path):
+        error = LLMRequestError(
+            "invalid_response", "x", attempts=1,
+            usage=LLMUsage(prompt_tokens=60, completion_tokens=None,
+                           calls=1, http_attempts=1))
+        run = self._failing(tmp_path / "d", error)
+        assert run["llm_prompt_tokens"] == 60  # 已知一侧保留
+        assert run["llm_prompt_usage_complete"] is True
+        assert run["llm_completion_usage_complete"] is False
+        assert run["llm_usage_complete"] is False
+
+    def test_legacy_adapter_without_attempts_counts_one(self, tmp_path):
+        # 旧适配器异常缺少 attempts 属性：按至少一次请求保守计数
+        error = LLMRequestError("network", "网络错误")  # attempts 默认 0
+        error.attempts = None  # 模拟旧适配器未携带
+        run = self._failing(tmp_path / "e", error)
+        assert run["llm_http_attempts"] == 1
+        assert run["llm_usage_complete"] is False  # 无 usage 可确认

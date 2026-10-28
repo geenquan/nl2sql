@@ -184,6 +184,128 @@ class RelationshipDiscoveryService:
             candidates = candidates[:max_candidates]
         return candidates, notes
 
+    # -- 按映射重建候选（重验重绑用，复用同一套依据计算） -------------------------
+
+    def build_candidate_for_mapping(
+        self,
+        metadata: list[dict],
+        profiles: dict[str, list[dict]],
+        semantics: list[dict],
+        *,
+        source_schema: str,
+        source_table: str,
+        source_columns: list[str],
+        target_schema: str,
+        target_table: str,
+        target_columns: list[str],
+    ) -> RecallCandidate | None:
+        """按给定映射在**给定（目标）快照输入**上重建候选依据。
+
+        重验重绑专用：稳定逻辑身份（两端标识+有序映射）来自旧链，候选依据
+        （类型兼容/外键存在性/结构唯一性/风险/证据/评分/版本）全部按目标
+        快照数据重算，绝不继承旧快照内容：
+
+        - 目标快照仍存在**映射一致的外键** → 走 _fk_candidate（结构依据真实）；
+        - 无外键 → 尝试按常规信号机制重建（_build_signal_candidate；类型
+          跨族或无信号时返回 None）；
+        - 信号机制无法召回 → 保留为**显式重验请求**：origin 仅标记
+          revalidate_rebind（reasons 注明），不伪造结构/语义支持；类型结论
+          与组合键风险仍如实计算并记录。
+
+        两端表或字段在目标快照不存在 → 返回 None（调用方报告不可重验）。
+        """
+        tables_by_name = {
+            (t["schema_name"], t["table_name"]): t for t in metadata
+        }
+        src = tables_by_name.get((source_schema, source_table))
+        tgt = tables_by_name.get((target_schema, target_table))
+        if src is None or tgt is None:
+            return None
+        src_names = {c["name"] for c in src.get("columns") or []}
+        tgt_names = {c["name"] for c in tgt.get("columns") or []}
+        if not set(source_columns) <= src_names or not set(target_columns) <= tgt_names:
+            return None
+
+        semantics_by_key = {
+            (s["table_id"], s["column_name"]): s for s in semantics
+        }
+        profiles_by_key = {
+            (table_id, p["column_name"]): p
+            for table_id, plist in profiles.items() for p in plist
+        }
+        signals = self._build_column_signals(
+            metadata, semantics_by_key, profiles_by_key)
+
+        # 1) 外键仍存在且映射一致 → 完整结构依据（来自目标快照）
+        for fk in src.get("foreign_keys") or []:
+            if (list(fk.get("columns") or []) == list(source_columns)
+                    and fk.get("ref_table") == target_table
+                    and list(fk.get("ref_columns") or []) == list(target_columns)):
+                return self._fk_candidate(
+                    src, fk, tables_by_name, semantics_by_key, profiles_by_key,
+                    signals)
+
+        verdict, reason = self._pair_type_verdict(
+            src, source_columns, tgt, target_columns)
+        key = relationship_key(
+            src["source_id"], source_schema, source_table, source_columns,
+            target_schema, target_table, target_columns)
+
+        # 2) 无外键：按常规信号机制重建（单列；类型跨族/无信号返回 None）
+        if len(source_columns) == 1 and len(target_columns) == 1:
+            by_identity = {
+                (sig.table["table_id"], sig.column["name"]): sig for sig in signals
+            }
+            ref = by_identity.get((src["table_id"], source_columns[0]))
+            target = by_identity.get((tgt["table_id"], target_columns[0]))
+            if ref is not None and target is not None:
+                candidate = self._build_signal_candidate(ref, target)
+                if candidate is not None:
+                    return candidate
+
+        # 3) 显式重验请求：不伪造结构/语义支持；类型与组合键风险如实记录
+        target_pk = list(tgt.get("primary_key") or [])
+        risks: list[dict[str, Any]] = []
+        if verdict != "compatible":
+            risks.append({"type": "type_risk", "note": reason})
+        if len(target_pk) > 1 and not any(
+            idx.get("unique") and list(idx.get("columns") or []) == target_columns
+            for idx in (tgt.get("indexes") or [])
+        ):
+            risks.append({
+                "type": "composite_key_risk",
+                "note": f"目标表主键为组合键（{','.join(target_pk)}），"
+                        "当前映射可能不足，需组合字段或人工确认",
+            })
+        source_unique = self._columns_unique(src, source_columns)
+        target_unique = self._columns_unique(tgt, target_columns)
+        candidate = RecallCandidate(
+            relationship_key=key,
+            source_table=src,
+            source_columns=list(source_columns),
+            target_table=tgt,
+            target_columns=list(target_columns),
+            origin=[],
+            reasons=[{
+                "origin": "revalidate_rebind", "method": "explicit",
+                "detail": "目标快照内无对应外键且不满足常规召回信号；"
+                          "保留为显式重验请求，候选依据按目标快照重算，"
+                          "不继承旧链内容",
+            }],
+            risks=risks,
+            type_verdict=verdict,
+            type_reason=reason,
+            cardinality_hint=self._cardinality(source_unique, target_unique),
+        )
+        candidate.scores = self._score(
+            structural=(0.7 if target_unique == "unique" else 0.3),
+            naming=self._naming_overlap(source_columns, target_columns),
+            semantic=self._semantic_match(
+                src, source_columns, tgt, target_columns, semantics_by_key),
+            profile=self._profile_support(src, source_columns, profiles_by_key),
+        )
+        return candidate
+
     # -- 信号构建 ---------------------------------------------------------------
 
     @staticmethod
@@ -301,6 +423,16 @@ class RelationshipDiscoveryService:
             candidate.risks.append({
                 "type": "self_referential",
                 "note": "自关联关系；路径搜索需防环",
+            })
+        target_pk = list(target.get("primary_key") or [])
+        if len(target_pk) > len(ref_columns) and not any(
+            idx.get("unique") and list(idx.get("columns") or []) == ref_columns
+            for idx in (target.get("indexes") or [])
+        ):
+            candidate.risks.append({
+                "type": "composite_key_risk",
+                "note": f"目标表主键为组合键（{','.join(target_pk)}），"
+                        "当前映射字段不足，需组合字段或人工确认",
             })
         if verdict != "compatible":
             candidate.risks.append({"type": "type_risk", "note": reason})

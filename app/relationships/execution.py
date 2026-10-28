@@ -14,6 +14,8 @@
 import threading
 from typing import ClassVar
 
+from app.core.exceptions import ValidationStatementBudgetExceeded
+
 
 class StatementCounter:
     """线程安全 SQL 语句计数（含失败尝试；按实际执行语句数，非方法调用数）。"""
@@ -30,6 +32,41 @@ class StatementCounter:
     def count(self) -> int:
         with self._lock:
             return self._count
+
+
+class StatementBudget(StatementCounter):
+    """逐语句硬预算：`allow_one()` 在每条 SQL 发出前**原子检查并消耗**额度。
+
+    - 额度不足时抛 ValidationStatementBudgetExceeded（固定安全文案，不含
+      SQL/参数/底层异常）——语句在执行前被阻止，不到达数据库；
+    - `count`＝已获准并实际发出的语句数（**含发出后失败的语句**：不退回、
+      不重复计数）；`rejected`＝在预算检查处被拒绝、未发出的语句数；
+    - 操作组"估计下界准入"只是减少浪费的优化，不能替代本硬限制；
+    - 未注入本对象的历史调用（M1/M2 扫描与画像）行为不变。
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        if limit < 1:
+            raise ValueError("语句预算必须 ≥1")
+        self._limit = limit
+        self._rejected = 0
+
+    def allow_one(self) -> None:
+        with self._lock:
+            if self._count >= self._limit:
+                self._rejected += 1
+                raise ValidationStatementBudgetExceeded(self._limit, self._count)
+            self._count += 1
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def rejected(self) -> int:
+        with self._lock:
+            return self._rejected
 
 
 class ValidationSlotLimiter:

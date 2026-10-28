@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from app.core.exceptions import ValidationStatementBudgetExceeded
 from app.domain.relationships import VALIDATION_POLICY_VERSION
 from app.ports.connectors import (
     JoinMetricsRequest,
@@ -246,18 +247,25 @@ class EvidenceCollector:
         budget: ValidationBudget,
         call: Callable[[], Any],
     ) -> Any | None:
-        """执行一个探查调用：组准入 → 计数测量 → 返回后期限检查。
+        """执行一个探查调用：组准入 → 逐语句硬预算 → 返回后期限检查。
 
-        counter 存在时按实际 SQL 语句数核销（语句发出即计数，失败尝试同样
-        计入）；返回后若已超期，标记 deadline_exceeded 并返回 None（调用方
-        不再使用该结果且后续指标全部 gated）。
+        逐语句硬限制在适配器事件钩子内执行（StatementBudget.allow_one，
+        发出前拒绝）；此处捕获拒绝并优雅降级——该指标记 unknown（gated，
+        注明语句被拒绝未发出），不中断运行收尾，后续指标自然因预算耗尽
+        全部 gated。已发出的语句（含失败）由钩子消耗额度，不退回。
         """
         before = self.counter.count if self.counter is not None else None
         started = budget.clock()
         try:
             result = call()
-        finally:
-            self.queries_used += 1
+        except ValidationStatementBudgetExceeded as exc:
+            self.queries_used += 1  # 探查调用发生了（语句被拒绝，未执行）
+            evidence["gated"].append({
+                "metric": template,
+                "reason": f"budget:statement_rejected（{exc}）",
+            })
+            return None
+        self.queries_used += 1
         elapsed_ms = int((budget.clock() - started) * 1000)
         if self.counter is not None and before is not None:
             statements = self.counter.count - before

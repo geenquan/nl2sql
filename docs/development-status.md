@@ -1,6 +1,65 @@
 # 开发交接报告
 
-更新时间：2026-10-28（M3 修复轮：跨快照链语义、共享并发额度、SQL 语句级预算与期限、JOIN 成本门槛、组合键去重碰撞；真实只读复验通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-28（M3 修复轮 2：跨快照重绑依据重算 + SQL 逐语句硬预算；此前修复轮 1 覆盖跨快照链/并发/预算期限/成本门槛/组合键去重；真实只读复验通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M3 修复轮 2（2026-10-28，两项 P1，先复现后修复）
+
+### 1. 跨快照重绑继承过期候选依据【P1】
+
+- **根因（已复现）**：`_rebind_to_snapshot` 用 `{**record}` 继承旧链全部候选依据——
+  新快照把目标字段 int→varchar(20) 并删除外键后，重验结果仍
+  status=validated / type_verdict=compatible / origin=['explicit_fk']。
+- **修复**：稳定逻辑身份（relationship_key=两端标识+有序映射）与**依赖快照的
+  候选依据**明确区分——重绑记录经 `discovery.build_candidate_for_mapping`
+  （新增，复用常规候选构建算法）按**目标快照**的表/画像/有效语义重算：
+  类型兼容及原因、外键存在性（目标快照无外键不标 explicit_fk）、结构唯一性/
+  组合键风险（含外键路径的目标组合主键风险补齐）、支持证据、来源、基数提示、
+  评分及版本；目标快照缺画像/语义按缺失处理（分项记 0，不借用旧快照）；
+  常规信号无法召回时保留为**显式重验请求**（origin 空 + reasons 标记
+  revalidate_rebind，不伪造结构/语义支持）；类型跨族时不执行可能产生隐式
+  转换语义混淆的 JOIN（证据 queries 为空 + gated type_incompatible +
+  策略阻断，不得自动 validated）；新链不继承旧审核人/确认/验证结论
+  （`_candidate_to_record` 全新构建），旧依据只保留旧链历史。
+- **回归**：`tests/test_relationships_fix_round2.py::TestRebindRecomputesBasis`
+  （7 项）——int→varchar+删外键（断言 origin/type_verdict/evidence/阻断全字段）；
+  删外键类型兼容（无 explicit_fk 仍可凭证据验证）；唯一约束删除（结构分重算、
+  唯一性口径来自 exact 观察而非结构）；变组合唯一（组合键风险）；缺画像/语义
+  （分项 0 不借用）；仅加列（外键保留仍可重验）；新旧链互不污染。
+
+### 2. SQL 数量预算改为逐语句硬限制【P1】
+
+- **根因（已复现）**：操作组估计下界 2、预算 2，但组内第 3 条 SQL 仍发往
+  数据库——事件钩子只计数不阻止。
+- **修复**：`StatementBudget`（execution.py）在每条 SQL **发出前**原子检查并
+  消耗额度，不足抛 `ValidationStatementBudgetExceeded`（新领域异常，固定安全
+  文案，无 SQL/参数/底层异常文本；适配器不得翻译为 unknown 数据库故障）——
+  `before_cursor_execute` 钩子内抛出即阻止执行，语句不到达数据库；Connector
+  与 Probe 共享同一运行预算（结构核对 Inspector 多条 SQL 同样受控）；操作组
+  估计准入保留为优化。口径区分：`queries_used`=已获准并实际发出的语句数
+  （**含发出后失败的**：不退回不重复计数），`sql_statements_rejected`=在预算
+  检查处被拒绝、未发出的语句数（**不计入已执行**）；证据采集中途被拒优雅降级
+  （该指标 gated statement_rejected，候选 needs_review，不冒充完整验证、不
+  覆盖已有有效关系）；结构核对中途被拒则该候选干净跳过（零残留）；运行正常
+  收尾、关闭连接并释放共享并发额度；普通 `StatementCounter`（仅计数不阻止）
+  保留——未注入预算的 M1/M2 历史调用行为不变。
+- **回归**：`TestStatementBudgetEventLevel`（6 项，**真实 SQLAlchemy 执行事件 +
+  临时 SQLite 引擎**）——预算 2 尝试 3 条 SELECT：接收监听器（挂载在守卫之后）
+  证明数据库只收到 2 条；剩余 1 条额度进入多语句 Inspector 读取即被拒且异常
+  无 SQL 文本；连接器与探查（独立引擎）共享额度；失败 SQL 消耗额度不退回；
+  被拒不计为已执行；并发争抢最后额度无超发（恰一成功一拒绝）；普通计数器
+  行为不变。`TestBudgetExhaustedRunFinalization`（2 项）——多语句操作组中途
+  逐语句拒绝（组估计 1<实际 2）优雅降级、旧有效结果不变、并发额度可再取得；
+  组准入拦截零语句发出。
+
+### 验证（修复轮 2 后）
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | **546 passed, 9 skipped**（新增 15 项；未删断言/未放宽/无新增跳过） |
+| `python -m ruff check app tests scripts` / `pip check` | 全部通过 |
+| 真实集成（`NL2SQL_MYSQL_INTEGRATION=1`） | **8 passed, 1 skipped**（未在真实库制造类型变化/删外键/超时） |
+| 真实只读演示（hotel，临时目录） | 18 表 → 67 候选 → 5 候选 **sql_statements=34**（逐语句硬预算下如实计数）→ 1 validated + 4 needs_review → 闭环正常 |
+
 
 ## 当前环境
 

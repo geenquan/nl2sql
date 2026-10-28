@@ -47,6 +47,27 @@ _UNREACHABLE_ERROR_CODES = {2002, 2003, 2005, 2006}
 _SYSTEM_SCHEMAS = frozenset({"information_schema", "performance_schema", "mysql", "sys"})
 
 
+def attach_statement_guard(engine: Engine, counter: Any) -> Engine:
+    """在引擎上挂 before_cursor_execute 语句守卫（逐语句硬限制）。
+
+    预算型计数器（含 allow_one）：发出前原子消耗额度，不足抛
+    ValidationStatementBudgetExceeded（语句不执行）；普通计数器：仅计数。
+    挂载顺序在前的守卫抛错时，后续监听器与语句本身都不会执行。
+    """
+
+    from sqlalchemy import event
+
+    def _guard(*args: Any, **kwargs: Any) -> None:
+        allow_one = getattr(counter, "allow_one", None)
+        if allow_one is not None:
+            allow_one()
+        else:
+            counter.increment()
+
+    event.listen(engine, "before_cursor_execute", _guard)
+    return engine
+
+
 class MySQLConnectionConfig(BaseModel):
     """MySQL 连接配置；password 仅在创建引擎时短暂使用，禁止写入日志。"""
 
@@ -158,8 +179,11 @@ class MySQLConnector(DataSourceConnector):
     """MySQL 适配器。业务层不得依赖该类的内部实现。
 
     statement_counter（可选）：经工厂参数注入后，引擎上挂 SQLAlchemy
-    `before_cursor_execute` 事件逐语句计数（含 Inspector 内部语句与失败
-    尝试）；不注入时行为与历史完全一致（扫描链路不受影响）。
+    `before_cursor_execute` 语句守卫（含 Inspector 内部语句）——
+    预算型计数器（StatementBudget.allow_one）在每条语句**发出前**原子
+    消耗额度，不足即抛 ValidationStatementBudgetExceeded 阻止执行（语句
+    不到达数据库；已发出的失败语句仍消耗额度）；普通计数器仅计数。
+    不注入时行为与历史完全一致（扫描链路不受影响）。
     """
 
     def __init__(
@@ -203,12 +227,7 @@ class MySQLConnector(DataSourceConnector):
         if self._engine is None:
             self._engine = self._engine_factory(self._config)
             if self._statement_counter is not None and not self._counter_attached:
-                from sqlalchemy import event
-
-                event.listen(
-                    self._engine, "before_cursor_execute",
-                    lambda *args, **kwargs: self._statement_counter.increment(),
-                )
+                attach_statement_guard(self._engine, self._statement_counter)
                 self._counter_attached = True
         return self._engine
 

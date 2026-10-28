@@ -201,7 +201,7 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 | `RELATIONSHIP_TOPK_PER_FIELD` | `5`，每个引用方列最多保留的 Top-K 目标（防同名泛配对） |
 | `RELATIONSHIP_DISCOVERY_DEADLINE_SECONDS` | `60`，召回处理期限（纯本地元数据计算） |
 | `RELATIONSHIP_VALIDATION_MAX_CANDIDATES` | `10`，单次验证最多处理的候选数 |
-| `RELATIONSHIP_VALIDATION_MAX_QUERIES` | `120`，单次验证**总 SQL 语句数**预算（结构核对 information_schema 查询与窗口/JOIN 聚合逐语句计数，含失败尝试；所有候选共享，不嵌套放大；操作组开始前按估计下界准入） |
+| `RELATIONSHIP_VALIDATION_MAX_QUERIES` | `120`，单次验证**总 SQL 语句数硬限制**（逐语句在发出前原子消耗额度：Connector/Probe 共享同一预算，结构核对 Inspector 多条 SQL 同样受控；已发出的失败语句消耗额度不退回；额度不足时语句在执行前被拒绝且**不计入已执行**——run 字段 `queries_used`=已发出语句数、`sql_statements_rejected`=被拒未发出数；操作组估计下界准入仅为优化） |
 | `RELATIONSHIP_QUERY_TIMEOUT_MS` | `15000`，单条聚合查询期限提示（毫秒） |
 | `RELATIONSHIP_VALIDATION_DEADLINE_SECONDS` | `300`，单次验证运行总期限（单调时钟贯穿） |
 | `RELATIONSHIP_SAMPLE_WINDOW_ROWS` | `500`，证据采样窗口行数（窗口未截断才记 exact 口径） |

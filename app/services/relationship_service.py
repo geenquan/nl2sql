@@ -37,6 +37,7 @@ from app.core.exceptions import (
     DataSourceConnectionError,
     ResourceNotFoundError,
     RevisionConflictError,
+    ValidationStatementBudgetExceeded,
 )
 from app.domain.relationships import (
     RELATIONSHIP_TRANSITIONS,
@@ -57,7 +58,7 @@ from app.relationships.evidence import (
     structure_changed,
 )
 from app.relationships.execution import (
-    StatementCounter,
+    StatementBudget,
     ValidationSlotLimiter,
 )
 from app.relationships.graph import (
@@ -435,7 +436,8 @@ class RelationshipService:
             "candidates_needs_review": 0,
             "candidates_stale_marked": 0,
             "candidates_skipped": 0,
-            "queries_used": 0,  # 实际执行的 SQL 语句数（含结构核对与失败尝试）
+            "queries_used": 0,  # 已发出并实际执行的 SQL 语句数（含结构核对与失败尝试；被拒绝语句不计入）
+            "sql_statements_rejected": 0,  # 在预算检查处被拒绝、未发出的语句数
             "budget": {
                 "max_candidates": len(records),
                 "max_sql_statements": self._settings.relationship_validation_max_queries,
@@ -455,7 +457,7 @@ class RelationshipService:
         self._repo.save_relationship_run(run)
         started = self._clock()
         deadline = started + self._settings.relationship_validation_deadline_seconds
-        counter = StatementCounter()
+        counter = StatementBudget(self._settings.relationship_validation_max_queries)
         budget = ValidationBudget(
             max_queries=self._settings.relationship_validation_max_queries,
             per_query_timeout_ms=self._settings.relationship_query_timeout_ms,
@@ -518,6 +520,14 @@ class RelationshipService:
                             "message": "结构核对操作组预算不足（估计下界不满足），该候选本轮跳过",
                         })
                         continue
+                    except ValidationStatementBudgetExceeded as exc:
+                        # 逐语句硬限制：语句被拒绝未发出（结构核对多语句中途触发）
+                        run["candidates_skipped"] += 1
+                        run["errors"].append({
+                            "reason": "budget_exceeded",
+                            "message": f"{exc}；该候选本轮跳过，剩余候选不再执行",
+                        })
+                        break
                     except DataSourceConnectionError as exc:
                         run["candidates_skipped"] += 1
                         run["errors"].append({
@@ -575,6 +585,7 @@ class RelationshipService:
                 except Exception:
                     pass  # 越界释放为编程错误；不覆盖主要结果
             run["queries_used"] = counter.count
+            run["sql_statements_rejected"] = counter.rejected
         run["finished_at"] = now_iso()
         run["elapsed_ms"] = int((self._clock() - started) * 1000)
         if any(e["reason"] in ("deadline_exceeded", "concurrency_slot_timeout")
@@ -660,9 +671,26 @@ class RelationshipService:
                 })
                 return stale_record
 
-        # 2) 证据采集（有界只读聚合；标识符来自快照元数据白名单）
-        evidence = collector.collect(
-            record, snapshot_tables["source"], snapshot_tables["target"], budget)
+        # 2) 证据采集（有界只读聚合；标识符来自快照元数据白名单）。
+        #    类型不兼容（跨族，如字符串 vs 整数）时不执行 JOIN——即使 typed
+        #    等值比较不会隐式转换，也不做无意义探查；明确记阻断原因。
+        if record.get("type_verdict") == "incompatible":
+            evidence = {
+                "collected_at": now_iso(),
+                "snapshot_id": record.get("snapshot_id"),
+                "policy_version": None,
+                "queries": [],
+                "gated": [{
+                    "metric": "all",
+                    "reason": "type_incompatible:连接两端类型跨族，"
+                              "不执行可能产生隐式类型转换语义混淆的 JOIN",
+                }],
+                "deadline_exceeded": False,
+                "notes": ["类型不兼容：候选可能是编码映射，需人工判断"],
+            }
+        else:
+            evidence = collector.collect(
+                record, snapshot_tables["source"], snapshot_tables["target"], budget)
         # 3) 判定前再次检查期限：超期证据不得升级 validated（策略内阻断）
         if budget.expired():
             evidence["deadline_exceeded"] = True
@@ -721,7 +749,7 @@ class RelationshipService:
         }
 
     def _open_source_connection(
-        self, source_id: str, counter: StatementCounter | None = None
+        self, source_id: str, counter: StatementBudget | None = None
     ) -> tuple[Any, Any]:
         source = self._require_source(source_id)
         password = self._credentials.get(source["credential_ref"])
@@ -945,19 +973,27 @@ class RelationshipService:
     def _rebind_to_snapshot(
         self, record: dict[str, Any], target_snapshot: str
     ) -> tuple[dict[str, Any] | None, list[str]]:
-        """按两端完整标识把关系重绑到目标快照；返回 (重绑记录, 缺失清单)。"""
-        tables = {
-            (t["schema_name"], t["table_name"]): t
-            for t in self._repo.list_table_metadata(
-                record["source_id"], snapshot_id=target_snapshot)
+        """把稳定逻辑身份重绑到目标快照；候选依据**全部按目标快照重算**。
+
+        稳定身份（relationship_key=两端完整标识+有序映射）与依赖快照的
+        候选依据（类型兼容/外键存在性/结构唯一性/风险/证据/评分/画像/语义
+        及其版本）明确区分：旧链依据只保留在旧快照历史中；新链经
+        discovery.build_candidate_for_mapping 用目标快照的表/画像/有效语义
+        重建（复用常规候选构建，不在重验服务里复制算法），不继承旧链的
+        审核人、确认或验证结论。目标快照缺画像/语义按缺失处理（对应分项
+        记 0，不借用旧快照结果）。表/字段消失 → 返回缺失清单（不可重验）。
+        """
+        tables = self._repo.list_table_metadata(
+            record["source_id"], snapshot_id=target_snapshot)
+        tables_by_name = {
+            (t["schema_name"], t["table_name"]): t for t in tables
         }
         missing: list[str] = []
-        bound: list[dict[str, Any]] = []
         for side in ("source", "target"):
             schema = record[f"{side}_schema"]
             table_name = record[f"{side}_table"]
             columns = list(record[f"{side}_columns"])
-            table = tables.get((schema, table_name))
+            table = tables_by_name.get((schema, table_name))
             if table is None:
                 missing.append(f"{schema}.{table_name}")
                 continue
@@ -965,29 +1001,30 @@ class RelationshipService:
             absent = [c for c in columns if c not in column_names]
             if absent:
                 missing.append(f"{schema}.{table_name}({','.join(absent)})")
-                continue
-            bound.append(table)
-        if missing or len(bound) != 2:
+        if missing:
             return None, missing
-        rebound = {
-            **record,
-            "snapshot_id": target_snapshot,
-            "source_table_id": bound[0]["table_id"],
-            "target_table_id": bound[1]["table_id"],
-            "evidence": None,   # 旧证据不带入新链
-            "validation": None,
-            "status": "candidate",
-            "inference_source": "rules",
-            "run_id": None,
-            "reviewed_by": None,
-            "review_note": None,
-            "recall_reasons": list(record.get("recall_reasons") or []) + [{
-                "origin": "revalidate_rebind",
-                "detail": f"从快照 {record.get('snapshot_id')} 重绑到 {target_snapshot}"
-                          "（重新解析两端完整标识；旧链人工结论不继承）",
-            }],
-        }
-        rebound.pop("revision", None)
+        profiles = {t["table_id"]: self._repo.list_column_profiles(t["table_id"])
+                    for t in tables}
+        semantics = self._repo.list_field_semantics_by_source(
+            record["source_id"], target_snapshot, effective=True)
+        candidate = self._discovery.build_candidate_for_mapping(
+            tables, profiles, semantics,
+            source_schema=record["source_schema"],
+            source_table=record["source_table"],
+            source_columns=list(record["source_columns"]),
+            target_schema=record["target_schema"],
+            target_table=record["target_table"],
+            target_columns=list(record["target_columns"]),
+        )
+        if candidate is None:
+            return None, ["两端标识（内部一致性）"]  # 防御：缺失已在上面排查
+        rebound = self._candidate_to_record(candidate, target_snapshot, run_id=None)
+        rebound["recall_reasons"] = list(rebound["recall_reasons"]) + [{
+            "origin": "revalidate_rebind", "method": "explicit",
+            "detail": f"显式重验：稳定逻辑身份从快照 {record.get('snapshot_id')}"
+                      f" 重绑到 {target_snapshot}；候选依据（类型/来源/证据/"
+                      "评分/风险）按目标快照重算，不继承旧链内容",
+        }]
         return rebound, []
 
     # -- 图与路径 -------------------------------------------------------------

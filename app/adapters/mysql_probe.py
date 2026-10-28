@@ -31,9 +31,13 @@ from sqlalchemy.engine import Engine
 from app.adapters.mysql_connector import (
     MySQLConnectionConfig,
     MySQLConnector,
+    attach_statement_guard,
     quote_mysql_identifier,
 )
-from app.core.exceptions import DataSourceConnectionError
+from app.core.exceptions import (
+    DataSourceConnectionError,
+    ValidationStatementBudgetExceeded,
+)
 from app.ports.connectors import (
     JoinMetricsRequest,
     JoinMetricsResult,
@@ -62,6 +66,9 @@ class MySQLRelationshipProbe(RelationshipProbe):
         self._connector = MySQLConnector(
             connection_config, statement_counter=statement_counter)
         self._engine = engine
+        # 外部传入的引擎同样挂语句守卫（与 Connector 共享同一预算对象）
+        if engine is not None and statement_counter is not None:
+            attach_statement_guard(engine, statement_counter)
 
     @property
     def engine(self) -> Engine:
@@ -204,13 +211,18 @@ class MySQLRelationshipProbe(RelationshipProbe):
     # -- 执行 -------------------------------------------------------------------
 
     def _fetch_one(self, sql: str) -> dict[str, Any]:
-        """执行聚合查询并返回单行结果；错误统一脱敏。"""
+        """执行聚合查询并返回单行结果；错误统一脱敏。
+
+        预算拒绝（ValidationStatementBudgetExceeded）不是数据库故障：
+        原样上抛给服务层按预算收尾，不翻译为 unknown 连接错误。"""
         try:
             with self.engine.connect() as connection:
                 result = connection.execute(text(sql))
                 row = result.mappings().first()
                 return dict(row) if row is not None else {}
-        except Exception as exc:  # SQLAlchemyError/OSError 统一经连接器翻译脱敏
-            if isinstance(exc, DataSourceConnectionError):
+        except Exception as exc:
+            if isinstance(exc, (DataSourceConnectionError,
+                                ValidationStatementBudgetExceeded)):
                 raise
+            # SQLAlchemyError/OSError 统一经连接器翻译脱敏
             raise self._connector._translate_error(exc) from None

@@ -50,3 +50,15 @@ class LLMRequestError(AppError):
 
 class RevisionConflictError(AppError):
     """人工修订基于过期修订号提交（并发冲突）；不静默覆盖。"""
+
+
+class ValidationStatementBudgetExceeded(AppError):
+    """M3 验证 SQL 语句预算耗尽：该语句在发出前被拒绝（未到达数据库）。
+
+    固定安全文案：不含 SQL 文本、参数、标识符或底层异常；不是数据库故障，
+    适配器不得把它翻译为 DataSourceConnectionError（unknown）。"""
+
+    def __init__(self, limit: int, issued: int) -> None:
+        super().__init__(
+            f"验证 SQL 语句预算耗尽：已发出 {issued}/{limit} 条，"
+            "后续语句在发出前被拒绝（未执行）")

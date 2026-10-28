@@ -314,8 +314,19 @@ class FakeRelationshipProbe(RelationshipProbe):
         self.closed = False
 
     def _note_statement(self) -> None:
-        if self._counter is not None:
-            self._counter.increment()
+        self._note_statements(1)
+
+    def _note_statements(self, count: int) -> None:
+        """与真实适配器一致：预算型计数器逐语句发出前消耗额度（不足即拒绝，
+        语句不执行）；普通计数器仅计数。"""
+        if self._counter is None:
+            return
+        allow_one = getattr(self._counter, "allow_one", None)
+        if allow_one is not None:
+            for _ in range(count):
+                allow_one()
+        else:
+            self._counter.increment(count)
 
     def close(self) -> None:
         self.closed = True
@@ -427,9 +438,20 @@ class FakeM3Connector:
         self._counter = statement_counter
         self.closed = False
 
+    def _note_statements(self, count: int) -> None:
+        """与真实适配器一致：预算型计数器逐语句发出前消耗额度；普通计数器仅计数。"""
+        if self._counter is None:
+            return
+        allow_one = getattr(self._counter, "allow_one", None)
+        if allow_one is not None:
+            for _ in range(count):
+                allow_one()
+        else:
+            self._counter.increment(count)
+
     def get_table_metadata(self, schema_name: str, table_name: str):
         if self._counter is not None:
-            self._counter.increment(self.STRUCTURE_STATEMENTS)
+            self._note_statements(self.STRUCTURE_STATEMENTS)
         table = self.catalog.get((schema_name, table_name))
         if table is None:
             raise DataSourceConnectionError(

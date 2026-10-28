@@ -2,6 +2,31 @@
 
 更新时间：2026-10-28（M3 修复轮 2：跨快照重绑依据重算 + SQL 逐语句硬预算；此前修复轮 1 覆盖跨快照链/并发/预算期限/成本门槛/组合键去重；真实只读复验通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
 
+## M3 最小修补（2026-10-28，修复轮 3：跨 Schema 重验切换目标关系）
+
+- **缺陷（已复现）**：`discovery.build_candidate_for_mapping` 匹配外键未比较
+  ref_schema——新快照把 `app.booking.guest_id` 的外键改指 `archive.guest.id`
+  后，重验请求 `app.booking.guest_id → app.guest.id` 会重建出指向 archive 的
+  **另一条关系**并保存为 validated，运行仍报告原请求成功。
+- **修复（最小改动）**：
+  1. `app/relationships/discovery.py`：外键有效目标 Schema＝fk.ref_schema
+     有值用之、否则回退来源表 schema，必须与请求 target_schema 一致（源字段/
+     目标表/目标字段及顺序的现有比较不变）；指向其他 Schema 的同名表不能
+     作为本映射的 explicit_fk 依据；无匹配外键走既有非外键重建流程
+     （不放宽验证门槛）。
+  2. `app/services/relationship_service.py`：重绑后新增**身份不变量检查**
+     （relationship_key、source_id、两端 Schema/表、有序字段映射必须与请求
+     一致）；不一致抛固定安全错误终止——不探查、不保存另一条关系、不改键
+     掩盖（`_REBIND_IDENTITY_MISMATCH` 固定文案）。
+- **回归（全部离线：临时 SQLite + 模拟连接器 + 虚构数据，不连真实库/模型）**：
+  `tests/test_relationships_fix_round3.py` 7 项——app/archive 同名表并存、
+  外键改指 archive 不匹配；外键仍指 app 正常匹配；ref_schema 缺失回退来源
+  Schema；请求本身指向 archive 时用 archive 外键；服务层 revalidate 断言
+  请求关系完整身份不变、不继承 explicit_fk、不验证另一条关系、旧快照历史
+  不变；注入错误目标/错误关系键候选 → 固定错误终止且零探查零写入。
+- **验证**：`python -m pytest -q` → **553 passed, 9 skipped**（新增 7 项）；
+  ruff / pip check 通过。
+
 ## M3 修复轮 2（2026-10-28，两项 P1，先复现后修复）
 
 ### 1. 跨快照重绑继承过期候选依据【P1】

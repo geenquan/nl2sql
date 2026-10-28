@@ -236,9 +236,14 @@ class RelationshipDiscoveryService:
         signals = self._build_column_signals(
             metadata, semantics_by_key, profiles_by_key)
 
-        # 1) 外键仍存在且映射一致 → 完整结构依据（来自目标快照）
+        # 1) 外键仍存在且映射一致 → 完整结构依据（来自目标快照）。
+        #    有效目标 Schema：fk.ref_schema 有值时用之，否则回退来源表 schema；
+        #    必须与请求的 target_schema 一致——指向其他 Schema 的同名表
+        #    （如 archive.guest）不能作为本映射的 explicit_fk 依据。
         for fk in src.get("foreign_keys") or []:
+            effective_ref_schema = fk.get("ref_schema") or src["schema_name"]
             if (list(fk.get("columns") or []) == list(source_columns)
+                    and effective_ref_schema == target_schema
                     and fk.get("ref_table") == target_table
                     and list(fk.get("ref_columns") or []) == list(target_columns)):
                 return self._fk_candidate(

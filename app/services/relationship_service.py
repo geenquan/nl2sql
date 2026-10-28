@@ -71,6 +71,12 @@ from app.security.credentials import CredentialStore
 
 _REVIEW_ACTIONS = {"confirm": "validated", "reject": "rejected", "revert": "candidate"}
 _VALIDATABLE_STATUSES = ("candidate", "evidence_collected", "needs_review")
+# 重绑身份不变量失败的固定安全错误（不携带请求/重建内容，不探查、不保存）
+_REBIND_IDENTITY_MISMATCH = (
+    "重验重绑内部一致性校验失败：重建候选与请求关系身份不一致"
+    "（Schema/表/字段映射或关系键）；已终止，未执行探查、未保存任何关系；"
+    "错误详情已抑制"
+)
 # 结构核对操作组估计下界：每表至少 1 条 information_schema 查询（真实
 # Inspector 为多条，按实际计数核销；估计只用于组准入）
 _STRUCTURE_GROUP_ESTIMATE = 2
@@ -1019,6 +1025,14 @@ class RelationshipService:
         if candidate is None:
             return None, ["两端标识（内部一致性）"]  # 防御：缺失已在上面排查
         rebound = self._candidate_to_record(candidate, target_snapshot, run_id=None)
+        # 身份不变量（防御）：重建候选的完整身份必须与请求关系一致——
+        # relationship_key、source_id、两端 Schema/表与有序字段映射。
+        # 不一致（如外键改指其他 Schema 的同名表导致重建出另一条关系）时
+        # 用固定安全错误终止：不探查、不保存另一条关系，也不通过改键掩盖。
+        expected_identity = self._identity_tuple(record)
+        actual_identity = self._identity_tuple(rebound)
+        if actual_identity != expected_identity:
+            raise ValueError(_REBIND_IDENTITY_MISMATCH)
         rebound["recall_reasons"] = list(rebound["recall_reasons"]) + [{
             "origin": "revalidate_rebind", "method": "explicit",
             "detail": f"显式重验：稳定逻辑身份从快照 {record.get('snapshot_id')}"
@@ -1026,6 +1040,16 @@ class RelationshipService:
                       "评分/风险）按目标快照重算，不继承旧链内容",
         }]
         return rebound, []
+
+    @staticmethod
+    def _identity_tuple(record: dict[str, Any]) -> tuple:
+        return (
+            record.get("relationship_key"), record.get("source_id"),
+            record.get("source_schema"), record.get("source_table"),
+            tuple(record.get("source_columns") or []),
+            record.get("target_schema"), record.get("target_table"),
+            tuple(record.get("target_columns") or []),
+        )
 
     # -- 图与路径 -------------------------------------------------------------
 

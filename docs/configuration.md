@@ -193,6 +193,45 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 - 真实模型集成测试默认跳过：`NL2SQL_MYSQL_INTEGRATION=1 NL2SQL_SEMANTICS_INTEGRATION=1
   python -m pytest tests/integration -q`（小预算：≤3 表扫描、≤8 列分析）。
 
+## M3 关系发现与验证预算（已实现）
+
+| 配置项 | 默认值 / 用途 |
+| --- | --- |
+| `RELATIONSHIP_MAX_CANDIDATES_PER_RUN` | `200`，单次召回最多保留的候选数（按分数截断） |
+| `RELATIONSHIP_TOPK_PER_FIELD` | `5`，每个引用方列最多保留的 Top-K 目标（防同名泛配对） |
+| `RELATIONSHIP_DISCOVERY_DEADLINE_SECONDS` | `60`，召回处理期限（纯本地元数据计算） |
+| `RELATIONSHIP_VALIDATION_MAX_CANDIDATES` | `10`，单次验证最多处理的候选数 |
+| `RELATIONSHIP_VALIDATION_MAX_QUERIES` | `120`，单次验证总查询数预算（所有候选共享，不嵌套放大） |
+| `RELATIONSHIP_QUERY_TIMEOUT_MS` | `15000`，单条聚合查询期限提示（毫秒） |
+| `RELATIONSHIP_VALIDATION_DEADLINE_SECONDS` | `300`，单次验证运行总期限（单调时钟贯穿） |
+| `RELATIONSHIP_SAMPLE_WINDOW_ROWS` | `500`，证据采样窗口行数（窗口未截断才记 exact 口径） |
+| `RELATIONSHIP_EXACT_MAX_ROWS` | `50000`，成本门槛：右端行数估计超此值且连接列无索引时拒绝 JOIN 探测（降级 unknown） |
+| `RELATIONSHIP_MAX_CONCURRENT_VALIDATIONS` | `1`，并发验证上限（当前实现串行执行=1，由执行模型直接保证；配置保留用于未来并行化） |
+| `RELATIONSHIP_COVERAGE_THRESHOLD` | `0.995`，自动 validated 的前向覆盖率阈值（exact 口径；仅高覆盖率不能单独升级） |
+| `RELATIONSHIP_PATH_MAX_HOPS` / `_MAX_PATHS` / `_MAX_NODES` / `_DEADLINE_SECONDS` | `3` / `5` / `200` / `10`，路径搜索预算（默认仅 validated 非 stale 边） |
+
+说明：
+
+- **执行边界**：候选召回只读本地持久化的 M1/M2 结果，不连接源库；数据验证由
+  显式操作触发（单关系或批量 Top-N），经专用 `RelationshipProbe` 端口执行
+  **系统构造的聚合查询**（窗口统计 + LEFT JOIN 聚合）——不是任意 SQL；
+  `execute_readonly` 保持 M6 显式未实现。
+- **只读保障**：探查复用 Connector 的连接级 `SET SESSION TRANSACTION READ
+  ONLY` 与账号 SELECT 约束；标识符来自快照元数据白名单并反引号转义，
+  LIMIT/超时为受校验整数；查询不携带业务参数值，结果只返回聚合计数。
+- **数据库级执行期限**：SELECT 优化器提示 `MAX_EXECUTION_TIME(ms)`
+  （MySQL ≥5.7.8 顶层 SELECT 生效；MariaDB 不支持该提示，未知提示被忽略并
+  回退为客户端 read_timeout——支持范围以此为准，不宣称所有版本都有服务端期限）。
+- **口径与门槛**：窗口行数 < `RELATIONSHIP_SAMPLE_WINDOW_ROWS`（未截断）记
+  `exact`，达到上限记 `sample`；成本门槛/预算耗尽记 `unknown`（gated 附原因）。
+  `sample` 口径不能自动升级 validated（策略要求 exact 前向覆盖达标）。
+- **元数据存储**：`relationships` / `relationship_runs` 两表随仓储 `create_all`
+  追加建表（兼容既有数据库，不删除/不重建用户已有表）。
+- **真实只读演示**：`python scripts/m3_real_validation.py`——元数据/凭证写
+  临时目录，先打印预算再执行；不打印任何业务原始值/地址/凭证。
+- M3 真实 MySQL 集成测试默认跳过：
+  `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q`。
+
 ## 登录与 JWT
 
 `LOGIN_ENABLED` 和 `JWT_SECRET` 已映射到同名小写配置属性，JWT 密钥使用 `SecretStr`。

@@ -11,13 +11,15 @@ from typing import Any
 from pydantic import SecretStr
 
 from app.adapters.mysql_connector import MySQLConnectionConfig, MySQLConnector
+from app.adapters.mysql_probe import MySQLRelationshipProbe
 from app.adapters.repositories.sqlite_metadata_repository import SQLiteMetadataRepository
 from app.core.config import Settings, get_settings
 from app.llm.deepseek_client import DeepSeekClient
-from app.ports.connectors import ConnectorFactory, DataSourceConnector
+from app.ports.connectors import ConnectorFactory, DataSourceConnector, ProbeFactory
 from app.ports.llm import LLMClient
 from app.profiling.profiler import DataProfiler
 from app.security.credentials import CredentialStore, FileCredentialStore
+from app.services.relationship_service import RelationshipService
 from app.services.scan_service import ScanService
 from app.services.semantics_service import SemanticsService
 from app.services.source_service import SourceService
@@ -114,5 +116,41 @@ def get_semantics_service() -> SemanticsService:
     return SemanticsService(
         metadata_repository=_metadata_repository(),
         llm_factory=_llm_factory(),
+        settings=_settings(),
+    )
+
+
+@lru_cache
+def _probe_factory() -> ProbeFactory:
+    settings = _settings()
+
+    def factory(params: dict[str, Any]) -> MySQLRelationshipProbe:
+        # 与 Connector 相同参数（含密码 SecretStr）；探查复用连接级 READ ONLY。
+        config = MySQLConnectionConfig(
+            host=params["host"],
+            port=int(params["port"]),
+            database=params["database"],
+            username=params["username"],
+            password=params.get("password") or SecretStr(""),
+            charset=params.get("charset", settings.mysql_charset),
+            connect_timeout_seconds=params.get(
+                "connect_timeout_seconds", settings.mysql_connect_timeout_seconds
+            ),
+            read_timeout_seconds=params.get(
+                "read_timeout_seconds", settings.mysql_read_timeout_seconds
+            ),
+        )
+        return MySQLRelationshipProbe(config)
+
+    return factory
+
+
+def get_relationship_service() -> RelationshipService:
+    return RelationshipService(
+        metadata_repository=_metadata_repository(),
+        source_repository=_metadata_repository(),
+        credential_store=_credential_store(),
+        connector_factory=_connector_factory(),
+        probe_factory=_probe_factory(),
         settings=_settings(),
     )

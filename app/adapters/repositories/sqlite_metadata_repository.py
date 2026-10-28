@@ -25,6 +25,7 @@ from sqlalchemy import (
     String,
     Table,
     UniqueConstraint,
+    and_,
     create_engine,
     delete,
     func,
@@ -34,7 +35,12 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from app.core.exceptions import RevisionConflictError
-from app.ports.repositories import MetadataRepository, SourceRepository
+from app.domain.relationships import select_effective_relationship
+from app.ports.repositories import (
+    MetadataRepository,
+    RelationshipRepository,
+    SourceRepository,
+)
 
 _JSON_COLUMNS = ("columns", "primary_key", "foreign_keys", "indexes", "allowed_schemas", "errors")
 
@@ -55,8 +61,8 @@ def _load(raw: str | None, default: Any) -> Any:
     return json.loads(raw)
 
 
-class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
-    """实现 MetadataRepository 与 SourceRepository 两个端口。"""
+class SQLiteMetadataRepository(MetadataRepository, SourceRepository, RelationshipRepository):
+    """实现 MetadataRepository / SourceRepository / RelationshipRepository 端口。"""
 
     def __init__(self, database_url: str, engine: Engine | None = None) -> None:
         self._database_url = database_url
@@ -175,6 +181,34 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
             Column("created_at", String(40)),
             Column("updated_at", String(40)),
             Column("payload", String(100000)),
+        )
+        # M3 关系表：追加式建表，不影响既有数据。relationship_key 为跨快照
+        # 稳定逻辑身份；snapshot_id 标记本修订证据的输入快照。
+        self._relationships = Table(
+            "relationships",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("relationship_key", String(64), nullable=False),
+            Column("source_id", String(36), nullable=False),
+            Column("snapshot_id", String(36)),
+            Column("status", String(24), nullable=False),
+            Column("revision", Integer, nullable=False),
+            Column("inference_source", String(12), nullable=False),
+            Column("run_id", String(36)),
+            Column("created_at", String(40)),
+            Column("payload", String(200000)),
+            UniqueConstraint("relationship_key", "revision", name="uq_rel_revision"),
+        )
+        self._relationship_runs = Table(
+            "relationship_runs",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("source_id", String(36)),
+            Column("run_type", String(16)),
+            Column("status", String(16)),
+            Column("created_at", String(40)),
+            Column("updated_at", String(40)),
+            Column("payload", String(200000)),
         )
         # 开发级建表：不存在则创建；正式迁移方案在 M8 引入。
         self._metadata.create_all(self._engine)
@@ -751,6 +785,179 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
                 select(self._semantic_runs)
                 .where(self._semantic_runs.c.source_id == source_id)
                 .order_by(self._semantic_runs.c.created_at.desc())
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    # -- M3 关系持久化 ---------------------------------------------------------
+
+    def save_relationship(
+        self, record: dict[str, Any], expected_revision: int | None = None
+    ) -> int:
+        """追加新修订；expected_revision 非空时在事务内原子乐观锁。"""
+        with self._engine.begin() as conn:
+            return self._insert_relationship(record, expected_revision, conn)
+
+    def _insert_relationship(
+        self,
+        record: dict[str, Any],
+        expected_revision: int | None,
+        conn: Any,
+    ) -> int:
+        key = record["relationship_key"]
+        current = conn.execute(
+            select(func.max(self._relationships.c.revision)).where(
+                self._relationships.c.relationship_key == key
+            )
+        ).scalar()
+        if expected_revision is not None and (current or 0) != expected_revision:
+            raise RevisionConflictError(
+                f"修订冲突：最新修订为 {current or 0}，提交基于 {expected_revision}")
+        revision = (current or 0) + 1
+        row = {**record, "revision": revision}
+        try:
+            conn.execute(
+                self._relationships.insert().values(
+                    id=_new_id(),
+                    relationship_key=key,
+                    source_id=row["source_id"],
+                    snapshot_id=row.get("snapshot_id"),
+                    status=row.get("status", "candidate"),
+                    revision=revision,
+                    inference_source=row.get("inference_source", "rules"),
+                    run_id=row.get("run_id"),
+                    created_at=row.get("created_at") or _now(),
+                    payload=_dump(row),
+                )
+            )
+        except IntegrityError:
+            # 并发窗口下唯一约束 (relationship_key, revision) 为最终仲裁者。
+            raise RevisionConflictError(
+                "并发修订冲突：关系已被其他写入更新，请刷新后重试") from None
+        return revision
+
+    def save_relationship_batch(
+        self, records: list[dict[str, Any]], run_record: dict[str, Any]
+    ) -> None:
+        """整次运行的关系修订 + 运行记录单事务提交；任一失败整体回滚。"""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        run_values = {
+            "id": run_record["run_id"],
+            "source_id": run_record.get("source_id"),
+            "run_type": run_record.get("run_type"),
+            "status": run_record.get("status"),
+            "created_at": run_record.get("started_at") or _now(),
+            "updated_at": _now(),
+            "payload": _dump(run_record),
+        }
+        with self._engine.begin() as conn:
+            for record in records:
+                self._insert_relationship(record, None, conn)
+            conn.execute(
+                sqlite_insert(self._relationship_runs)
+                .values(run_values)
+                .on_conflict_do_update(
+                    index_elements=[self._relationship_runs.c.id],
+                    set_={k: v for k, v in run_values.items() if k != "id"},
+                )
+            )
+
+    def _load_relationship_rows(self, where_clause: Any) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._relationships).where(where_clause).order_by(
+                    self._relationships.c.relationship_key,
+                    self._relationships.c.revision.desc(),
+                )
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    def get_relationship_history(self, relationship_key: str) -> list[dict[str, Any]]:
+        return self._load_relationship_rows(
+            self._relationships.c.relationship_key == relationship_key
+        )
+
+    def get_effective_relationship(self, relationship_key: str) -> dict[str, Any] | None:
+        rows = self.get_relationship_history(relationship_key)
+        if not rows:
+            return None
+        return select_effective_relationship(rows)
+
+    def list_relationships(
+        self,
+        source_id: str,
+        snapshot_id: str | None = None,
+        status: str | None = None,
+        effective_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        rows = self._load_relationship_rows(
+            self._relationships.c.source_id == source_id
+        )
+        if effective_only:
+            # 按逻辑键分组（跨快照共享键），每组取有效修订
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:  # rows 已按 key 分组、修订倒序
+                groups.setdefault(row["relationship_key"], []).append(row)
+            selected = [select_effective_relationship(group) for group in groups.values()]
+        else:
+            latest: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                latest.setdefault(row["relationship_key"], row)
+            selected = list(latest.values())
+        if snapshot_id is not None:
+            selected = [r for r in selected if r.get("snapshot_id") == snapshot_id]
+        if status is not None:
+            selected = [r for r in selected if r.get("status") == status]
+        return sorted(
+            selected,
+            key=lambda r: (
+                -(r.get("scores", {}) or {}).get("total_weighted", 0.0),
+                r["relationship_key"],
+            ),
+        )
+
+    def save_relationship_run(self, run: dict[str, Any]) -> None:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        record = {
+            "id": run["run_id"],
+            "source_id": run.get("source_id"),
+            "run_type": run.get("run_type"),
+            "status": run.get("status"),
+            "created_at": run.get("started_at") or _now(),
+            "updated_at": _now(),
+            "payload": _dump(run),
+        }
+        with self._engine.begin() as conn:
+            conn.execute(
+                sqlite_insert(self._relationship_runs)
+                .values(record)
+                .on_conflict_do_update(
+                    index_elements=[self._relationship_runs.c.id],
+                    set_={k: v for k, v in record.items() if k != "id"},
+                )
+            )
+
+    def get_relationship_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._relationship_runs).where(
+                    self._relationship_runs.c.id == run_id
+                )
+            ).first()
+        return dict(_load(row.payload, {})) if row else None
+
+    def list_relationship_runs(
+        self, source_id: str, run_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        conditions = [self._relationship_runs.c.source_id == source_id]
+        if run_type is not None:
+            conditions.append(self._relationship_runs.c.run_type == run_type)
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._relationship_runs)
+                .where(and_(*conditions))
+                .order_by(self._relationship_runs.c.created_at.desc())
             ).fetchall()
         return [dict(_load(row.payload, {})) for row in rows]
 

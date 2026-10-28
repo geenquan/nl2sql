@@ -40,13 +40,34 @@ M1 接口与命令示例见 README；扫描为同步执行，后台任务、增�
 未完成：Embedding 向量检索（明确保留，不宣称 M2 全部完成）；候选实体准确率等无标签指标
 标记 unavailable。M3 输入已就绪（foreign_identifier_candidate 清单 + 画像证据）。
 
-## M3 — 跨表关系发现与验证
-- [ ] 候选关系召回（类型、命名、语义、统计特征）
-- [ ] 值域覆盖、唯一性、基数、NULL 和 JOIN 膨胀证据
-- [ ] 关系状态机：candidate / needs_review / validated / rejected / stale
-- [ ] 关系候选和负例评测
-- 验收输出：候选关系表、证据详情、关系图数据、审核结果。
-- 门槛：未经验证的关系不得默认用于生产查询。
+## M3 — 跨表关系发现与验证（已完成，含真实只读演示）
+- [x] 候选关系召回（显式外键 + 类型兼容矩阵 + 命名/注释/术语词法 + M2 有效语义
+  （rejected 不作正向证据）+ 主键/唯一索引/画像口径；分桶 Top-K，禁止笛卡尔积；
+  通用词/状态码/字典↔字典/跨族类型负例防线）
+- [x] 值域覆盖、唯一性、基数、NULL 和 JOIN 膨胀证据（专用 RelationshipProbe
+  有界聚合查询；exact/sample/unknown 口径；三种分母不混用；空串/占位值扣除；
+  成本门槛与预算耗尽降级 unknown）
+- [x] 关系状态机：candidate / evidence_collected / needs_review / validated /
+  rejected / stale（快照结构指纹比较自动 stale + 人工标记 + 显式重验；
+  rel-validate-v1 策略：高覆盖/名称相似/语义相似不能单独自动升级）
+- [x] 审核与并发（expected_revision 原子乐观锁→409；机器不覆盖人工；
+  撤销/拒绝/过期改变有效结果；reviewer 为本地开发输入）
+- [x] 关系图与受限多跳路径（默认仅 validated 非 stale 边；防环；跳数/路径/
+  节点/期限预算；Mermaid 输出）
+- [x] 关系候选和负例评测（合成集开发标注：Precision 0.75 / Recall 1.0 / F1 0.857，
+  高置信错误 0，基数准确率 1.000，路径用例通过；字段名基线 Precision≈0.04 对照；
+  LLM/Embedding 基线未评测——如实标注）
+- [x] 持久化与兼容升级（relationships/relationship_runs 追加建表，create_all
+  兼容，不动既有表；修订式历史；失败运行零残留）
+- 验收输出：候选关系表、证据详情、关系图数据、审核结果（全部提供；
+  真实 hotel 库只读演示：18 表扫描 → 67 候选 → 20 条聚合查询验证出
+  1 validated + 4 needs_review（如实体现在采样口径），审核/过期/重验/图/路径闭环）
+- 门槛达成：未经验证的关系不得默认用于生产查询——默认路径搜索仅使用
+  validated 非 stale 边（ADR-002）。
+- 已知限制：数据分布漂移不会自动识别（结构漂移自动 stale；分布漂移需人工
+  触发重验；定时漂移检测在 M8）；验证串行执行（并发=1）；MariaDB 无服务端
+  语句期限提示（回退客户端 read_timeout）；编码映射类跨族类型关系需人工登记
+  （origin=human），不自动召回。
 
 ## M4 — 业务语义层
 - [ ] 实体、属性、关系、指标、维度、查询路径

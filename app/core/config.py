@@ -42,6 +42,27 @@ class Settings(BaseSettings):
     # 单次语义分析的模型调用总期限（秒）；请求超时不替代整次运行期限。
     semantics_llm_deadline_seconds: int = Field(default=120, gt=0)
 
+    # M3 关系发现与验证预算：候选召回纯本地；数据验证显式触发、全程有界。
+    relationship_max_candidates_per_run: int = Field(default=200, gt=0)
+    relationship_topk_per_field: int = Field(default=5, gt=0)
+    relationship_discovery_deadline_seconds: int = Field(default=60, gt=0)
+    relationship_validation_max_candidates: int = Field(default=10, gt=0)
+    relationship_validation_max_queries: int = Field(default=120, gt=0)
+    relationship_query_timeout_ms: int = Field(default=15000, ge=100)
+    relationship_validation_deadline_seconds: int = Field(default=300, gt=0)
+    # 证据采样窗口行数；窗口未截断（行数<窗口）才记 exact 口径。
+    relationship_sample_window_rows: int = Field(default=500, gt=0, le=10000)
+    # 成本门槛：右端行数估计超过该值且连接列无索引时拒绝 JOIN 探测（降级 unknown）。
+    relationship_exact_max_rows: int = Field(default=50000, gt=0)
+    # 并发验证上限：当前实现为串行执行（=1 由执行模型直接保证；配置保留用于未来并行化）。
+    relationship_max_concurrent_validations: int = Field(default=1, ge=1)
+    # 自动 validated 的前向覆盖率阈值（exact 口径）；仅高覆盖率不能单独升级。
+    relationship_coverage_threshold: float = Field(default=0.995, gt=0.5, le=1.0)
+    relationship_path_max_hops: int = Field(default=3, ge=1, le=6)
+    relationship_path_max_paths: int = Field(default=5, ge=1, le=50)
+    relationship_path_max_nodes: int = Field(default=200, ge=1)
+    relationship_path_deadline_seconds: int = Field(default=10, gt=0)
+
     # 系统业务库：与只读查询数据源独立，持久化接入仍待实现。
     biz_mysql_host: str = "127.0.0.1"
     biz_mysql_port: int = Field(default=3306, gt=0, le=65535)

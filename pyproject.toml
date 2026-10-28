@@ -40,5 +40,8 @@ target-version = "py313"
 # close 失败也必须吞掉以免覆盖主要结果；这里是刻意为之的宽捕获。
 "app/services/scan_service.py" = ["BLE001", "S110"]
 "app/services/semantics_service.py" = ["BLE001"]
+# M3 关系运行与扫描同族：发现/验证全生命周期收尾必须兜底捕获任意异常
+# （failed + finished_at + 固定安全文案），close 失败吞掉不覆盖主要结果。
+"app/services/relationship_service.py" = ["BLE001", "S110"]
 # 并发回归测试需捕获线程内任意异常并断言结果，不允许静默。
 "tests/test_semantics_service.py" = ["BLE001"]

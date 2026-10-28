@@ -106,6 +106,44 @@ curl -s "http://127.0.0.1:8000/api/v1/sources/<sid>/semantics/search?q=组织机
 人工确认不被新一轮模型建议覆盖；模型故障与语义 unknown 分开表达。评测指标与真实模型
 验证结果见 [开发交接报告](docs/development-status.md)。
 
+## M3：跨表关系发现与验证（可用）
+
+```bash
+# 1) 候选召回（纯本地 M1/M2 输入，不连源库；默认发布快照）
+curl -s -X POST http://127.0.0.1:8000/api/v1/sources/<sid>/relationships/discover \
+  -H 'Content-Type: application/json' -d '{}'
+# 返回 run（candidates_new/notes/budget）；部分快照需 {"allow_partial": true}
+
+# 2) 按优先级有界只读验证 Top-N 候选（显式触发才连源库，聚合查询无业务值）
+curl -s -X POST http://127.0.0.1:8000/api/v1/sources/<sid>/relationships/validate \
+  -H 'Content-Type: application/json' -d '{"limit": 5}'
+
+# 3) 列出/查看关系详情（证据束、口径、阻断原因）与修订历史
+curl -s "http://127.0.0.1:8000/api/v1/sources/<sid>/relationships?status=validated"
+curl -s http://127.0.0.1:8000/api/v1/relationships/<relationship_key>
+curl -s http://127.0.0.1:8000/api/v1/relationships/<relationship_key>/history
+
+# 4) 人工审核（confirm/reject/revert；expected_revision 冲突返回 409）
+curl -s -X POST http://127.0.0.1:8000/api/v1/relationships/<relationship_key>/review \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"confirm","reviewer":"dev","expected_revision":2}'
+
+# 5) 标记过期与显式重验；单关系验证 / 运行记录
+curl -s -X POST http://127.0.0.1:8000/api/v1/relationships/<relationship_key>/stale \
+  -H 'Content-Type: application/json' -d '{"reason":"结构变化","expected_revision":3}'
+curl -s -X POST "http://127.0.0.1:8000/api/v1/relationships/<relationship_key>/revalidate?source_id=<sid>"
+curl -s http://127.0.0.1:8000/api/v1/relationships/runs/<run_id>
+
+# 6) 关系图（可 Mermaid）与受限多跳路径（仅 validated 非 stale 边）
+curl -s "http://127.0.0.1:8000/api/v1/sources/<sid>/relationships/graph?mermaid=true"
+curl -s "http://127.0.0.1:8000/api/v1/sources/<sid>/relationships/paths?from_table_id=<t1>&to_table_id=<t2>&max_hops=3"
+```
+
+约束：候选≠已验证（ADR-002），默认路径搜索只用 validated 非 stale 边；验证前核对源库
+结构与输入快照一致；指标只记聚合口径（exact/sample/unknown），采样口径不能自动升级为
+validated；真实只读演示脚本 `python scripts/m3_real_validation.py`（临时目录、预算先行、
+不打印业务值）。评测与真实验证结果见 [开发交接报告](docs/development-status.md)。
+
 ## 目录
 
 ```text
@@ -156,8 +194,7 @@ tests/
 - [x] M0：工程结构、文档、配置、健康检查、里程碑 API、核心契约
 - [x] M1：数据源连接、元数据扫描、画像与持久化（真实库全链路验证，见交接报告）
 - [~] M2：字段语义理解（规则+DeepSeek 已真实验证；Embedding 检索未接入，见交接报告）
-- [ ] M3：跨表关系发现
-- [ ] M3：关系发现与验证
+- [x] M3：跨表关系发现与验证（候选召回/有界只读验证/审核/过期重验/关系图与路径；真实只读演示通过，见交接报告）
 - [ ] M4：业务语义层
 - [ ] M5：视图/宽表生成和质量校验
 - [ ] M6：NL2SQL、安全执行和结果验证

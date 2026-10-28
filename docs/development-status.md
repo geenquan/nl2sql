@@ -1,6 +1,6 @@
 # 开发交接报告
 
-更新时间：2026-10-28（M1 完成 + 三轮修复；M2 字段语义理解完成主体，Embedding 检索项未完成）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-28（M3 跨表关系发现与验证完成，含真实只读演示；此前 M1 完成、M2 主体完成 Embedding 未接入）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
 
 ## 当前环境
 
@@ -8,6 +8,99 @@
 - 本机解释器：`/Users/apple/miniconda3/envs/nl2sql/bin/python`；其他机器激活自己的同名环境。
 - 依赖：**PyMySQL 1.2.3**（MySQL 驱动）；**httpx 0.28.1 转为运行时依赖**（DeepSeek 客户端
   使用，未引入供应商 SDK）。其余与 M0 基线一致（fastapi 0.162.0 / sqlalchemy 2.1.6 等）。
+  **M3 未引入任何新第三方依赖**（纯标准库 + 既有 fastapi/sqlalchemy/pymysql）。
+
+## M3 跨表关系发现与验证（2026-10-28 完成）
+
+### 已实现能力
+
+| 能力 | 实现 |
+| --- | --- |
+| 领域契约 | `app/domain/relationships.py`：稳定逻辑键（relationship_key=数据源+两端完整标识+有序映射，方向敏感，跨快照稳定）、状态机 candidate→evidence_collected→validated/needs_review/rejected + stale/重验、有效结果解析（人工终局不被机器覆盖；人工/系统 stale 必须改变有效结果；人工 mark_stale 是重验指令非终局判定） |
+| 候选召回 | `app/relationships/discovery.py`（rel-recall-v1）：显式外键（含组合键有序映射/自关联/悬空外键报告）+ 分桶信号召回（禁止笛卡尔积）：引用方特征（M2 foreign_identifier_candidate/标识符命名/非通用 token）× 被引用方特征（主键/单列唯一索引/entity_identifier），桶=非通用 token（含表名词法与轻量复数变体，method=lexical）；每列 Top-K、总数预算、单调时钟期限；类型兼容矩阵先行过滤（incompatible 不召回——编码映射走人工登记；risky 保留带风险） |
+| 类型兼容 | `app/relationships/type_compat.py`：族/符号/精度/标度/长度解析；int 宽度与符号、decimal 精度、varchar 长度、date vs datetime 粒度、text 不可比 → compatible/risky/incompatible/unknown + 原因 |
+| 只读证据 | `app/relationships/evidence.py` + `app/adapters/mysql_probe.py`：专用 `RelationshipProbe` 端口（ports/connectors.py 类型化 Spec），系统构造聚合查询（窗口统计 + LEFT JOIN 聚合），标识符白名单转义、无业务参数、只返回计数；验证前源库结构 vs 输入快照核对（不一致→stale 不绑定证据） |
+| 指标口径 | 双侧行数/非空/空串/组合去重/常量列（占位风险）+ 双向覆盖率（分母=左窗非空键行，NULL 键排除单列）+ JOIN 膨胀 fanout/INNER 行数 + 基数观察（源×目标唯一性）；每指标记方法/分母/口径（exact=窗口未截断，sample=截断，unknown=成本门槛/预算耗尽）/时间/快照/预算；SQL 只存模板名+预算摘要 |
+| 验证策略 | rel-validate-v1：名称相似/语义相似/高样本覆盖率**不能单独**自动升级；自动 validated 需类型兼容 + 前向覆盖 exact≥0.995 + 目标端唯一（结构或 exact）+ fanout≤1 + 支持分≥0.4 + 无阻断风险（组合键缺失/语义被否决/源端低唯一率/结构漂移）；否则 needs_review 逐条阻断原因；validated 附范围/时间/快照/基数/排除项/限制声明 |
+| 预算与成本 | 候选数/总查询数/单查询期限（MySQL≥5.7.8 `MAX_EXECUTION_TIME` 服务端提示，MariaDB 回退客户端 read_timeout——支持范围已明示）/运行总期限（单调时钟）/窗口行数/成本门槛（右端行数估计>5 万且连接列无索引→拒 JOIN 降级 unknown）；验证串行执行（并发=1 由执行模型保证）；JOIN 膨胀在聚合上计算不物化 |
+| 审核与过期 | confirm/reject/revert + mark_stale + revalidate；expected_revision 仓储事务内原子乐观锁（409，唯一约束多进程仲裁）；机器不覆盖人工；新发现不覆盖人工审核；快照结构指纹（列/类型/PK/FK/索引）比较自动 stale（完整快照表消失也 stale；部分快照缺表不当作消失） |
+| 图与路径 | `app/relationships/graph.py`：JSON 图（节点完整标识/边方向+有序映射+状态+基数+风险+证据摘要；候选/拒绝/过期可见且区分）+ Mermaid；受限 DFS 路径搜索默认仅 validated 非 stale 边、仅 source→target 方向、防环、跳数/路径数/节点数/期限预算、多对多与组合缺失风险提示 |
+| 持久化 | SQLite 追加两表 `relationships`（唯一约束 relationship_key+revision）/`relationship_runs`（create_all 兼容，不动既有表）；修订式历史；整次运行修订+运行记录单事务提交，**失败运行零残留**（发现/验证同 M2 语义） |
+| API | `app/api/routes/relationships.py`（前缀 /api/v1）：POST discover / validate（批量）/ relationships/{key}/validate / review / stale / revalidate；GET 列表（状态/快照过滤）/详情/历史/运行/图（?mermaid）/路径。默认发布快照，部分目录需 allow_partial 且 input_complete=false |
+
+### 召回与验证的负例防线（要求第四节逐项落地）
+
+同名不同义（M2 类别冲突风险标记）；共享状态码（status/category 类别列不作关系信号）；
+不同租户重复编号（源端低唯一率风险阻断 + validated 附租户分层提示）；组合键需求
+（目标组合主键且匹配列非独立唯一→组合键风险阻断自动验证）；编码映射（跨族类型
+incompatible 不召回，人工登记保留）；时间条件缺失（多对多基数附 JOIN 需聚合/条件
+约束提示）；同名词典 code↔code（双端均被引用方特征不配对）；高样本覆盖但支持分不足
+（coverage 达标仍被 support_score 阻断）。
+
+### 评测结果（合成集，开发标注——非真实业务人工金标准）
+
+标签来源：开发者按合成库设计标注（tests/test_relationships_eval.py；
+9 正例 + 6 负例）。**Recall 分母=本合成库标注的全部真实引用关系（9 条），
+不是全库任意字段对的召回率**；LLM 基线与 Embedding 基线未实现，未评测
+（不为此扩大本轮模型调用）。
+
+| 指标 | 结果 | 说明 |
+| --- | --- | --- |
+| 召回 Precision | **0.750**（9/12） | 3 条误报均为标注负例（tenant_seq 租户编号、room_id→room_type、room_no→room_type.code 同名词法噪声），验证层全部 needs_review |
+| 召回 Recall / F1 | **1.000** / **0.857** | 全部 9 条正例召回（8 显式外键 + 1 无外键 booking_no 词法） |
+| 字段名相同基线 Precision | **≈0.04**（2/50） | 同名即候选：id↔id/name↔name/status↔status 大量配对；Recall 0.22（FK 名不同漏召） |
+| 高置信错误（自动 validated 但标签为负例） | **0** | 验证层全部 9 条 validated 均为正例 |
+| 基数判断准确率 | **1.000**（9/9 many_to_one） | evidence.cardinality_observed 与标注一致 |
+| 路径用例 | **通过** | 3 跳 booking_item→booking→guest/room→tenant 可达；自关联防环（employee→employee 0 条）；有向不逆向（booking→payment 0 条） |
+| 单候选查询成本 | **≤4 条聚合查询/候选**（2 窗口 + 2 JOIN），运行 queries_used ≤ 预算 | 合成集与真实演示均符合 |
+
+### 真实只读验证（hotel 库，2026-10-28）
+
+`python scripts/m3_real_validation.py`（元数据/凭证写临时目录，预算先行打印，
+不打印业务值/凭证；未覆盖任何用户已有审核结论）：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 扫描（≤20 表 × 200 行采样） | **succeeded**：18 表 planned/scanned，0 失败 0 跳过 |
+| 候选召回（纯本地） | **succeeded**：found=new=67，input_complete=true |
+| 有界验证（Top-5 × ≤30 查询，窗口 200） | **succeeded**：queries=20；**1 validated + 4 needs_review**（阻断原因如实：4 条 sample 口径 + 源端样本唯一率低 0.10–0.25——共享编码特征，策略拒绝自动升级） |
+| validated 示例 | `role_permission.permission_id → permission.id`：前向覆盖 1.0（exact，分母 39）、fanout=1.0、基数 many_to_one |
+| 审核/过期/重验闭环 | 人工确认 rev=3 → mark_stale 生效 stale → revalidate succeeded → 恢复 validated |
+| 图 | 17 节点 / 67 边（状态分布 candidate 62 / needs_review 4 / validated 1，清晰区分） |
+
+未在真实库上人工标注金标准，以上真实结果仅证明链路与预算执行，不作为准确率结论。
+
+### 测试与验证（Conda `nl2sql`，2026-10-28）
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | **498 passed, 8 skipped**（M3 新增 123 项离线测试；skipped=6 项 M1/M2 真实集成 + 2 项 M3 真实集成，默认关闭） |
+| `python -m ruff check app tests scripts` | **All checks passed** |
+| `python -m pip check` | **No broken requirements found** |
+| M3 新增测试文件 | domain（键/状态机/有效解析 19）、repository（修订/乐观锁/并发/批原子 15）、discovery（召回/负例/TopK/期限/幂等 19）、evidence（口径/分母/膨胀/占位/门槛/预算/策略 23）、service（编排/审核并发/stale/重验/零残留/安全文案 26）、graph（图/路径/防环/预算 12）、api（端到端 11）、eval（指标/基线/路径/成本 9） |
+| 真实集成 | `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q` → **7 passed, 1 skipped**（5 项 M1 + 2 项 M3：探查端口有界聚合与脱敏、小预算真实发现验证链路；1 skipped 为 M2 真实模型项，需另加 NL2SQL_SEMANTICS_INTEGRATION=1，本轮未调用模型） |
+
+### M3 已知限制（如实保留）
+
+- **数据分布漂移不自动识别**：结构漂移（列/类型/约束/索引变化、完整快照表消失）
+  会自动 stale；纯数据分布变化（如覆盖率下降）需人工标记 stale/重验或下次验证时
+  由策略降级——不声称自动发现所有漂移（定时漂移检测在 M8）。
+- 验证串行执行（并发=1 由执行模型直接保证；`RELATIONSHIP_MAX_CONCURRENT_VALIDATIONS`
+  配置保留用于未来并行化，未实际并行）。
+- MariaDB 不支持 `MAX_EXECUTION_TIME` 提示：回退客户端 read_timeout（单查询服务端
+  期限仅 MySQL ≥5.7.8 SELECT 支持，范围已在配置文档明示）。
+- 编码映射类跨族类型关系（字符串↔整数）不自动召回也不做隐式转换 JOIN；
+  人工登记路径（origin=human）预留。
+- 图路径为有向（source→target）搜索，不逆向使用边；连通≠业务可 JOIN（不生成
+  生产 SQL，M4 范畴）。
+- 词法召回无 Embedding（沿用 M2 词法基线，method=lexical，不伪造向量分）。
+
+### M4 可使用的输入
+
+- 有效关系清单（含 validated/needs_review 状态、有序字段映射、基数、证据口径）：
+  `GET /api/v1/sources/{id}/relationships?status=validated`（默认发布快照 + effective）；
+- 图与路径数据：`GET .../relationships/graph?mermaid=true`、`.../paths`；
+- 关系修订历史与审核记录（溯源）；运行记录（预算与查询计数，成本核算用）。
 
 ## M2 修复轮 3（2026-10-28，三项小范围修复，全部先复现后修复，完全离线验证）
 

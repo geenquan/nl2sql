@@ -137,3 +137,62 @@ class SourceRepository(ABC):
     @abstractmethod
     def find_source_by_name(self, name: str) -> dict[str, Any] | None:
         ...
+
+
+class RelationshipRepository(ABC):
+    """M3 关系持久化端口。
+
+    修订语义（沿用 M2 原则，关系侧补充 stale）：
+    - 每次写入追加新修订；relationship_key 是跨快照稳定的逻辑身份，
+      snapshot_id 标记本修订证据所基于的输入快照（新快照不覆盖旧证据链）；
+    - effective 解析：人工结论不被机器修订覆盖；人工可撤销自己的结论；
+      stale（人工或结构变化）必须改变有效结果；stale 之后的新机器修订
+      （重验/重发现）重新接管有效结果；
+    - expected_revision 原子乐观锁：版本比较与写入同事务（多进程安全），
+      唯一约束 (relationship_key, revision) 为最终仲裁者。
+    """
+
+    @abstractmethod
+    def save_relationship(
+        self, record: dict[str, Any], expected_revision: int | None = None
+    ) -> int:
+        """追加关系新修订，返回修订号；expected_revision 过期抛冲突。"""
+
+    @abstractmethod
+    def save_relationship_batch(
+        self, records: list[dict[str, Any]], run_record: dict[str, Any]
+    ) -> None:
+        """整次运行的关系修订 + 运行记录单事务写入：全成或全败，
+        失败运行不产生部分有效结果（沿用 M2 候选写入—成功发布语义）。"""
+
+    @abstractmethod
+    def get_relationship_history(self, relationship_key: str) -> list[dict[str, Any]]:
+        """按修订号倒序返回该逻辑关系的全部修订（跨快照）。"""
+
+    @abstractmethod
+    def get_effective_relationship(self, relationship_key: str) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def list_relationships(
+        self,
+        source_id: str,
+        snapshot_id: str | None = None,
+        status: str | None = None,
+        effective_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """列出关系（默认 effective；snapshot_id 过滤证据快照）。"""
+
+    @abstractmethod
+    def save_relationship_run(self, run: dict[str, Any]) -> None:
+        """按 run_id upsert 关系运行记录。"""
+
+    @abstractmethod
+    def get_relationship_run(self, run_id: str) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def list_relationship_runs(
+        self, source_id: str, run_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        """按创建时间倒序。"""

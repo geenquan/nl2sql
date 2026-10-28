@@ -9,6 +9,34 @@
 - 依赖：**PyMySQL 1.2.3**（MySQL 驱动）；**httpx 0.28.1 转为运行时依赖**（DeepSeek 客户端
   使用，未引入供应商 SDK）。其余与 M0 基线一致（fastapi 0.162.0 / sqlalchemy 2.1.6 等）。
 
+## M2 修复轮 2（2026-10-28，五项遗漏，全部先复现后修复）
+
+1. **敏感文本缺口【P1】**：键值遮蔽重写为“保留键名+完整遮蔽值到句界”（覆盖
+   Bearer/引号/空格/后半段，`token: Bearer X` 不再残留 X）；样本外发逐值执行
+   mask_value + sanitize_text_for_model 完整净化，净化后仍残留键值形态的值拒绝外发；
+   模型提供的 name_pattern/glossary_term 上下文证据（任意文本不可核验）一律丢弃，
+   不存储、不作为依据；business_name/entities/rationale/alternatives 全部净化。
+2. **证据校验漏洞【P1】**：修复 `return column if ref == column else None, True`
+   元组缺陷（此前产生 ref=None 的“有效证据”）；index 证据仅接受包含当前字段的
+   真实索引名（字段名自身不能绕过）；画像指标数值等值（类型明确、容差 1e-9，
+   不做字符串包含）；表用途画像证据必须以 columns.<列>.profile.<指标>[:=值]
+   定位实际字段的已计算指标（值+口径核对），裸指标名/值形式不再通过；
+   上层增加规范引用非空不变量。
+3. **运行总期限【P2】**：单调时钟绝对截止时间贯穿连接/读取/退避/流式分块；
+   剩余期限传入客户端（重试与修复共享）；返回后再次检查，超期结果不发布
+   （deadline_exceeded 回退规则）；注入时钟测试，无真实长 sleep。
+4. **失败路径计量【P2】**：HTTP 尝试计数统一在发起点，所有失败路径携带累计次数；
+   usage/model 在内容解析前提取，内容不合格/截断不丢用量（随异常携带）；
+   分项完整性 `llm_prompt_usage_complete/llm_completion_usage_complete`
+   （已知一侧保留、缺失一侧如实标记）；同一逻辑调用内含传输重试时早期尝试
+   用量不可确认 → 完整性 False 但保留已知小计；model_reported 仅服务端值。
+5. **全状态有界读取【P2】**：错误响应体也走有界流式嗅探（4KB），
+   超限直接丢弃正文只用状态码；声明长度仅对 200 生效且不信任（非法值忽略，
+   累计字节为最终上限）；读取中途异常按 network 处理。
+
+验证（修复轮 2 后）：`python -m pytest -q` **357 passed, 6 skipped**；ruff/pip check 通过；
+真实复验 hotel 只读 + deepseek-flash 1 次调用（1201/668 tokens）通过全部新校验。
+
 ## M2 缺陷修复轮（2026-10-28，七组问题全部先复现后修复）
 
 1. **模型输入净化与样本外发【P1】**：键值敏感信息改为“保留键名+遮蔽值”（冒号/等号/
@@ -88,7 +116,7 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| `python -m pytest -q` | **322 passed, 6 skipped**（修复轮后；skipped 为真实集成，默认关闭；无残留文件） |
+| `python -m pytest -q` | **357 passed, 6 skipped**（修复轮 2 后；skipped 为真实集成，默认关闭；无残留文件） |
 | `python -m ruff check app tests scripts` | **All checks passed** |
 | `python -m pip check` | **No broken requirements found** |
 | `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q`（M1 只读复验） | **5 passed** |

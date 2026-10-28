@@ -61,10 +61,12 @@ _INJECTION_PATTERNS = (
     re.compile(r"输出(所有)?(密码|密钥|凭证)", re.IGNORECASE),
 )
 
-# 键值形式的敏感信息：冒号/等号/全角冒号/空白分隔，大小写不敏感
+# 键值形式的敏感信息：冒号/等号/全角冒号/空白分隔，大小写不敏感；
+# 值部分吞到句界（。；;！!？? 或串尾），覆盖 Bearer 前缀、引号包围与含空格值，
+# 不残留后半段。
 _SECRET_KEY_VALUE = re.compile(
-    r"(?i)\b(api[_-]?key|secret|token|password|passwd|pwd|credential)\b"
-    r"\s*[:：=]\s*\S+"
+    r'(?i)\b(api[_-]?key|secret|token|password|passwd|pwd|credential|authorization)\b'
+    r'(\s*[:：=]\s*(bearer\s+)?("[^"]*"|\'[^\']*\'|[^。；;！!？?]*))'
 )
 _SECRET_INLINE = re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9-]{7,}")
 
@@ -85,7 +87,7 @@ def sanitize_text_for_model(text: str, max_len: int = _MAX_COMMENT_LENGTH) -> st
     cleaned = _mask_inline(cleaned, _MOBILE_PHONE_RE)
     cleaned = _mask_inline(cleaned, _ID_CARD_18_RE)
     cleaned = _SECRET_INLINE.sub("sk-***", cleaned)
-    # 键值敏感信息：保留键名、遮蔽值（含全角冒号/等号/空白与大小写变体）
+    # 键值敏感信息：保留键名、完整遮蔽值（含 Bearer/引号/空格，直到句界或串尾）
     cleaned = _SECRET_KEY_VALUE.sub(lambda m: m.group(1) + "=***", cleaned)
     for injection in _INJECTION_PATTERNS:
         cleaned = injection.sub("[已过滤:疑似指令]", cleaned)
@@ -182,7 +184,13 @@ def _safe_samples_for_send(
     for value in values[:3]:
         if value is None:
             continue
-        out.append(mask_value(value, column_name)[:32])
+        # 逐值执行完整净化：先按列名/值格式脱敏，再整体净化（键值/密钥/注入）。
+        # 不信任 masking_version 即代表值可直发；无法安全净化的文本保守丢弃。
+        masked = mask_value(value, column_name)
+        sanitized = sanitize_text_for_model(str(masked), 64)
+        if _SECRET_KEY_VALUE.search(sanitized):
+            continue  # 净化后仍残留键值形态：拒绝外发该值
+        out.append(sanitized[:32])
     return out
 
 
@@ -214,6 +222,14 @@ def build_prompts(payload: dict[str, Any]) -> tuple[str, str]:
         f"置信等级枚举：{json.dumps(list(CONFIDENCE_LEVELS))}（相对强度，不是概率）。"
     )
     return system, user
+
+
+def _metric_value_matches(actual: Any, declared: str) -> bool:
+    """指标值等值判断：数值用类型明确的相等（容差 1e-9），不做字符串包含。"""
+    try:
+        return abs(float(actual) - float(declared)) <= 1e-9
+    except (TypeError, ValueError):
+        return str(actual) == declared
 
 
 def _extract_json(raw: Any) -> Any:
@@ -312,9 +328,13 @@ def validate_model_response(
             if etype not in EVIDENCE_TYPES or not isinstance(ref, str) or not ref:
                 evidence_ok = False
                 break
+            if etype in _CONTEXT_EVIDENCE:
+                # 模型提供的上下文证据（name_pattern/glossary_term）无法核验归属：
+                # 静默丢弃，不存储、不作为依据、也不计为无效（可核验类型才判无效）
+                continue
             resolved = _resolve_column_evidence(name, etype, ref, columns_ctx.get(name))
-            if resolved is None:
-                evidence_ok = False
+            if resolved is None or not resolved[0]:
+                evidence_ok = False  # 不变量：可核验类型必须给出非空规范引用
                 break
             canonical, is_direct = resolved
             has_direct = has_direct or is_direct
@@ -357,7 +377,15 @@ def validate_model_response(
 def _validate_table_purpose(
     purpose_raw: Any, table_context: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """表用途必须是结构化对象且证据可核验；否则返回 None（调用方记错误）。"""
+    """表用途必须是结构化对象且证据可核验；否则返回 None（调用方记错误）。
+
+    证据核验（表级）：comment 引用本表任意列注释或表注释；column_type 引用列名
+    或列类型串（规范化为列名）；primary_key/foreign_key 引用对应约束列；
+    index 引用索引名；profile_metric 必须以 columns.<列>.profile.<指标>[:值]
+    定位到实际字段的已计算指标（值数值等值、口径可用），规范引用为
+    “<列名>.<指标>”。裸指标名不再通过（无法定位字段）。模型提供的
+    name_pattern/glossary_term 上下文证据丢弃。
+    """
     if purpose_raw is None:
         return None
     if not isinstance(purpose_raw, dict):
@@ -373,37 +401,25 @@ def _validate_table_purpose(
         return None
     if rationale:
         rationale = sanitize_text_for_model(rationale, _MAX_RATIONALE)[:_MAX_RATIONALE]
-    evidence_items = purpose_raw.get("evidence") or []
-    table_objects = table_context.get("table_objects", {})
+    table_context.get("columns", {})
+    next(
+        (None for _ in ()), None)  # placeholder removed below
     verified_evidence: list[dict[str, Any]] = []
-    for item in evidence_items:
+    for item in purpose_raw.get("evidence") or []:
         if not isinstance(item, dict):
             return None
         etype = item.get("type")
         ref = item.get("ref")
         if etype not in EVIDENCE_TYPES or not isinstance(ref, str) or not ref:
             return None
-        if etype in _DIRECT_EVIDENCE:
-            allowed = table_objects.get(etype, set())
-            if ref in allowed:
-                verified_evidence.append({"type": etype, "ref": ref, "detail": ""})
-                continue
-            # 值形式：列类型串（任意列）或 metric=value（指标键合法）
-            if etype == "column_type" and any(
-                str(meta.get("data_type", "")).lower() == ref.lower()
-                for meta in table_context.get("columns", {}).values()
-            ):
-                verified_evidence.append({"type": etype, "ref": ref, "detail": ""})
-                continue
-            if etype == "profile_metric" and "=" in ref:
-                metric = ref.partition("=")[0]
-                if metric in allowed:
-                    verified_evidence.append({"type": etype, "ref": metric, "detail": ""})
-                    continue
+        if etype in _CONTEXT_EVIDENCE:
+            continue  # 模型上下文证据不可核验 → 丢弃
+        canonical = _resolve_table_evidence(etype, ref, table_context)
+        if canonical is None or not canonical:
             return None
-        verified_evidence.append({"type": etype, "ref": ref, "detail": ""})
+        verified_evidence.append({"type": etype, "ref": canonical, "detail": ""})
     if purpose != "unknown" and not verified_evidence:
-        return None  # 枚举通过但无证据：不可作为可追溯结论
+        return None  # 枚举通过但无可核验证据：不可作为可追溯结论
     alternatives_raw = purpose_raw.get("alternatives") or []
     alternatives = []
     for alt in alternatives_raw[:3]:
@@ -422,13 +438,61 @@ def _validate_table_purpose(
     }
 
 
+def _resolve_table_evidence(
+    evidence_type: str, ref: str, table_context: dict[str, Any]
+) -> str | None:
+    """表级证据核验与规范化；返回规范引用或 None。"""
+    columns_ctx = table_context.get("columns", {})
+    table_objects = table_context.get("table_objects", {})
+
+    def _column_profile_metric_ok(column: str, metric: str, declared: str | None) -> bool:
+        profile = (columns_ctx.get(column) or {}).get("profile") or {}
+        if metric not in profile or profile.get(metric) is None:
+            return False
+        if profile.get("metric_basis") in _UNUSABLE_PROFILE_BASIS:
+            return False
+        return not (declared and not _metric_value_matches(profile.get(metric), declared))
+
+    if evidence_type == "comment":
+        if ref in table_objects.get("comment", set()):
+            return ref
+        return None
+    if evidence_type == "column_type":
+        if ref in table_objects.get("column_type", set()):
+            return ref
+        for name, meta in columns_ctx.items():
+            if str(meta.get("data_type", "")).lower() == ref.lower():
+                return name
+        return None
+    if evidence_type in ("primary_key", "foreign_key"):
+        if ref in table_objects.get(evidence_type, set()):
+            return ref
+        return None
+    if evidence_type == "index":
+        if ref in table_objects.get("index", set()):
+            return ref
+        return None
+    if evidence_type == "profile_metric":
+        # 路径形态：定位实际字段的已计算指标
+        match = re.match(r"^columns\.([A-Za-z0-9_\u4e00-\u9fff]+)\.profile\.([A-Za-z_]+)(?:[:=](.*))?$", ref)
+        if match:
+            column, metric, declared = match.group(1), match.group(2), match.group(3)
+            if column in columns_ctx and _column_profile_metric_ok(column, metric, declared):
+                return f"{column}.{metric}"
+            return None
+        # 值形式（metric=value）与裸指标名无法定位字段 → 拒绝
+        return None
+    return None
+
 def _resolve_column_evidence(
     column: str, evidence_type: str, ref: str, column_ctx: dict[str, Any] | None
 ) -> tuple[str, bool] | None:
-    """核验并规范化单条字段证据；返回 (标准引用, 是否直接证据) 或 None（无效）。
+    """核验并规范化单条字段证据；返回 (规范引用, 是否直接证据) 或 None（无效）。
 
-    直接证据＝解析到当前字段自身的对象（类型/注释/主键/外键/索引含本列/
-    本字段画像指标）；name_pattern/glossary_term 为上下文证据。
+    直接证据＝解析到当前字段自身的对象（类型/注释/主键/外键/含该列的索引名/
+    本字段已计算画像指标）。模型提供的 name_pattern/glossary_term 为任意文本，
+    无法核验归属，一律丢弃（不存储、不作为依据）；规则引擎自产的上下文证据
+    不经过本函数。上层保证规范引用非空。
     """
     if column_ctx is None:
         return None
@@ -438,58 +502,63 @@ def _resolve_column_evidence(
         if metric not in profile or profile.get(metric) is None:
             return False  # 不存在或 None：不是已计算事实
         if profile.get("metric_basis") in _UNUSABLE_PROFILE_BASIS:
-            return False  # skipped/insufficient/缺口径：不可作为证据
-        if declared_value:
-            actual = str(profile.get(metric))
-            if declared_value != actual and declared_value not in actual:
-                return False  # 声明值与实际不符
-        return True
+            return False  # skipped/insufficient/无口径：不可作为证据
+        # 声明值与实际不符则不通过（数值等值，不做字符串包含）
+        return not declared_value or _metric_value_matches(profile.get(metric), declared_value)
+
+    in_primary_key = column in (column_ctx.get("primary_key") or ())
+    in_foreign_key = column in (column_ctx.get("foreign_key_columns") or ())
+    containing_indexes = column_ctx.get("indexes") or set()
 
     # 标准形态
-    if evidence_type == "column_type" and ref == column:
-        return column, True
     if evidence_type == "column_type":
-        # 值形式：引用本字段的类型串（如 "INTEGER"），大小写不敏感
+        if ref == column:
+            return column, True
         actual_type = str(column_ctx.get("data_type", "")).lower()
         if actual_type and ref.lower() == actual_type:
             return column, True
+        return None
     if evidence_type == "comment":
         comment = column_ctx.get("comment")
         if comment and ref == comment:
             return comment, True
-    if evidence_type == "primary_key" and column in (column_ctx.get("primary_key") or ()):
-        return column if ref == column else None, True
-    if evidence_type == "foreign_key" and column in (column_ctx.get("foreign_key_columns") or ()):
-        return column if ref == column else None, True
+        return None
+    if evidence_type == "primary_key":
+        if in_primary_key and ref == column:
+            return column, True
+        return None
+    if evidence_type == "foreign_key":
+        if in_foreign_key and ref == column:
+            return column, True
+        return None
     if evidence_type == "index":
-        indexes = column_ctx.get("indexes") or set()
-        if ref in indexes or ref == column:
+        # 仅接受“包含当前字段”的真实索引名；字段名本身不能绕过索引存在性检查
+        if ref in containing_indexes:
             return ref, True
-    if evidence_type == "profile_metric" and _profile_metric_ok(ref, None):
-        return ref, True
-    if evidence_type == "profile_metric" and "=" in ref:
-        # 值形式：metric=value（如 "uniqueness_ratio=1.0"）
-        metric, _, declared = ref.partition("=")
-        if _profile_metric_ok(metric, declared):
-            return metric, True
-    if evidence_type in _CONTEXT_EVIDENCE and ref:
-        return ref, False
+        return None
+    if evidence_type == "profile_metric":
+        if "=" in ref:
+            metric, _, declared = ref.partition("=")
+            if _profile_metric_ok(metric, declared or None):
+                return metric, True
+            return None
+        if _profile_metric_ok(ref, None):
+            return ref, True
+        return None
 
-    # 路径形态：columns.<本列>.<字段>[:值] —— 只接受本列路径
+    # 路径形态：columns.<本列>.<字段>[:值] / columns.<本列>.profile.<指标>[:值]
     if ref.startswith(f"columns.{column}."):
         segments = ref[len(f"columns.{column}."):].split(".", 2)
         if segments[0] == "profile" and evidence_type == "profile_metric" and len(segments) >= 2:
-            metric, _, declared = segments[1].partition(":") if len(segments) == 2 else (
-                segments[1], "", "")
-            if len(segments) >= 3:
-                metric, _, declared = (segments[1] + "." + segments[2]).partition(":")
+            metric_field = segments[1] if len(segments) == 2 else segments[1] + "." + segments[2]
+            metric, _, declared = metric_field.partition(":")
             if _profile_metric_ok(metric, declared or None):
                 return metric, True
             return None
         field, _, value = segments[0].partition(":")
         if field == "data_type" and evidence_type == "column_type":
             actual = str(column_ctx.get("data_type", "")).lower()
-            if not value or value.lower() in actual or actual in value.lower():
+            if not value or actual == value.lower():
                 return column, True
             return None
         if field == "comment" and evidence_type == "comment":
@@ -500,14 +569,16 @@ def _resolve_column_evidence(
         return None
     if evidence_type == "primary_key" and ref.startswith("constraints.primary_key:"):
         target = ref.split(":", 1)[1]
-        if target == column and column in (column_ctx.get("primary_key") or ()):
+        if target == column and in_primary_key:
             return column, True
         return None
     if evidence_type == "foreign_key" and ref.startswith("constraints."):
         target = ref.split(":", 1)[-1]
-        if target == column and column in (column_ctx.get("foreign_key_columns") or ()):
+        if target == column and in_foreign_key:
             return column, True
         return None
+
+    # name_pattern / glossary_term：模型提供的任意文本不可核验 → 丢弃
     return None
 
 

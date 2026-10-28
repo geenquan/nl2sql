@@ -173,6 +173,8 @@ class SemanticRun:
     llm_prompt_tokens: int | None = None  # 已知响应的累计；None = unavailable
     llm_completion_tokens: int | None = None
     llm_usage_complete: bool = True  # False = 部分 usage 缺失（部分已知）
+    llm_prompt_usage_complete: bool = True  # prompt 侧是否完整已知
+    llm_completion_usage_complete: bool = True  # completion 侧是否完整已知
     elapsed_ms: int | None = None
     columns_analyzed: int = 0
     send_samples: bool = False

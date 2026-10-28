@@ -14,7 +14,6 @@
 - 错误消息沿用固定安全文案，不落提示词/响应/异常文本。
 """
 
-import time
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
@@ -55,10 +54,14 @@ class SemanticsService:
         llm_factory: Callable[[], LLMClient] | None,
         settings: Settings,
         understanding: FieldUnderstandingService | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        import time as _time
+
         self._repo = metadata_repository
         self._llm_factory = llm_factory
         self._settings = settings
+        self._clock = clock or _time.monotonic
         self._understanding = understanding or FieldUnderstandingService(
             glossary=Glossary.load_default()
         )
@@ -227,107 +230,112 @@ class SemanticsService:
         expected = [c["name"] for c in columns]
 
         client = self._llm_factory()  # type: ignore[misc]
-        started = time.perf_counter()
-        deadline_seconds = self._settings.semantics_llm_deadline_seconds
+        started = self._clock()
+        deadline = started + self._settings.semantics_llm_deadline_seconds
+        feedback = ""
         total_budget = self._settings.semantics_llm_max_calls  # 总 HTTP 尝试预算
         consumed = 0
         logical_calls = 0
-        prompt_tokens: list[int] = []
-        completion_tokens: list[int] = []
-        usage_complete = True
-        feedback = ""
+        prompt_known: list[int] = []
+        completion_known: list[int] = []
+        prompt_complete = True   # 任一已发生请求的 prompt 用量不可确认 → False
+        completion_complete = True
 
-        def _elapsed_ok() -> bool:
-            return (time.perf_counter() - started) < deadline_seconds
+        def _flush_usage(run_obj: SemanticRun) -> None:
+            run_obj.llm_usage_complete = prompt_complete and completion_complete
+            run_obj.llm_prompt_usage_complete = prompt_complete
+            run_obj.llm_completion_usage_complete = completion_complete
+            if prompt_known:
+                run_obj.llm_prompt_tokens = sum(prompt_known)
+            if completion_known:
+                run_obj.llm_completion_tokens = sum(completion_known)
 
-        def _record_usage(usage) -> None:
-            nonlocal usage_complete
-            if usage.prompt_tokens is None or usage.completion_tokens is None:
-                usage_complete = False
+        def _account_usage(usage, http_attempts: int) -> None:
+            """累计一次逻辑调用的已知用量；带传输重试的调用其早期尝试用量未知。"""
+            nonlocal prompt_complete, completion_complete
+            if usage is None:
+                prompt_complete = False
+                completion_complete = False
+                return
+            if usage.prompt_tokens is None:
+                prompt_complete = False
             else:
-                prompt_tokens.append(usage.prompt_tokens)
-                completion_tokens.append(usage.completion_tokens)
+                prompt_known.append(usage.prompt_tokens)
+            if usage.completion_tokens is None:
+                completion_complete = False
+            else:
+                completion_known.append(usage.completion_tokens)
+            if http_attempts > 1:
+                # 同一逻辑调用内的早期尝试（如 429）无用量记录 → 不可确认完整
+                prompt_complete = False
+                completion_complete = False
+
+        def _finalize(error: dict) -> tuple[dict, dict | None, dict]:
+            run.llm_calls = logical_calls
+            run.llm_http_attempts = consumed
+            _flush_usage(run)
+            run.elapsed_ms = int((self._clock() - started) * 1000)
+            return {}, None, error
 
         try:
             while logical_calls < 2:  # 首次 + 至多一次结构修复
                 remaining = total_budget - consumed
                 if remaining <= 0:
-                    run.llm_calls = logical_calls
-                    run.llm_http_attempts = consumed
-                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
-                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return {}, None, {
+                    return _finalize({
                         "reason": "model_request_failed:budget_exceeded",
                         "message": "模型请求预算耗尽（含传输重试），已回退规则结果",
-                    }
-                if not _elapsed_ok():
-                    run.llm_calls = logical_calls
-                    run.llm_http_attempts = consumed
-                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
-                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return {}, None, {
+                    })
+                if self._clock() >= deadline:
+                    return _finalize({
                         "reason": "model_request_failed:deadline_exceeded",
                         "message": "模型调用超过本次分析总期限，已回退规则结果",
-                    }
+                    })
                 current_user = user if not feedback else (
                     user + "\n上一次输出未通过校验：" + feedback
                     + "，请修正后重新输出完整 JSON。")
                 # 每次请求重新检查输入长度预算（修复反馈会增长输入）
                 if len(system) + len(current_user) > self._settings.semantics_input_char_limit:
-                    run.llm_calls = logical_calls
-                    run.llm_http_attempts = consumed
-                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
-                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return {}, None, {
+                    return _finalize({
                         "reason": "input_budget_exceeded",
                         "message": "模型输入超过字符预算（含修复反馈），本次仅使用规则结果",
-                    }
+                    })
                 logical_calls += 1
                 output = client.generate_structured(
                     system, current_user, {"type": "object"},
-                    max_output_chars=100_000, max_attempts=remaining)
+                    max_output_chars=100_000, max_attempts=remaining,
+                    deadline_monotonic=deadline)
                 consumed += max(output.usage.http_attempts, 1)
-                _record_usage(output.usage)
+                _account_usage(output.usage, output.usage.http_attempts)
                 if output.usage.model_reported:
                     run.model_reported = output.usage.model_reported
+                # 返回后再次检查期限：超期结果不得作为模型成功结果发布
+                if self._clock() >= deadline:
+                    return _finalize({
+                        "reason": "model_request_failed:deadline_exceeded",
+                        "message": "模型响应在期限边界返回，已按超期处理并回退规则结果",
+                    })
                 validation = prompt_module.validate_model_response(
                     output.result, expected, table_ctx)
                 if validation["valid"]:
                     run.llm_calls = logical_calls
                     run.llm_http_attempts = consumed
-                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
-                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    _flush_usage(run)
+                    run.elapsed_ms = int((self._clock() - started) * 1000)
                     return validation["columns"], validation["table_purpose"], None
                 feedback = prompt_module.safe_repair_feedback(
                     validation["errors"], expected)
-            run.llm_calls = logical_calls
-            run.llm_http_attempts = consumed
-            self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
-            run.elapsed_ms = int((time.perf_counter() - started) * 1000)
-            return {}, None, {
+            return _finalize({
                 "reason": "model_validation_failed",
                 "message": "模型输出未通过结构校验（虚构/遗漏/无效证据），已回退规则结果",
-            }
+            })
         except LLMRequestError as exc:
             consumed += max(getattr(exc, "attempts", 0) or 1, 1)
-            run.llm_calls = logical_calls
-            run.llm_http_attempts = consumed
-            self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
-            run.elapsed_ms = int((time.perf_counter() - started) * 1000)
-            return {}, None, {
+            _account_usage(getattr(exc, "usage", None), 0)
+            return _finalize({
                 "reason": f"model_request_failed:{exc.reason}",
                 "message": "模型调用失败（运行故障），已回退规则结果；"
                            "该失败与证据不足的 unknown 不同",
-            }
-
-    @staticmethod
-    def _apply_usage(run: SemanticRun, prompt_tokens: list[int],
-                     completion_tokens: list[int], usage_complete: bool) -> None:
-        run.llm_usage_complete = usage_complete
-        if prompt_tokens:
-            run.llm_prompt_tokens = sum(prompt_tokens)
-        if completion_tokens:
-            run.llm_completion_tokens = sum(completion_tokens)
+            })
 
     # -- 记录构建 ---------------------------------------------------------------
 

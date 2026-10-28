@@ -87,15 +87,22 @@
   索引/本字段已计算画像指标），支持标准、路径（columns.<列>.<字段>[:值]）、
   值（类型串/metric=value）三种形态并统一核验规范化；引用其他字段的对象无效；
   画像指标需值非 None 且口径可用（skipped/insufficient 不可作证据）；
-  引用存在 ≠ 结论正确（rationale 如实表述）；仅上下文证据（name_pattern/
-  glossary_term）不足以支撑非 unknown 结论；表用途输出为结构化对象
-  （purpose/confidence/rationale/evidence/alternatives），证据引用表级对象
-  （表名/列名/列注释/表注释/索引/指标键）
+  引用存在 ≠ 结论正确（rationale 如实表述）；**模型提供的 name_pattern/
+  glossary_term 上下文证据（任意文本）一律丢弃**（规则引擎自产证据不经此路径），
+  仅可核验直接证据支撑非 unknown 结论；指标值等值为类型明确的数值比较
+  （容差 1e-9，不做字符串包含）；表用途输出为结构化对象
+  （purpose/confidence/rationale/evidence/alternatives），画像证据必须以
+  columns.<列>.profile.<指标>[:=值] 定位实际字段的已计算指标（裸指标名不通过），
+  规范引用为 <列>.<指标>；上层保证规范引用非空（不保存 ref=null 的证据）
 - 运行记录：`mode`（rules_only/model_assisted）、`input_complete`（显式快照按对应
   扫描任务真实性核定，不无条件视为完整）、`status`、用量计量（`llm_calls`=逻辑调用、
-  `llm_http_attempts`=总 HTTP 尝试、token 为**所有返回过 usage 响应的累计**含结构
-  不合格者、`llm_usage_complete=false` 表示部分已知、`model_reported` 只填服务端
-  返回值且与 `model_configured` 分列）、`send_samples`、安全错误明细；
+  `llm_http_attempts`=总 HTTP 尝试（计数在请求发起点，所有失败路径携带累计值）、
+  token 为**所有返回过 usage 响应的累计**含结构不合格者（usage 在内容解析前提取、
+  失败随异常携带不丢失）、`llm_prompt_usage_complete/llm_completion_usage_complete`
+  分项表达完整性（已知一侧保留、缺失一侧如实标记；同逻辑调用内含传输重试时
+  早期尝试用量不可确认→完整性 False 但保留已知小计）、`model_reported` 只填服务端
+  返回值且与 `model_configured` 分列、运行期限为单调时钟绝对截止（贯穿读取与退避，
+  超期 deadline_exceeded 且已发生请求如实计数）、`send_samples`、安全错误明细；
   **发布规则**：整次分析结果（字段+表用途+运行记录）单事务提交，failed 运行
   不产生部分有效结果；模型失败回退规则的 partial 运行可发布（字段来源标记 rules）
 

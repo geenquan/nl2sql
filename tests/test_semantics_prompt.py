@@ -1,5 +1,7 @@
 """模型输入安全与输出结构校验测试（M2 修复轮语义）。"""
 
+import pytest
+
 from app.security.masking import MASKING_VERSION
 from app.semantics.prompt import (
     PROMPT_VERSION,
@@ -387,13 +389,159 @@ class TestValueFormEvidence:
         raw["columns"][2]["evidence"] = [{"type": "column_type", "ref": "BIGINT"}]
         assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False
 
-    def test_purpose_value_form_evidence_accepted(self) -> None:
+    def test_purpose_metric_must_locate_column(self) -> None:
+        # 裸指标名/值形式无法定位字段 → 拒绝（不再“指标名在集合中即通过”）
+        for bad_ref in ("uniqueness_ratio", "uniqueness_ratio=1.0", "fake_metric=1"):
+            raw = model_output()
+            raw["table_purpose"]["evidence"] = [
+                {"type": "comment", "ref": "金额"},
+                {"type": "profile_metric", "ref": bad_ref},
+            ]
+            assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False, bad_ref
+
+        # 路径形式定位实际字段 + 数值等值 → 通过并规范化为 <列>.<指标>
         raw = model_output()
         raw["table_purpose"]["evidence"] = [
-            {"type": "column_type", "ref": "BIGINT"},
-            {"type": "profile_metric", "ref": "uniqueness_ratio=1.0"},
+            {"type": "comment", "ref": "金额"},
+            {"type": "profile_metric", "ref": "columns.id.profile.uniqueness_ratio=1.0"},
         ]
         result = validate_model_response(raw, EXPECTED, ctx())
         assert result["valid"] is True
         refs = [e["ref"] for e in result["table_purpose"]["evidence"]]
-        assert "uniqueness_ratio" in refs  # 规范化为指标键
+        assert "id.uniqueness_ratio" in refs
+
+        # 声明值与实际不符 → 拒绝
+        raw2 = model_output()
+        raw2["table_purpose"]["evidence"] = [
+            {"type": "comment", "ref": "金额"},
+            {"type": "profile_metric", "ref": "columns.id.profile.uniqueness_ratio=0.5"},
+        ]
+        assert validate_model_response(raw2, EXPECTED, ctx())["valid"] is False
+
+        # 指标实际为 0.99，声明 0.9 → 数值等值不通过（不做字符串包含）
+        raw3 = model_output()
+        raw3["table_purpose"]["evidence"] = [
+            {"type": "comment", "ref": "金额"},
+            {"type": "profile_metric", "ref": "columns.amount.profile.uniqueness_ratio=0.9"},
+        ]
+        assert validate_model_response(raw3, EXPECTED, ctx())["valid"] is False
+
+
+class TestFixRound2Sanitization:
+    """修复轮 2：敏感文本与证据内容安全。"""
+
+    def _payload_with_sample(self, sample: str):
+        from app.security.masking import MASKING_VERSION
+        table = {"table_name": "t", "table_comment": None,
+                 "columns": [{"name": "remark", "data_type": "varchar", "nullable": True,
+                              "comment": None}],
+                 "primary_key": [], "foreign_keys": [], "indexes": []}
+        profiles = [{"column_name": "remark", "masking_version": MASKING_VERSION,
+                     "samples_redacted": False, "sample_values": [sample],
+                     "metric_basis": "sample", "sample_row_count": 5}]
+        return build_table_analysis_payload(table, profiles, send_samples=True,
+                                            sensitive_columns=set())
+
+    @pytest.mark.parametrize("sample,secret", [
+        ("password: ReviewDummy123", "ReviewDummy123"),
+        ("token: ReviewToken456", "ReviewToken456"),
+        ("api_key=ReviewApiKey789", "ReviewApiKey789"),
+        ("token: Bearer ReviewBearer123", "ReviewBearer123"),
+        ('Authorization: Bearer "AuthQuoted-777"', "AuthQuoted-777"),
+        ('secret = \'spaced secret value\'', "spaced secret value"),
+    ])
+    def test_secret_samples_never_leave_boundary(self, sample: str, secret: str) -> None:
+        payload = self._payload_with_sample(sample)
+        dumped = str(payload)
+        assert secret not in dumped
+        # 不残留后半段：即使原字符串整体不再出现，也不允许碎片如 Bearer/裸密钥段
+        for fragment in (secret, secret[: max(1, len(secret) // 2)]):
+            assert fragment not in dumped
+
+    def test_unparseable_secret_sample_dropped_not_sent(self) -> None:
+        payload = self._payload_with_sample("password: ???复杂 无法解析$$$")
+        samples = payload["columns"][0].get("sample_values")
+        # 保守处理：要么完整净化，要么整值拒绝外发
+        assert samples is None or "???" not in str(samples)
+
+    def test_model_context_evidence_with_secret_dropped(self) -> None:
+        raw = model_output()
+        raw["columns"][1]["evidence"] = [
+            {"type": "foreign_key", "ref": "customer_id"},
+            {"type": "name_pattern", "ref": "密钥 sk-Ref-Secret-888"},
+        ]
+        result = validate_model_response(raw, EXPECTED, ctx())
+        assert result["valid"] is True
+        dumped = str(result["columns"])
+        assert "sk-Ref-Secret-888" not in dumped
+        assert all(e["type"] != "name_pattern" for c in result["columns"].values()
+                   for e in c["evidence"])
+
+    def test_model_free_text_secret_scrubbed_everywhere(self) -> None:
+        raw = model_output()
+        raw["columns"][0]["business_name"] = "名称 password: LeakName123"
+        raw["columns"][0]["candidate_entities"] = ["token: Bearer EntSecret456"]
+        raw["columns"][2]["evidence"] = [{"type": "comment", "ref": "金额"}]
+        raw["table_purpose"] = dict(model_output()["table_purpose"])
+        raw["table_purpose"]["rationale"] = "理由 api_key: WhyKey789"
+        raw["table_purpose"]["alternatives"] = [
+            {"purpose": "log_history", "rationale": "备选 secret: AltSec111", "confidence": "low"}]
+        result = validate_model_response(raw, EXPECTED, ctx())
+        assert result["valid"] is True
+        dumped = str(result)
+        for secret in ("LeakName123", "EntSecret456", "WhyKey789", "AltSec111"):
+            assert secret not in dumped
+
+
+class TestFixRound2EvidenceOwnership:
+    """修复轮 2：证据归属与结构校验漏洞。"""
+
+    def test_pk_reference_to_nonexistent_object_rejected(self) -> None:
+        raw = model_output()
+        raw["columns"][0]["evidence"] = [{"type": "primary_key", "ref": "不存在的主键对象"}]
+        result = validate_model_response(raw, EXPECTED, ctx())
+        assert result["valid"] is False
+        # 不保存 ref=None 的“有效证据”
+        assert all(e.get("ref") for c in result["columns"].values() for e in c["evidence"])
+
+    def test_pk_column_citing_fk_evidence_rejected(self) -> None:
+        raw = model_output()
+        raw["columns"][0]["evidence"] = [{"type": "foreign_key", "ref": "id"}]
+        assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False
+
+    def test_index_self_name_bypass_rejected(self) -> None:
+        # amount 不属于任何索引：用自身字段名作为 index 证据无效
+        raw = model_output()
+        raw["columns"][2]["evidence"] = [{"type": "index", "ref": "amount"}]
+        assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False
+
+    def test_other_table_or_composite_index_rejected_for_nonmember(self) -> None:
+        # customer_id 属于 idx_c（单列）；uk_o 是复合唯一 (id, order_no)，
+        # customer_id 引用 uk_o 无效
+        raw = model_output()
+        raw["columns"][1]["evidence"] = [{"type": "index", "ref": "uk_o"}]
+        assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False
+
+    def test_metric_declared_value_numeric_mismatch(self) -> None:
+        # id.uniqueness_ratio 实际 1.0；声明 0.9 → 拒绝（数值等值，非字符串包含）
+        raw = model_output()
+        raw["columns"][0]["evidence"] = [
+            {"type": "primary_key", "ref": "id"},
+            {"type": "profile_metric", "ref": "columns.id.profile.uniqueness_ratio=0.9"},
+        ]
+        assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False
+
+    def test_missing_or_unusable_profile_metrics(self) -> None:
+        # amount 画像口径 insufficient：任何指标引用无效
+        for ref in ("distinct_count_estimate", "uniqueness_ratio=0.99",
+                    "columns.amount.profile.uniqueness_ratio=0.99"):
+            raw = model_output()
+            raw["columns"][2]["evidence"] = [{"type": "profile_metric", "ref": ref}]
+            assert validate_model_response(raw, EXPECTED, ctx())["valid"] is False, ref
+
+    def test_valid_direct_and_context_evidence(self) -> None:
+        raw = model_output()
+        result = validate_model_response(raw, EXPECTED, ctx())
+        assert result["valid"] is True
+        id_ev = {e["type"] for e in result["columns"]["id"]["evidence"]}
+        assert "primary_key" in id_ev  # 直接证据（服务端构造的规范引用）

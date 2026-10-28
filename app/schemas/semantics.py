@@ -35,6 +35,9 @@ class SemanticRunResponse(BaseModel):
     llm_calls: int = 0
     llm_prompt_tokens: int | None = None
     llm_completion_tokens: int | None = None
+    llm_usage_complete: bool = True
+    llm_prompt_usage_complete: bool = True
+    llm_completion_usage_complete: bool = True
     elapsed_ms: int | None = None
     send_samples: bool = False
     errors: list[RunErrorItem] = Field(default_factory=list)

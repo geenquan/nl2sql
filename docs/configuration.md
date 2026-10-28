@@ -174,11 +174,19 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
   限长、PII 与密钥键值遮蔽（冒号/等号/全角/空白/大小写变体）、提示注入模式中和；
   不含 sample_values、源库地址/账号/密码/credential_ref。
 - 样本外发双层开关开启后，仅限带当前 MASKING_VERSION 标记（mask-v2）、未脱敏、
-  非敏感列的样本，外发边界逐值再脱敏（≤3 条 × 32 字符）；无法证明经过当前规则
-  处理的历史样本一律不外发（不以 samples_redacted=false 判断安全）。
-- 用量核算：llm_calls=逻辑调用数，llm_http_attempts=总 HTTP 尝试；token 累计所有
-  返回过 usage 的响应（含结构不合格者），缺失标记 llm_usage_complete=false
-  （部分已知）；model_reported 只填服务端返回值，配置模型单列 model_configured。
+  非敏感列的样本；外发边界逐值执行 mask_value + sanitize_text_for_model 完整净化
+  （键值/密钥/注入），净化后仍残留敏感键值形态的值整值拒绝外发（≤3 条 × 32 字符）；
+  无法证明经过当前规则处理的历史样本一律不外发（不以 samples_redacted=false 判断安全）。
+- 用量核算：llm_calls=逻辑调用数，llm_http_attempts=总 HTTP 尝试（计数在请求发起
+  点，所有失败路径携带累计值）；token 累计所有返回过 usage 的响应（含结构不合格者，
+  usage 在内容解析前提取、失败随异常携带不丢失）；`llm_usage_complete` 为总标记，
+  `llm_prompt_usage_complete/llm_completion_usage_complete` 分项表达（已知一侧保留、
+  缺失一侧如实标记）；model_reported 只填服务端返回值，配置模型单列 model_configured。
+- 运行期限：`SEMANTICS_LLM_DEADLINE_SECONDS` 为单调时钟绝对截止时间，由服务层
+  传入客户端，覆盖连接/读取/退避与流式分块；超期抛 deadline_exceeded 固定安全
+  错误并回退规则结果，已发生请求次数与已知用量如实保留。
+- 响应体：所有 HTTP 状态（含错误响应）有界流式读取；200 超限即停，错误响应
+  超限丢弃正文只用状态码；Content-Length 不被信任（非法值忽略，累计字节为上限）。
 - 结果发布：整次分析（字段+表用途+运行记录）单事务提交；失败运行不产生部分有效结果。
 - 模型调用失败（超时/认证/限流等）与语义 unknown（证据不足）分开表达；失败回退规则结果
   并记录 `model_request_failed:<reason>`，不返回伪造的模型语义。

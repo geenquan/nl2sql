@@ -1,3 +1,6 @@
+from typing import Any
+
+
 class AppError(Exception):
     """可预期的应用异常基类。"""
 
@@ -33,13 +36,16 @@ class CredentialStoreError(AppError):
 class LLMRequestError(AppError):
     """模型调用失败。reason：auth_failure / rate_limited / server_error / timeout /
     network / invalid_request / invalid_response / output_truncated / config /
-    budget_exceeded。消息为固定安全文案，不含提示词、响应或密钥。
-    attempts＝该次逻辑调用已消耗的 HTTP 尝试数（供上层预算扣减）。"""
+    budget_exceeded / deadline_exceeded。消息为固定安全文案，不含提示词、响应或密钥。
+    attempts＝该次逻辑调用已消耗的 HTTP 尝试数（供上层预算扣减）；
+    usage＝失败前最后一次已接收响应的用量（可能为 None＝未知，不虚构）。"""
 
-    def __init__(self, reason: str, message: str, attempts: int = 0) -> None:
+    def __init__(self, reason: str, message: str, attempts: int = 0,
+                 usage: Any = None) -> None:
         super().__init__(message)
         self.reason = reason
         self.attempts = attempts
+        self.usage = usage
 
 
 class RevisionConflictError(AppError):

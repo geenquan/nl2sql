@@ -73,7 +73,8 @@ class FakeLLM:
 
     def generate_structured(self, system: str, user: str, output_schema: dict,
                             *, max_output_chars: int | None = None,
-                            max_attempts: int | None = None) -> LLMStructuredOutput:
+                            max_attempts: int | None = None,
+                            deadline_monotonic: float | None = None) -> LLMStructuredOutput:
         self.calls += 1
         self.prompts.append((system, user))
         self.max_attempts_limits = getattr(self, "max_attempts_limits", [])
@@ -115,7 +116,8 @@ def valid_model_output() -> dict:
 
 def make_service(tmp_path, llm: Any = None, settings: Settings | None = None,
                  table: dict | None = None,
-                 profiles: list[dict] | None = None) -> tuple[SemanticsService, SQLiteMetadataRepository]:
+                 profiles: list[dict] | None = None,
+                 clock=None) -> tuple[SemanticsService, SQLiteMetadataRepository]:
     settings = settings or Settings(_env_file=None)
     repo = StubRepo(f"sqlite:///{tmp_path/'meta.db'}", table or FAKE_TABLE_META,
                     profiles if profiles is not None else PROFILES)
@@ -134,6 +136,7 @@ def make_service(tmp_path, llm: Any = None, settings: Settings | None = None,
         metadata_repository=repo,
         llm_factory=llm_factory,
         settings=settings,
+        clock=clock,
     )
     return service, repo
 
@@ -610,3 +613,73 @@ class TestFixRoundRegressions:
         reasons = {e["reason"] for e in run["errors"]}
         assert "input_budget_exceeded" in reasons
         assert llm.calls <= 1  # 输入超限后不再发起请求
+
+
+class TestFixRound2Service:
+    """服务层期限与分项用量完整性。"""
+
+    def test_deadline_exceeded_after_response_not_published(self, tmp_path):
+        # 注入时钟：模型返回后越界 → 结果不发布，回退规则并记录 deadline_exceeded
+        clock = {"t": 100.0}
+        llm = FakeLLM([valid_model_output()])
+
+        def fake_clock() -> float:
+            return clock["t"]
+
+        original = llm.generate_structured
+
+        def advancing(*args, **kwargs):
+            out = original(*args, **kwargs)
+            clock["t"] += 50.0  # 单次响应跨越期限
+            return out
+
+        llm.generate_structured = advancing
+        settings = Settings(_env_file=None, deepseek_enabled=True,
+                            semantics_llm_deadline_seconds=10)
+        (tmp_path / "d").mkdir()
+        service, repo = make_service(tmp_path / "d", llm=llm, settings=settings,
+                                     clock=fake_clock)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert run["status"] == "partial"
+        assert any(e["reason"] == "model_request_failed:deadline_exceeded"
+                   for e in run["errors"])
+        stored = repo.list_field_semantics("tbl-1")
+        assert all(s["inference_source"] == "rules" for s in stored)  # 模型结果未发布
+        assert run["llm_calls"] == 1  # 已发生请求如实计数
+
+    def test_per_side_usage_completeness(self, tmp_path):
+        llm = FakeLLM([valid_model_output()])
+        original = llm.generate_structured
+
+        def partial_usage(*args, **kwargs):
+            out = original(*args, **kwargs)
+            out.usage.completion_tokens = None  # 仅一侧缺失
+            return out
+
+        llm.generate_structured = partial_usage
+        settings = Settings(_env_file=None, deepseek_enabled=True)
+        (tmp_path / "p").mkdir()
+        service, _ = make_service(tmp_path / "p", llm=llm, settings=settings)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert run["llm_prompt_tokens"] == 100  # 已知一侧保留
+        assert run["llm_prompt_usage_complete"] is True
+        assert run["llm_completion_usage_complete"] is False  # 缺失侧如实标记
+        assert run["llm_usage_complete"] is False
+
+    def test_retried_call_marks_usage_incomplete_keeps_known(self, tmp_path):
+        llm = FakeLLM([valid_model_output()])
+        original = llm.generate_structured
+
+        def with_retry(*args, **kwargs):
+            out = original(*args, **kwargs)
+            out.usage.http_attempts = 2  # 同一逻辑调用内有传输重试
+            return out
+
+        llm.generate_structured = with_retry
+        settings = Settings(_env_file=None, deepseek_enabled=True)
+        (tmp_path / "r2").mkdir()
+        service, _ = make_service(tmp_path / "r2", llm=llm, settings=settings)
+        run = service.analyze_table("src-1", "tbl-1")
+        # 已知小计保留；早期尝试用量不可确认 → 完整性 False
+        assert run["llm_prompt_tokens"] == 100
+        assert run["llm_usage_complete"] is False

@@ -1,0 +1,6 @@
+name: nl2sql
+dependencies:
+  - python=3.13.18
+  - pip
+  - pip:
+      - -e .[dev]

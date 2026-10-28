@@ -1,0 +1,94 @@
+# 跨阶段数据契约
+
+本文件定义模块之间的稳定输入输出。需要修改契约时，先说明兼容性和迁移影响。
+
+## 数据源
+- `source_id`、名称、方言、主机/端口/数据库、允许 Schema（`allowed_schemas`，空则默认数据源自身库）
+- 凭证使用 `credential_ref`，不在普通元数据表中保存明文密码
+- `read_only=true` 是默认约束，写入型数据源直接拒绝注册
+- M1 起数据源卡片额外返回 `table_count / column_count / latest_scan`
+
+## 扫描任务（M1 新增；修复轮调整）
+- `job_id`、`source_id`、`snapshot_id`、`started_at / finished_at`
+- 状态：`running → succeeded | partial | failed`；
+  `failed`=结构性失败（连接/凭证/Schema 不可见，或预算内表全部失败），
+  `partial`=存在表级失败或被预算截断（缺失表不当作确认删除），
+  `succeeded`=完整成功（此时确认空 Schema 可发布空目录）
+- 任何任务级异常都会收尾为 `failed` + `finished_at` + 已清洗的错误原因
+  （`internal_error` / `credential_store_error` 等）；表级可恢复异常按表隔离
+  （`table_scan_error`），持久化等基础设施故障中止整单扫描
+- 计数：`tables_planned / tables_scanned / tables_failed / tables_skipped`，预算参数
+  `sample_rows / max_tables` 一并落库以便复现
+- 错误明细 `errors[]`：`schema / table / reason / message`，`message` 已清洗（剔除凭证、
+  截断长度），不含原始样本
+
+## 目录发布（修复轮新增契约）
+- 任务状态与目录发布分离：**默认目录＝最近一次 succeeded 快照**；无完整成功时回退最近
+  一次 `partial`（`tables_scanned>0`）快照并标记 `complete=false`；
+  `failed/running` 快照永不发布
+- 因权限、采样失败或预算跳过而缺失的表不得当作确认删除；只有下一次完整成功快照
+  才决定目录内容（完整成功确认空 Schema 时发布空目录）
+- 历史快照全部保留（不删除历史数据规避问题）；`GET /sources/{id}/tables?snapshot_id=`
+  可查看任意历史快照用于诊断
+- 数据源卡片同时暴露 `latest_scan`（最近任务）与 `catalog`（目录实际来源
+  `{snapshot_id, status, complete}`），避免两者来源混淆
+
+## 表与字段元数据
+- 数据源、Schema、表、字段标识、表注释、归属快照（`snapshot_id` 随目录项返回）
+- 字段类型、注释、可空、主键/外键、索引（名称、字段列表、唯一性）、字段默认值
+- 行数来自 `information_schema.TABLES`，`row_count_is_estimate` 恒为 true（InnoDB 估计值）
+- 同一快照内按（snapshot, schema, table）去重；重复扫描生成新快照
+- 外键统一为 `{name, columns, ref_schema, ref_table, ref_columns}`，`ref_schema` 为空时回退本表 Schema
+
+## 字段画像
+- `null_ratio`、`distinct_count_estimate`、`uniqueness_ratio`（均基于采样计算，按原始值统计）
+- `sample_values`（脱敏，最多 5 条）：两层检测——列名关键词（内置 + `SENSITIVE_COLUMN_KEYWORDS`
+  追加）整列遮蔽；与列名无关的值格式检测（邮箱/大陆手机号/18 位身份证）命中即脱敏
+  （整值命中部分遮蔽，嵌入自由文本则整值遮蔽）
+- 允许原样展示的类型仅限：数字、布尔、日期时间形式短字符串、不含敏感格式且 ≤64 字符的
+  短字符串；长文本/JSON 保守遮蔽；二进制仅返回长度。脱敏发生在持久化与 API 响应之前
+- `samples_redacted` 如实反映任何实际脱敏（含值格式检测与保守遮蔽）
+- 口径与范围：`metric_basis`（`exact`=采样覆盖整表 / `sample`=样本估计 /
+  `insufficient_sample`=空表等无数据 / `skipped`=超预算未计算）、
+  `sample_row_count`、`row_count_basis`、`computed_at`、`profile_version`
+- `empty_string_count` 区分空字符串与 NULL；`unsupported_metrics` 列出未计算的指标，
+  不支持或样本不足时保持 `None`，不虚构结果
+- **历史数据**：规则升级不自动修复已持久化画像；本地清理脚本
+  `scripts/clear_profile_samples.py` 只清空历史 `sample_values` 并标记
+  `sample_values_cleared=true`（需重新画像），保留统计与元数据
+
+## 字段语义
+- 来源表/字段、建议业务名称、语义类型、候选实体
+- 支持证据、替代解释、置信等级
+- 模型/提示词版本、审核状态
+- 必须允许 `unknown`
+
+## 关系候选
+- 源表/字段、目标表/字段、候选基数
+- 分项证据、评分方法/版本、状态
+- 验证 SQL 摘要、验证结果、过期条件
+- `candidate` 不等于 `validated`
+
+## 业务语义模型
+- 实体、属性、关系、指标、维度和查询路径
+- 每个主题有明确粒度
+- 指标含表达式、去重规则、过滤条件和时间口径
+- 来源、状态、版本和权限策略
+
+## 数据集定义
+- 名称、主题、grain、一行代表什么
+- 来源表、关系路径、字段和指标
+- 生成 SQL、质量检查、刷新策略
+- 草稿/校验中/已发布/失败/过期状态和版本
+- ES 宽表实现时需补充目标索引/别名、文档主键与 grain 的映射、字段 mapping、刷新与版本切换信息；当前 `DatasetSpec` 尚未包含这些目标存储字段
+
+## NL2SQL 结果
+- 问题和解析出的意图
+- 使用的实体、指标、关系和口径假设
+- SQL、安全检查状态、执行状态、结果摘要
+- 解释、耗时、trace_id 和反馈
+
+## 状态约定
+关系：`candidate → evidence_collected → validated / needs_review / rejected`；源数据变化后可转 `stale`。
+语义：`suggested → data_validated → business_confirmed → published`。
+数据集：`draft → validating → published`；校验失败为 `failed_validation`。

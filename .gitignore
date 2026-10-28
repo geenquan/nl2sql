@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+metadata.db
+.DS_Store
+.idea/
+.credential_store.json
+.credential_store.json.lock

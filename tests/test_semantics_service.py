@@ -72,16 +72,20 @@ class FakeLLM:
         self.calls = 0
 
     def generate_structured(self, system: str, user: str, output_schema: dict,
-                            *, max_output_chars: int | None = None) -> LLMStructuredOutput:
+                            *, max_output_chars: int | None = None,
+                            max_attempts: int | None = None) -> LLMStructuredOutput:
         self.calls += 1
         self.prompts.append((system, user))
+        self.max_attempts_limits = getattr(self, "max_attempts_limits", [])
+        self.max_attempts_limits.append(max_attempts)
         step = self.script.pop(0) if self.script else {"columns": []}
         if isinstance(step, Exception):
             raise step
         return LLMStructuredOutput(
             result=step,
-            usage=LLMUsage(model_reported="deepseek-fake", prompt_tokens=100,
-                           completion_tokens=50, calls=1, elapsed_ms=12),
+            usage=LLMUsage(model_reported="deepseek-fake", model_configured="deepseek-test",
+                           prompt_tokens=100, completion_tokens=50, calls=1,
+                           http_attempts=1, elapsed_ms=12),
         )
 
 
@@ -99,14 +103,22 @@ def valid_model_output() -> dict:
              "business_name": "订单金额", "candidate_entities": [],
              "evidence": [{"type": "comment", "ref": "金额"}]},
         ],
-        "table_purpose": "transaction_event",
+        "table_purpose": {
+            "purpose": "transaction_event",
+            "confidence": "medium",
+            "rationale": "订单命名且含金额字段",
+            "evidence": [{"type": "comment", "ref": "金额"}],
+            "alternatives": [],
+        },
     }
 
 
 def make_service(tmp_path, llm: Any = None, settings: Settings | None = None,
-                 table: dict | None = None) -> tuple[SemanticsService, SQLiteMetadataRepository]:
+                 table: dict | None = None,
+                 profiles: list[dict] | None = None) -> tuple[SemanticsService, SQLiteMetadataRepository]:
     settings = settings or Settings(_env_file=None)
-    repo = StubRepo(f"sqlite:///{tmp_path/'meta.db'}", table or FAKE_TABLE_META, PROFILES)
+    repo = StubRepo(f"sqlite:///{tmp_path/'meta.db'}", table or FAKE_TABLE_META,
+                    profiles if profiles is not None else PROFILES)
     # 建立发布快照：succeeded 任务 + 表元数据行
     repo.save_scan_job({"job_id": "job-1", "source_id": "src-1", "snapshot_id": "snap-1",
                         "status": "succeeded", "started_at": "2026-10-28T01:00:00+00:00"})
@@ -209,25 +221,40 @@ class TestModelAssistedMode:
         for forbidden in ("10.00", "20.00", "sample_values", "password", "credential"):
             assert forbidden not in combined, forbidden
 
-    def test_send_samples_optin_only_and_sensitive_excluded(self, tmp_path):
-        llm = FakeLLM([valid_model_output()])
-        settings = Settings(_env_file=None, deepseek_enabled=True, semantics_send_samples=True)
-        service, _ = make_service(tmp_path, llm=llm, settings=settings)
+    def test_send_samples_optin_only_and_boundary_rules(self, tmp_path):
+        from app.security.masking import MASKING_VERSION
+        trusted_profiles = [dict(p, masking_version=MASKING_VERSION) for p in PROFILES]
+
+        def build(path, profiles, send_enabled=True):
+            settings = Settings(_env_file=None, deepseek_enabled=True,
+                                semantics_send_samples=send_enabled)
+            llm = FakeLLM([valid_model_output()])
+            service, _ = make_service(path, llm=llm, settings=settings,
+                                      profiles=profiles)
+            return service, llm
+
+        # 双侧开启 + 当前脱敏版本标记：非敏感样本外发
+        service, llm = build(tmp_path, trusted_profiles)
         service.analyze_table("src-1", "tbl-1", send_samples=True)
-        user = llm.prompts[0][1]
-        assert "10.00" in user  # 非敏感样本按开关外发
-        llm2 = FakeLLM([valid_model_output()])
-        (tmp_path / "x").mkdir()
-        service2, _ = make_service(tmp_path / "x", llm=llm2, settings=settings)
-        service2.analyze_table("src-1", "tbl-1")  # 请求未开启
-        assert "10.00" not in llm2.prompts[0][1]
+        assert "10.00" in llm.prompts[0][1]
+
+        # 历史样本（无版本标记）即使双侧开启也不外发
+        (tmp_path / "h").mkdir(parents=True, exist_ok=True)
+        service_h, llm_h = build(tmp_path / "h", PROFILES)
+        service_h.analyze_table("src-1", "tbl-1", send_samples=True)
+        assert "10.00" not in llm_h.prompts[0][1]
+
+        # 请求未开启 → 不外发
+        (tmp_path / "r").mkdir(parents=True, exist_ok=True)
+        service_r, llm_r = build(tmp_path / "r", trusted_profiles)
+        service_r.analyze_table("src-1", "tbl-1")
+        assert "10.00" not in llm_r.prompts[0][1]
+
         # 配置关闭时请求开启也无效
-        settings_off = Settings(_env_file=None, deepseek_enabled=True, semantics_send_samples=False)
-        llm3 = FakeLLM([valid_model_output()])
-        (tmp_path / "y").mkdir()
-        service3, _ = make_service(tmp_path / "y", llm=llm3, settings=settings_off)
-        service3.analyze_table("src-1", "tbl-1", send_samples=True)
-        assert "10.00" not in llm3.prompts[0][1]
+        (tmp_path / "c").mkdir(parents=True, exist_ok=True)
+        service_c, llm_c = build(tmp_path / "c", trusted_profiles, send_enabled=False)
+        service_c.analyze_table("src-1", "tbl-1", send_samples=True)
+        assert "10.00" not in llm_c.prompts[0][1]
 
     def test_invalid_then_repaired_within_call_budget(self, tmp_path):
         bad = {"columns": [{"column_name": "ghost", "category": "name", "confidence": "low",
@@ -364,3 +391,222 @@ class TestSearch:
         service.analyze_table("src-1", "tbl-1")
         results = service.search_fields("src-1", "id", limit=1)
         assert len(results["items"]) <= 1
+
+
+class TestFixRoundRegressions:
+    """修复轮回归：并发审核、失败运行不发布、预算与用量核算。"""
+
+    def test_concurrent_field_review_only_one_wins(self, tmp_path):
+        import threading
+
+        from app.core.exceptions import RevisionConflictError
+
+        service, repo = make_service(tmp_path)
+        service.analyze_table("src-1", "tbl-1")
+        results = []
+        barrier = threading.Barrier(2)
+
+        def submit() -> None:
+            barrier.wait()
+            try:
+                service.submit_review("tbl-1", "id", action="confirm", patch={},
+                                      reviewer="dev", expected_revision=1)
+                results.append("ok")
+            except RevisionConflictError:
+                results.append("conflict")
+            except Exception as exc:
+                results.append(f"unexpected:{type(exc).__name__}")
+
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(results) == ["conflict", "ok"]
+        history = repo.get_field_semantics_history("tbl-1", "id")
+        assert len(history) == 2  # 一次成功修订，无重复覆盖
+
+    def test_concurrent_purpose_review_conflict(self, tmp_path):
+        import threading
+
+        from app.core.exceptions import RevisionConflictError
+
+        service, _repo = make_service(tmp_path)
+        service.analyze_table("src-1", "tbl-1")
+        results = []
+        barrier = threading.Barrier(2)
+
+        def submit() -> None:
+            barrier.wait()
+            try:
+                service.submit_purpose_review(
+                    "tbl-1", action="confirm", patch={"purpose": "transaction_event"},
+                    reviewer="dev", expected_revision=1)
+                results.append("ok")
+            except RevisionConflictError:
+                results.append("conflict")
+            except Exception as exc:  # 任何其他异常都视为失败（不得静默）
+                results.append(f"unexpected:{type(exc).__name__}")
+
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(results) == ["conflict", "ok"], results
+
+    def test_model_write_interleaved_with_review_keeps_consistency(self, tmp_path):
+        import threading
+
+        service, repo = make_service(tmp_path)
+        service.analyze_table("src-1", "tbl-1")
+        outcomes = []
+        barrier = threading.Barrier(2)
+
+        def review() -> None:
+            barrier.wait()
+            try:
+                service.submit_review("tbl-1", "id", action="confirm", patch={},
+                                      reviewer="dev", expected_revision=1)
+                outcomes.append("review-ok")
+            except Exception:
+                outcomes.append("review-conflict")
+
+        def reanalyze() -> None:
+            barrier.wait()
+            try:
+                service.analyze_table("src-1", "tbl-1")
+                outcomes.append("analyze-ok")
+            except Exception:
+                outcomes.append("analyze-failed")
+
+        threads = [threading.Thread(target=review), threading.Thread(target=reanalyze)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert "analyze-failed" not in outcomes
+        history = repo.get_field_semantics_history("tbl-1", "id")
+        revisions = [h["revision"] for h in history]
+        assert revisions == sorted(revisions, reverse=True)  # 无重复修订号
+        effective = {s["column_name"]: s for s in repo.list_field_semantics("tbl-1", effective=True)}
+        if "review-ok" in outcomes and any(
+            h["review_status"] == "business_confirmed" for h in history
+        ):
+            # 人工确认存在且其后无人工撤销 → 有效结果保持确认
+            assert effective["id"]["review_status"] == "business_confirmed"
+
+    def test_failed_run_publishes_nothing(self, tmp_path):
+        service, repo = make_service(tmp_path)
+        service.analyze_table("src-1", "tbl-1")  # 先有成功结果
+
+        class FailingBatchRepo(type(repo)):
+            def save_semantics_batch(self, field_records, purpose_record, run_record):
+                raise RuntimeError("simulated batch failure")
+
+        failing = FailingBatchRepo(f"sqlite:///{tmp_path/'meta.db'}",
+                                   FAKE_TABLE_META, PROFILES)
+        failing_service = SemanticsService(
+            metadata_repository=failing, llm_factory=None,
+            settings=Settings(_env_file=None))
+        run = failing_service.analyze_table("src-1", "tbl-1")
+        assert run["status"] == "failed"
+        assert run["finished_at"] is not None
+        # 失败运行不产生任何新修订，原结果不受影响
+        for column in ("id", "customer_id", "total_amount"):
+            history = repo.get_field_semantics_history("tbl-1", column)
+            assert all(h["run_id"] != run["run_id"] for h in history)
+        effective = {s["column_name"]: s for s in repo.list_field_semantics("tbl-1", effective=True)}
+        assert effective["id"]["category"] == "entity_identifier"
+        search = service.search_fields("src-1", "id")
+        assert search["items"]  # 检索结果不受失败运行影响
+
+    def test_explicit_partial_snapshot_marks_input_incomplete(self, tmp_path):
+        service, repo = make_service(tmp_path)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert run["input_complete"] is True
+        # 显式 snapshot_id 指向部分成功任务 → input_complete=False
+        repo.save_scan_job({"job_id": "job-p", "source_id": "src-1",
+                            "snapshot_id": "snap-partial", "status": "partial",
+                            "tables_scanned": 1,
+                            "started_at": "2026-10-28T02:00:00+00:00"})
+        real_id = repo.save_table_metadata({
+            "source_id": "src-1", "snapshot_id": "snap-partial", "schema_name": "sales",
+            "table_name": "orders_p", "columns": FAKE_TABLE_META["columns"],
+            "primary_key": ["id"], "foreign_keys": [], "indexes": [],
+            "row_count_estimate": 3, "row_count_is_estimate": True, "scanned_at": "t"})
+        run2 = service.analyze_table("src-1", real_id, snapshot_id="snap-partial")
+        assert run2["input_complete"] is False
+
+    def test_llm_budget_shared_between_retries_and_repair(self, tmp_path):
+        # 第一次逻辑调用：429 后重试成功但结构错误（消耗 2 次 HTTP）
+        # 预算 2 → 修复无剩余预算 → 回退规则
+        class AttemptedLLM(FakeLLM):
+            def __init__(self):
+                super().__init__([valid_model_output()])
+                self.http_attempts = 2  # 模拟传输重试消耗
+
+            def generate_structured(self, *args, **kwargs):
+                out = super().generate_structured(*args, **kwargs)
+                out.usage.http_attempts = 2
+                # 返回结构不合格的结果（虚构字段）触发修复路径
+                out.result = {"columns": [{"column_name": "ghost", "category": "name",
+                                           "confidence": "low", "evidence": []}]}
+                return out
+
+        llm = AttemptedLLM()
+        settings = Settings(_env_file=None, deepseek_enabled=True,
+                            semantics_llm_max_calls=2)
+        (tmp_path / "b").mkdir()
+        service, _repo = make_service(tmp_path / "b", llm=llm, settings=settings)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert llm.calls == 1  # 修复未被允许（预算耗尽）
+        assert run["status"] == "partial"
+        assert any(e["reason"] == "model_request_failed:budget_exceeded" for e in run["errors"])
+        assert run["llm_http_attempts"] == 2
+
+    def test_tokens_accumulated_across_invalid_then_valid(self, tmp_path):
+        bad = {"columns": [{"column_name": "ghost", "category": "name",
+                            "confidence": "low", "evidence": []}]}
+        llm = FakeLLM([bad, valid_model_output()])
+        settings = Settings(_env_file=None, deepseek_enabled=True,
+                            semantics_llm_max_calls=3)
+        service, _ = make_service(tmp_path, llm=llm, settings=settings)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert run["status"] == "succeeded"
+        assert run["llm_calls"] == 2  # 首次 + 修复
+        assert run["llm_prompt_tokens"] == 200  # 两次响应累计（100×2）
+        assert run["llm_completion_tokens"] == 100
+        assert run["llm_usage_complete"] is True
+
+    def test_partial_usage_flagged(self, tmp_path):
+        llm = FakeLLM([valid_model_output()])
+        llm.missing_usage = True
+        settings = Settings(_env_file=None, deepseek_enabled=True)
+
+        original = llm.generate_structured
+
+        def patched(*args, **kwargs):
+            out = original(*args, **kwargs)
+            out.usage.prompt_tokens = None  # 服务端未提供
+            return out
+
+        llm.generate_structured = patched
+        service, _ = make_service(tmp_path, llm=llm, settings=settings)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert run["llm_usage_complete"] is False
+        assert run["llm_prompt_tokens"] is None  # unavailable，不编造
+
+    def test_repair_feedback_inflating_input_blocked(self, tmp_path):
+        bad = {"columns": [{"column_name": "ghost", "category": "name",
+                            "confidence": "low", "evidence": []}]}
+        llm = FakeLLM([bad, bad])
+        settings = Settings(_env_file=None, deepseek_enabled=True,
+                            semantics_input_char_limit=10)  # 极小预算
+        (tmp_path / "s").mkdir()
+        service, _ = make_service(tmp_path / "s", llm=llm, settings=settings)
+        run = service.analyze_table("src-1", "tbl-1")
+        assert run["status"] == "partial"
+        reasons = {e["reason"] for e in run["errors"]}
+        assert "input_budget_exceeded" in reasons
+        assert llm.calls <= 1  # 输入超限后不再发起请求

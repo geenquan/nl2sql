@@ -1,12 +1,17 @@
-"""M2 语义分析用例编排。
+"""M2 语义分析用例编排（修复轮加固）。
 
 - 默认读取 M1 发布快照；部分目录需显式 allow_partial 并标记 input_complete=False；
-  显式 snapshot_id 仅用于诊断，不改变发布目录；
-- 规则结果始终生成；模型（DeepSeek）启用时做受控推断：预算内调用、严格校验、
-  失败回退规则并如实记录，不伪造模型语义；
-- 人工修订采用修订号并发控制（RevisionConflictError），确认结论不被模型覆盖；
-- 检索为本地词法基线（method=lexical），不冒充向量相似度；
-- 错误消息沿用固定安全文案模式（类别 + 标识），不落提示词/响应/异常文本。
+  显式 snapshot_id 仅用于诊断，input_complete 按对应扫描任务的真实完整性核定，
+  不改变发布目录；
+- 结果发布采用“候选写入—成功发布”：整次分析的字段/表用途/运行记录在单事务中
+  提交；失败运行不产生部分有效结果（历史诊断可查但明确不可作为有效结论）；
+- 模型预算：传输重试与结构修复共享总 HTTP 尝试预算（semantics_llm_max_calls），
+  每次修复请求重新检查输入长度预算；累计 token（含结构不合格响应）与耗时，
+  usage 缺失时标记 llm_usage_complete=False；运行总期限独立于单次请求超时；
+- 人工修订：expected_revision 原子乐观锁（仓储事务内仲裁，多进程安全）；
+  人工可撤销确认（revert），撤销后旧确认不再生效；模型建议永不覆盖有效确认；
+- 检索为本地词法基线（method=lexical）；
+- 错误消息沿用固定安全文案，不落提示词/响应/异常文本。
 """
 
 import time
@@ -29,7 +34,7 @@ from app.domain.semantics import (
     TablePurpose,
     now_iso,
 )
-from app.ports.llm import LLMClient, LLMStructuredOutput
+from app.ports.llm import LLMClient
 from app.ports.repositories import MetadataRepository
 from app.security.masking import is_sensitive_column
 from app.semantics import prompt as prompt_module
@@ -86,8 +91,14 @@ class SemanticsService:
                 )
             input_complete = published.get("complete", True)
         else:
-            # 显式历史快照仅用于诊断，不改变默认发布目录
-            input_complete = True
+            # 显式历史快照仅用于诊断；按对应扫描任务的真实完整性核定，不无条件视为完整
+            job = next(
+                (j for j in self._repo.list_scan_jobs(source_id)
+                 if j.get("snapshot_id") == snapshot_id), None)
+            if job is None:
+                raise ResourceNotFoundError(
+                    "snapshot", f"快照没有对应的扫描任务记录：{snapshot_id}")
+            input_complete = job.get("status") == "succeeded"
         if table["snapshot_id"] != snapshot_id:
             raise ValueError(
                 f"表不属于目标快照：table_snapshot={table['snapshot_id']}，"
@@ -102,13 +113,16 @@ class SemanticsService:
             table_ids=[table_id],
             input_complete=input_complete,
             send_samples=bool(send_samples and self._settings.semantics_send_samples),
+            model_configured=(self._settings.llm_model
+                              if self._settings.deepseek_enabled and self._llm_factory
+                              else None),
         )
         self._repo.save_semantic_run(run.to_dict())
 
         try:
-            result = self._analyze(table, run, send_samples=run.send_samples,
-                                   column_limit=column_limit)
-        except Exception as exc:  # 收尾兜底：任务级异常落库为 failed（固定安全文案）
+            return self._analyze(table, run, send_samples=run.send_samples,
+                                 column_limit=column_limit)
+        except Exception as exc:  # 收尾兜底：固定安全文案，不泄漏内容
             run.status = "failed"
             run.finished_at = now_iso()
             run.errors.append({
@@ -117,7 +131,6 @@ class SemanticsService:
             })
             self._repo.save_semantic_run(run.to_dict())
             return run.to_dict()
-        return result
 
     def _analyze(self, table: dict[str, Any], run: SemanticRun, *,
                  send_samples: bool, column_limit: int | None) -> dict[str, Any]:
@@ -160,29 +173,31 @@ class SemanticsService:
         })
 
         model_outputs: dict[str, dict[str, Any]] = {}
-        model_purpose: str | None = None
+        model_purpose: dict[str, Any] | None = None
         if self._settings.deepseek_enabled and self._llm_factory is not None:
             run.mode = "model_assisted"
             model_outputs, model_purpose, model_error = self._model_infer(
                 table, analyzed_columns, profiles, run, send_samples)
             if model_error:
+                # 模型故障/校验失败：回退规则结果并明确记录；规则结果可发布（partial）
                 run.errors.append(model_error)
                 run.status = "partial"
         run.columns_analyzed = len(analyzed_columns)
-        run.status = run.status if run.status == "partial" else "succeeded"
-
-        for column in analyzed_columns:
-            model_entry = model_outputs.get(column["name"])
-            record = self._build_field_record(
-                table, run, column, rules_results[column["name"]], model_entry)
-            self._repo.save_field_semantics(record)
-        purpose_record = self._build_purpose_record(
-            table, run, purpose_rules, model_purpose,
-            model_used=bool(model_outputs))
-        self._repo.save_table_purpose(purpose_record)
-
+        if run.status != "partial":
+            run.status = "succeeded"
         run.finished_at = now_iso()
-        self._repo.save_semantic_run(run.to_dict())
+
+        # 候选写入—成功发布：字段 + 表用途 + 运行记录单事务提交
+        field_records = [
+            self._build_field_record(
+                table, run, column, rules_results[column["name"]],
+                model_outputs.get(column["name"]))
+            for column in analyzed_columns
+        ]
+        purpose_record = self._build_purpose_record(
+            table, run, purpose_rules, model_purpose, model_used=bool(model_outputs))
+        # 批写入不带乐观锁（追加式修订）；失败异常由上层收尾兜底统一处理
+        self._repo.save_semantics_batch(field_records, purpose_record, run.to_dict())
         return run.to_dict()
 
     def _model_infer(
@@ -192,8 +207,14 @@ class SemanticsService:
         profiles: list[dict[str, Any]],
         run: SemanticRun,
         send_samples: bool,
-    ) -> tuple[dict[str, dict[str, Any]], str | None, dict[str, Any] | None]:
-        """返回 (字段输出, 表用途, 错误条目|None)。预算内调用 + 一次修复。"""
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+        """预算内模型推断：返回 (字段输出, 表用途, 错误条目|None)。
+
+        计量口径：llm_calls=逻辑调用数；llm_http_attempts=总 HTTP 尝试
+        （传输重试与结构修复共享 semantics_llm_max_calls 总预算）；
+        token 累计所有返回过 usage 的响应（含结构不合格者），缺失标记
+        llm_usage_complete=False；运行总期限独立于单次请求超时。
+        """
         sensitive = {
             c["name"] for c in columns
             if is_sensitive_column(c["name"], self._settings.sensitive_column_keywords)
@@ -202,56 +223,111 @@ class SemanticsService:
             {**table, "columns": columns}, profiles,
             send_samples=send_samples, sensitive_columns=sensitive)
         system, user = prompt_module.build_prompts(payload)
-        if len(system) + len(user) > self._settings.semantics_input_char_limit:
-            return {}, None, {
-                "reason": "input_budget_exceeded",
-                "message": "模型输入超过字符预算，本次仅使用规则结果",
-            }
-        refs, columns_meta = prompt_module.evidence_refs_for(
-            {**table, "columns": columns}, profiles)
+        table_ctx = prompt_module.table_context_for({**table, "columns": columns}, profiles)
         expected = [c["name"] for c in columns]
 
         client = self._llm_factory()  # type: ignore[misc]
         started = time.perf_counter()
-        llm_calls = 0
-        output: LLMStructuredOutput | None = None
+        deadline_seconds = self._settings.semantics_llm_deadline_seconds
+        total_budget = self._settings.semantics_llm_max_calls  # 总 HTTP 尝试预算
+        consumed = 0
+        logical_calls = 0
+        prompt_tokens: list[int] = []
+        completion_tokens: list[int] = []
+        usage_complete = True
         feedback = ""
-        max_calls = min(self._settings.semantics_llm_max_calls, 2)
+
+        def _elapsed_ok() -> bool:
+            return (time.perf_counter() - started) < deadline_seconds
+
+        def _record_usage(usage) -> None:
+            nonlocal usage_complete
+            if usage.prompt_tokens is None or usage.completion_tokens is None:
+                usage_complete = False
+            else:
+                prompt_tokens.append(usage.prompt_tokens)
+                completion_tokens.append(usage.completion_tokens)
+
         try:
-            for attempt in range(max_calls):
-                llm_calls += 1
-                user_prompt = user if not feedback else (
-                    user + "\n上一次输出未通过校验：" + feedback + "，请修正后重新输出完整 JSON。"
-                )
+            while logical_calls < 2:  # 首次 + 至多一次结构修复
+                remaining = total_budget - consumed
+                if remaining <= 0:
+                    run.llm_calls = logical_calls
+                    run.llm_http_attempts = consumed
+                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
+                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    return {}, None, {
+                        "reason": "model_request_failed:budget_exceeded",
+                        "message": "模型请求预算耗尽（含传输重试），已回退规则结果",
+                    }
+                if not _elapsed_ok():
+                    run.llm_calls = logical_calls
+                    run.llm_http_attempts = consumed
+                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
+                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    return {}, None, {
+                        "reason": "model_request_failed:deadline_exceeded",
+                        "message": "模型调用超过本次分析总期限，已回退规则结果",
+                    }
+                current_user = user if not feedback else (
+                    user + "\n上一次输出未通过校验：" + feedback
+                    + "，请修正后重新输出完整 JSON。")
+                # 每次请求重新检查输入长度预算（修复反馈会增长输入）
+                if len(system) + len(current_user) > self._settings.semantics_input_char_limit:
+                    run.llm_calls = logical_calls
+                    run.llm_http_attempts = consumed
+                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
+                    run.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    return {}, None, {
+                        "reason": "input_budget_exceeded",
+                        "message": "模型输入超过字符预算（含修复反馈），本次仅使用规则结果",
+                    }
+                logical_calls += 1
                 output = client.generate_structured(
-                    system, user_prompt, {"type": "object"},
-                    max_output_chars=100_000,
-                )
-                validation = prompt_module.validate_model_response(
-                    output.result, expected, refs, columns_meta=columns_meta)
-                if validation["valid"]:
+                    system, current_user, {"type": "object"},
+                    max_output_chars=100_000, max_attempts=remaining)
+                consumed += max(output.usage.http_attempts, 1)
+                _record_usage(output.usage)
+                if output.usage.model_reported:
                     run.model_reported = output.usage.model_reported
-                    run.llm_prompt_tokens = output.usage.prompt_tokens
-                    run.llm_completion_tokens = output.usage.completion_tokens
-                    run.llm_calls = llm_calls
+                validation = prompt_module.validate_model_response(
+                    output.result, expected, table_ctx)
+                if validation["valid"]:
+                    run.llm_calls = logical_calls
+                    run.llm_http_attempts = consumed
+                    self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
                     run.elapsed_ms = int((time.perf_counter() - started) * 1000)
                     return validation["columns"], validation["table_purpose"], None
-                feedback = ";".join(validation["errors"][:5])
-            # 有限修复仍不合格：记录失败，不返回伪造模型语义
-            run.llm_calls = llm_calls
+                feedback = prompt_module.safe_repair_feedback(
+                    validation["errors"], expected)
+            run.llm_calls = logical_calls
+            run.llm_http_attempts = consumed
+            self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
             run.elapsed_ms = int((time.perf_counter() - started) * 1000)
             return {}, None, {
                 "reason": "model_validation_failed",
                 "message": "模型输出未通过结构校验（虚构/遗漏/无效证据），已回退规则结果",
             }
         except LLMRequestError as exc:
-            run.llm_calls = llm_calls
+            consumed += max(getattr(exc, "attempts", 0) or 1, 1)
+            run.llm_calls = logical_calls
+            run.llm_http_attempts = consumed
+            self._apply_usage(run, prompt_tokens, completion_tokens, usage_complete)
             run.elapsed_ms = int((time.perf_counter() - started) * 1000)
             return {}, None, {
                 "reason": f"model_request_failed:{exc.reason}",
                 "message": "模型调用失败（运行故障），已回退规则结果；"
                            "该失败与证据不足的 unknown 不同",
             }
+
+    @staticmethod
+    def _apply_usage(run: SemanticRun, prompt_tokens: list[int],
+                     completion_tokens: list[int], usage_complete: bool) -> None:
+        run.llm_usage_complete = usage_complete
+        if prompt_tokens:
+            run.llm_prompt_tokens = sum(prompt_tokens)
+        if completion_tokens:
+            run.llm_completion_tokens = sum(completion_tokens)
 
     # -- 记录构建 ---------------------------------------------------------------
 
@@ -291,7 +367,7 @@ class SemanticsService:
                 "inference_source": "model",
                 "model_name": run.model_reported,
                 "prompt_version": prompt_module.PROMPT_VERSION,
-                "rationale": "模型推断（证据已服务端核验）",
+                "rationale": "模型推断；证据引用已核验存在（引用存在不等于结论正确）",
             })
             return record
         record = base.to_dict()
@@ -313,7 +389,7 @@ class SemanticsService:
         table: dict[str, Any],
         run: SemanticRun,
         rules_result: dict[str, Any],
-        model_purpose: str | None,
+        model_purpose: dict[str, Any] | None,
         model_used: bool,
     ) -> dict[str, Any]:
         record = TablePurpose(
@@ -326,24 +402,23 @@ class SemanticsService:
         ).to_dict()
         if model_used and model_purpose:
             record.update({
-                "purpose": model_purpose,
-                "rationale": "模型推断（枚举校验通过）",
+                "purpose": model_purpose["purpose"],
+                "confidence": model_purpose.get("confidence", "low"),
+                "rationale": model_purpose.get("rationale")
+                or "模型推断；证据引用已核验存在（引用存在不等于结论正确）",
+                "evidence": model_purpose.get("evidence", []),
+                "alternatives": model_purpose.get("alternatives", []),
                 "inference_source": "model",
                 "model_name": run.model_reported,
                 "prompt_version": prompt_module.PROMPT_VERSION,
-                "alternatives": [{
-                    "purpose": rules_result["purpose"],
-                    "rationale": f"规则候选（{rules_result.get('rules_version')}）",
-                    "confidence": rules_result.get("confidence", "low"),
-                }] if rules_result["purpose"] != model_purpose else [],
             })
         else:
             record.update({
                 "purpose": rules_result["purpose"],
+                "confidence": rules_result.get("confidence", "low"),
                 "rationale": rules_result.get("rationale"),
                 "alternatives": rules_result.get("alternatives", []),
                 "evidence": rules_result.get("evidence", []),
-                "confidence": rules_result.get("confidence", "low"),
             })
         return record
 
@@ -366,6 +441,11 @@ class SemanticsService:
         latest = history[0]
         if action not in _REVIEW_ACTIONS:
             raise ValueError(f"未知审核动作：{action}")
+        # 过期视图优先报冲突（409）：并发下另一提交可能已改变状态，
+        # 此时转换校验针对的是提交者未见过的状态，应判定冲突而非转换非法。
+        if latest["revision"] != expected_revision:
+            raise RevisionConflictError(
+                f"修订冲突：最新修订为 {latest['revision']}，提交基于 {expected_revision}")
         target_status = _REVIEW_ACTIONS[action]
         allowed = REVIEW_TRANSITIONS.get(latest["review_status"], ())
         if target_status not in allowed:
@@ -374,10 +454,6 @@ class SemanticsService:
             )
         if patch.get("category") is not None and patch["category"] not in FIELD_CATEGORIES:
             raise ValueError(f"非法语义类别：{patch['category']}")
-        if latest["revision"] != expected_revision:
-            raise RevisionConflictError(
-                f"修订冲突：最新修订为 {latest['revision']}，提交基于 {expected_revision}"
-            )
         normalized = dict(patch)
         if "business_name" in normalized:
             normalized["suggested_business_name"] = normalized.pop("business_name")
@@ -392,7 +468,8 @@ class SemanticsService:
             "run_id": None,
         }
         updated.pop("revision", None)
-        return self._repo.save_field_semantics(updated)
+        # expected_revision 传到仓储：版本比较与新修订写入在同一事务内原子完成
+        return self._repo.save_field_semantics(updated, expected_revision=expected_revision)
 
     def submit_purpose_review(
         self,
@@ -410,15 +487,15 @@ class SemanticsService:
         latest = history[0]
         if action not in _REVIEW_ACTIONS:
             raise ValueError(f"未知审核动作：{action}")
+        if latest["revision"] != expected_revision:
+            raise RevisionConflictError(
+                f"修订冲突：最新修订为 {latest['revision']}，提交基于 {expected_revision}")
         target_status = _REVIEW_ACTIONS[action]
         if target_status not in REVIEW_TRANSITIONS.get(latest["review_status"], ()):
             raise ValueError(
                 f"不允许的审核转换：{latest['review_status']} → {target_status}")
         if patch.get("purpose") is not None and patch["purpose"] not in TABLE_PURPOSES:
             raise ValueError(f"非法表用途：{patch['purpose']}")
-        if latest["revision"] != expected_revision:
-            raise RevisionConflictError(
-                f"修订冲突：最新修订为 {latest['revision']}，提交基于 {expected_revision}")
         updated = {
             **latest,
             **{k: v for k, v in patch.items() if v is not None},
@@ -430,7 +507,7 @@ class SemanticsService:
             "run_id": None,
         }
         updated.pop("revision", None)
-        return self._repo.save_table_purpose(updated)
+        return self._repo.save_table_purpose(updated, expected_revision=expected_revision)
 
     # -- 查询 -----------------------------------------------------------------
 
@@ -492,13 +569,14 @@ class SemanticsService:
             haystacks: list[tuple[str, float]] = []
             business = record.get("suggested_business_name") or ""
             if record.get("review_status") == "business_confirmed" and business:
-                haystacks.append((business, 3.0))
-            elif business:
+                haystacks.append((business, 3.0))  # rejected 不参与确认加权
+            elif business and record.get("review_status") != "rejected":
                 haystacks.append((business, 2.0))
             haystacks.append((record.get("original_name") or "", 2.0))
-            haystacks.append((record.get("original_comment") or "", 1.5))
-            haystacks.append((" ".join(record.get("candidate_entities") or []), 1.5))
-            haystacks.append((record.get("category") or "", 1.0))
+            if record.get("review_status") != "rejected":
+                haystacks.append((record.get("original_comment") or "", 1.5))
+                haystacks.append((" ".join(record.get("candidate_entities") or []), 1.5))
+                haystacks.append((record.get("category") or "", 1.0))
             haystacks.append((table.get("table_name") or "", 0.5))
             score = 0.0
             basis: list[str] = []
@@ -506,16 +584,13 @@ class SemanticsService:
                 lowered = (text or "").lower()
                 if not lowered:
                     continue
-                hits = [t for t in query_tokens if t and (t in lowered or lowered in t
-                                                          and len(lowered) <= 24)]
+                hits = [t for t in query_tokens if t and (
+                    t in lowered or (lowered in t and len(lowered) <= 24))]
                 if hits:
                     score += weight * min(len(hits), 3)
-                    source_label = {
-                        3.0: "confirmed_business_name", 2.0: "business_name",
-                    }.get(weight) or {
-                        2.0: "original_name", 1.5: "comment_or_entity",
-                        1.0: "category", 0.5: "table_name",
-                    }.get(weight)
+                    source_label = {3.0: "confirmed_business_name", 2.0: "business_name",
+                                    1.5: "comment_or_entity", 1.0: "category",
+                                    0.5: "table_name"}.get(weight)
                     if source_label:
                         basis.append(source_label)
             if score > 0:

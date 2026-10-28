@@ -40,3 +40,5 @@ target-version = "py313"
 # close 失败也必须吞掉以免覆盖主要结果；这里是刻意为之的宽捕获。
 "app/services/scan_service.py" = ["BLE001", "S110"]
 "app/services/semantics_service.py" = ["BLE001"]
+# 并发回归测试需捕获线程内任意异常并断言结果，不允许静默。
+"tests/test_semantics_service.py" = ["BLE001"]

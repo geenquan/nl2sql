@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.domain.metadata import ColumnProfile, TableMetadata
-from app.security.masking import mask_sample_values
+from app.security.masking import MASKING_VERSION, mask_sample_values
 
 _ALL_METRICS = ("null_ratio", "distinct_count_estimate", "uniqueness_ratio", "sample_values")
 
@@ -71,6 +71,7 @@ class DataProfiler:
                         samples_redacted=True,
                         empty_string_count=None,
                         unsupported_metrics=list(_ALL_METRICS),
+                        masking_version=MASKING_VERSION,
                     )
                 )
                 continue
@@ -101,6 +102,7 @@ class DataProfiler:
                     samples_redacted=masked.redacted,
                     empty_string_count=empty_string_count if values else None,
                     unsupported_metrics=[],
+                    masking_version=MASKING_VERSION,
                 )
             )
         return profiles

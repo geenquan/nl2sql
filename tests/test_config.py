@@ -144,3 +144,9 @@ def test_m2_semantics_budgets_default_and_env(tmp_path, monkeypatch) -> None:
 def test_invalid_m2_budgets_are_rejected(overrides: dict) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **overrides)
+
+
+def test_m2_llm_deadline_config() -> None:
+    assert Settings(_env_file=None).semantics_llm_deadline_seconds > 0
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, semantics_llm_deadline_seconds=0)

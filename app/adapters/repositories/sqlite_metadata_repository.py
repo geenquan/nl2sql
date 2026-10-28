@@ -33,6 +33,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
+from app.core.exceptions import RevisionConflictError
 from app.ports.repositories import MetadataRepository, SourceRepository
 
 _JSON_COLUMNS = ("columns", "primary_key", "foreign_keys", "indexes", "allowed_schemas", "errors")
@@ -59,8 +60,9 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
 
     def __init__(self, database_url: str, engine: Engine | None = None) -> None:
         self._database_url = database_url
+        # busy timeout：多线程/多进程写入时等待锁而非立即失败（乐观锁语义依赖串行化写入）
         self._engine = engine or create_engine(
-            database_url, connect_args={"check_same_thread": False}
+            database_url, connect_args={"check_same_thread": False, "timeout": 30}
         )
         self._metadata = MetaData()
         self._sources = Table(
@@ -492,33 +494,54 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
 
     # -- M2 语义持久化 -------------------------------------------------------
 
-    def save_field_semantics(self, record: dict[str, Any]) -> int:
+    def save_field_semantics(
+        self, record: dict[str, Any], expected_revision: int | None = None
+    ) -> int:
+        """追加新修订。expected_revision 非空时在事务内做乐观锁：
+        版本比较与写入原子完成，过期提交抛 RevisionConflictError（多进程安全）。"""
+        with self._engine.begin() as conn:
+            return self._insert_field_semantics(record, expected_revision, conn)
+
+    def _insert_field_semantics(
+        self,
+        record: dict[str, Any],
+        expected_revision: int | None,
+        conn: Any,
+    ) -> int:
         table_id = record["table_id"]
         column_name = record["column_name"]
-        with self._engine.begin() as conn:
-            current = conn.execute(
-                select(func.max(self._field_semantics.c.revision)).where(
-                    self._field_semantics.c.table_id == table_id,
-                    self._field_semantics.c.column_name == column_name,
-                )
-            ).scalar()
-            revision = (current or 0) + 1
-            record = {**record, "revision": revision}
+        current = conn.execute(
+            select(func.max(self._field_semantics.c.revision)).where(
+                self._field_semantics.c.table_id == table_id,
+                self._field_semantics.c.column_name == column_name,
+            )
+        ).scalar()
+        if expected_revision is not None and (current or 0) != expected_revision:
+            raise RevisionConflictError(
+                f"修订冲突：最新修订为 {current or 0}，提交基于 {expected_revision}")
+        revision = (current or 0) + 1
+        row = {**record, "revision": revision}
+        try:
             conn.execute(
                 self._field_semantics.insert().values(
                     id=_new_id(),
-                    source_id=record["source_id"],
-                    snapshot_id=record["snapshot_id"],
+                    source_id=row["source_id"],
+                    snapshot_id=row["snapshot_id"],
                     table_id=table_id,
                     column_name=column_name,
                     revision=revision,
-                    review_status=record.get("review_status", "suggested"),
-                    inference_source=record.get("inference_source", "rules"),
-                    run_id=record.get("run_id"),
-                    created_at=record.get("created_at") or _now(),
-                    payload=_dump(record),
+                    review_status=row.get("review_status", "suggested"),
+                    inference_source=row.get("inference_source", "rules"),
+                    run_id=row.get("run_id"),
+                    created_at=row.get("created_at") or _now(),
+                    payload=_dump(row),
                 )
             )
+        except IntegrityError:
+            # SELECT 不预留写锁：并发窗口下唯一约束 (table,column,revision)
+            # 是最终仲裁者；命中即并发修订冲突。
+            raise RevisionConflictError(
+                "并发修订冲突：记录已被其他写入更新，请刷新后重试") from None
         return revision
 
     def _load_semantic_rows(self, where_clause: Any, order_desc: bool = True) -> list[dict[str, Any]]:
@@ -535,26 +558,46 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
         return [dict(_load(row.payload, {})) for row in rows]
 
     @staticmethod
-    def _effective_revision(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """每列取一条：最新 business_confirmed 优先，否则最新修订。"""
-        by_column: dict[str, dict[str, Any]] = {}
-        confirmed: dict[str, dict[str, Any]] = {}
+    def _select_effective(group_desc: list[dict[str, Any]]) -> dict[str, Any]:
+        """单字段（或单表用途，倒序修订）的有效结果选择：
+
+        - 最新修订已 business_confirmed → 生效；
+        - 存在历史确认且其后有人工修订（revert/人工改写）→ 确认已被人工终止，
+          生效最新修订（人工可以撤销自己的确认）；
+        - 存在历史确认且其后只有模型/规则修订 → 人工确认继续生效
+          （模型建议不能覆盖人工确认）；
+        - 无确认 → 生效最新修订（rejected 如实返回，由调用方决定展示/过滤）。
+        """
+        latest = group_desc[0]
+        if latest.get("review_status") == "business_confirmed":
+            return latest
+        confirmed_idx = next(
+            (i for i, row in enumerate(group_desc)
+             if row.get("review_status") == "business_confirmed"), None)
+        if confirmed_idx is None:
+            return latest
+        revoked = any(
+            row.get("inference_source") == "human"
+            for row in group_desc[:confirmed_idx]
+        )
+        return latest if revoked else group_desc[confirmed_idx]
+
+    @classmethod
+    def _effective_revision(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """按 (table_id, column_name) 完整字段标识分组，不跨表合并同名字段。"""
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in rows:  # rows 已按 revision 倒序
-            column = row["column_name"]
-            if column not in by_column:
-                by_column[column] = row
-            if row.get("review_status") == "business_confirmed" and column not in confirmed:
-                confirmed[column] = row
-        return [confirmed.get(column, by_column[column]) for column in by_column]
+            groups.setdefault((row["table_id"], row["column_name"]), []).append(row)
+        return [cls._select_effective(group) for _key, group in sorted(groups.items())]
 
     def list_field_semantics(self, table_id: str, effective: bool = False) -> list[dict[str, Any]]:
         rows = self._load_semantic_rows(self._field_semantics.c.table_id == table_id)
         if effective:
             return self._effective_revision(rows)
-        latest: dict[str, dict[str, Any]] = {}
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
-            latest.setdefault(row["column_name"], row)
-        return [latest[column] for column in sorted(latest)]
+            latest.setdefault((row["table_id"], row["column_name"]), row)
+        return [latest[key] for key in sorted(latest)]
 
     def get_field_semantics_history(self, table_id: str, column_name: str) -> list[dict[str, Any]]:
         return self._load_semantic_rows(
@@ -571,36 +614,87 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
         )
         if effective:
             return self._effective_revision(rows)
-        latest: dict[str, dict[str, Any]] = {}
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
             latest.setdefault((row["table_id"], row["column_name"]), row)
-        return list(latest.values())
+        return [latest[key] for key in sorted(latest)]
 
-    def save_table_purpose(self, record: dict[str, Any]) -> int:
-        table_id = record["table_id"]
+    def save_table_purpose(
+        self, record: dict[str, Any], expected_revision: int | None = None
+    ) -> int:
+        """追加新修订；expected_revision 乐观锁语义同字段语义（原子、多进程安全）。"""
         with self._engine.begin() as conn:
-            current = conn.execute(
-                select(func.max(self._table_purposes.c.revision)).where(
-                    self._table_purposes.c.table_id == table_id
-                )
-            ).scalar()
-            revision = (current or 0) + 1
-            record = {**record, "revision": revision}
+            return self._insert_table_purpose(record, expected_revision, conn)
+
+    def _insert_table_purpose(
+        self, record: dict[str, Any], expected_revision: int | None, conn: Any
+    ) -> int:
+        table_id = record["table_id"]
+        current = conn.execute(
+            select(func.max(self._table_purposes.c.revision)).where(
+                self._table_purposes.c.table_id == table_id
+            )
+        ).scalar()
+        if expected_revision is not None and (current or 0) != expected_revision:
+            raise RevisionConflictError(
+                f"修订冲突：最新修订为 {current or 0}，提交基于 {expected_revision}")
+        revision = (current or 0) + 1
+        row = {**record, "revision": revision}
+        try:
             conn.execute(
                 self._table_purposes.insert().values(
                     id=_new_id(),
-                    source_id=record["source_id"],
-                    snapshot_id=record["snapshot_id"],
+                    source_id=row["source_id"],
+                    snapshot_id=row["snapshot_id"],
                     table_id=table_id,
                     revision=revision,
-                    review_status=record.get("review_status", "suggested"),
-                    inference_source=record.get("inference_source", "rules"),
-                    run_id=record.get("run_id"),
-                    created_at=record.get("created_at") or _now(),
-                    payload=_dump(record),
+                    review_status=row.get("review_status", "suggested"),
+                    inference_source=row.get("inference_source", "rules"),
+                    run_id=row.get("run_id"),
+                    created_at=row.get("created_at") or _now(),
+                    payload=_dump(row),
                 )
             )
+        except IntegrityError:
+            raise RevisionConflictError(
+                "并发修订冲突：记录已被其他写入更新，请刷新后重试") from None
         return revision
+
+    def save_semantics_batch(
+        self,
+        field_records: list[dict[str, Any]],
+        purpose_record: dict[str, Any] | None,
+        run_record: dict[str, Any],
+    ) -> None:
+        """整次语义分析结果在单事务中写入（字段 + 表用途 + 运行记录）。
+
+        全部成功才提交；任一失败整体回滚——失败运行的中间结果不会成为
+        默认有效结果（修复轮的发布语义）。run_record 按 run_id upsert。
+        """
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        run_values = {
+            "id": run_record["run_id"],
+            "source_id": run_record.get("source_id"),
+            "snapshot_id": run_record.get("snapshot_id"),
+            "status": run_record.get("status"),
+            "created_at": run_record.get("started_at") or _now(),
+            "updated_at": _now(),
+            "payload": _dump(run_record),
+        }
+        with self._engine.begin() as conn:
+            for record in field_records:
+                self._insert_field_semantics(record, None, conn)
+            if purpose_record:
+                self._insert_table_purpose(purpose_record, None, conn)
+            conn.execute(
+                sqlite_insert(self._semantic_runs)
+                .values(run_values)
+                .on_conflict_do_update(
+                    index_elements=[self._semantic_runs.c.id],
+                    set_={k: v for k, v in run_values.items() if k != "id"},
+                )
+            )
 
     def _load_purpose_rows(self, where_clause: Any) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
@@ -616,10 +710,7 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
         if not rows:
             return None
         if effective:
-            confirmed = next(
-                (r for r in rows if r.get("review_status") == "business_confirmed"), None
-            )
-            return confirmed or rows[0]
+            return self._select_effective(rows)
         return rows[0]
 
     def get_table_purpose_history(self, table_id: str) -> list[dict[str, Any]]:

@@ -168,9 +168,11 @@ class SemanticRun:
     prompt_version: str = "prompt-v1"
     model_configured: str | None = None
     model_reported: str | None = None
-    llm_calls: int = 0
-    llm_prompt_tokens: int | None = None  # None = unavailable，不编造
+    llm_calls: int = 0  # 逻辑调用数（generate_structured 次数）
+    llm_http_attempts: int = 0  # 总 HTTP 尝试数（含传输重试与修复）
+    llm_prompt_tokens: int | None = None  # 已知响应的累计；None = unavailable
     llm_completion_tokens: int | None = None
+    llm_usage_complete: bool = True  # False = 部分 usage 缺失（部分已知）
     elapsed_ms: int | None = None
     columns_analyzed: int = 0
     send_samples: bool = False

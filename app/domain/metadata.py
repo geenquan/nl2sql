@@ -66,3 +66,5 @@ class ColumnProfile:
     samples_redacted: bool = False
     empty_string_count: int | None = None
     unsupported_metrics: list[str] = field(default_factory=list)
+    # 生成样本时使用的脱敏规则版本；外发边界据此判断样本可信来源。
+    masking_version: str | None = None

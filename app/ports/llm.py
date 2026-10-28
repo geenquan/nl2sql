@@ -7,12 +7,19 @@ from app.core.exceptions import LLMRequestError  # noqa: F401  （调用方捕�
 
 @dataclass
 class LLMUsage:
-    """如实记录的调用用量；服务端未提供的数据为 None（unavailable），不编造。"""
+    """如实记录的调用用量；服务端未提供的数据为 None（unavailable），不编造。
+
+    区分三个计数：逻辑调用数（generate_structured 次数）、HTTP 尝试数
+    （含传输层重试）、结构修复次数（由服务层统计）。model_reported 只填
+    服务端返回的标识；配置的模型名放在 model_configured，二者不得混用。
+    """
 
     model_reported: str | None = None
+    model_configured: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
-    calls: int = 0
+    calls: int = 1
+    http_attempts: int = 1
     elapsed_ms: int = 0
 
 
@@ -25,9 +32,10 @@ class LLMStructuredOutput:
 class LLMClient(ABC):
     """大模型端口；业务模块不直接导入特定供应商 SDK。
 
-    M2 接口调整：generate_structured 拆分 system/user 输入并返回
-    LLMStructuredOutput（结构化结果 + 如实用量）；适配器负责超时、
-    有限重试、响应大小限制与 JSON 解析。领域级校验由业务模块执行。
+    M2 修复轮接口调整：generate_structured 增加 max_attempts（该次逻辑调用
+    允许的总 HTTP 尝试上限，含传输重试；传输重试与上层修复共享同一预算，
+    不允许嵌套放大）。失败抛出的 LLMRequestError 携带 attempts（已消耗的
+    HTTP 尝试数），供上层继续扣减预算。
     """
 
     @abstractmethod
@@ -38,6 +46,7 @@ class LLMClient(ABC):
         output_schema: dict[str, Any],
         *,
         max_output_chars: int | None = None,
+        max_attempts: int | None = None,
     ) -> LLMStructuredOutput:
         """返回解析后的 JSON 对象；失败抛 LLMRequestError（固定安全消息）。"""
 

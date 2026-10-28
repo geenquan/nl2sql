@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     semantics_input_char_limit: int = Field(default=24000, gt=0)
     semantics_send_samples: bool = False
     semantics_search_default_limit: int = Field(default=20, gt=0, le=100)
+    # 单次语义分析的模型调用总期限（秒）；请求超时不替代整次运行期限。
+    semantics_llm_deadline_seconds: int = Field(default=120, gt=0)
 
     # 系统业务库：与只读查询数据源独立，持久化接入仍待实现。
     biz_mysql_host: str = "127.0.0.1"

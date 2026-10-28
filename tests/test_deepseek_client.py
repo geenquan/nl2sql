@@ -90,7 +90,9 @@ class TestRetryPolicy:
         client = make_client(httpx.MockTransport(handler))
         out = client.generate_structured("system", "user", SCHEMA)
         assert out.result == {"a": 1}
-        assert out.usage.calls == 2
+        # 新口径：calls=逻辑调用数，http_attempts=含传输重试的 HTTP 尝试数
+        assert out.usage.calls == 1
+        assert out.usage.http_attempts == 2
 
     def test_retry_limit_exceeded(self) -> None:
         attempts = []
@@ -169,3 +171,74 @@ class TestOutputLimits:
             client.generate_structured("system", "user", SCHEMA)
         assert "test-key-do-not-log" not in str(exc.value)
         assert "sk-live" not in str(exc.value)
+
+
+class TestAttemptBudgetAndUsage:
+    def test_max_attempts_caps_transport_retries(self) -> None:
+        attempts = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            return httpx.Response(503, json={"error": "down"})
+
+        client = make_client(httpx.MockTransport(handler), max_retries=5)
+        with pytest.raises(LLMRequestError) as exc:
+            client.generate_structured("s", "u", SCHEMA, max_attempts=2)
+        assert len(attempts) == 2  # 预算 2 次封顶，嵌套重试不放大
+        assert exc.value.attempts == 2
+
+    def test_error_carries_attempts_for_budget_accounting(self) -> None:
+        attempts = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            raise httpx.ReadTimeout("timed out")
+
+        client = make_client(httpx.MockTransport(handler), max_retries=3)
+        with pytest.raises(LLMRequestError) as exc:
+            client.generate_structured("s", "u", SCHEMA, max_attempts=3)
+        assert exc.value.reason == "timeout"
+        assert exc.value.attempts == 3
+
+    def test_model_reported_none_when_server_omits(self) -> None:
+        client = make_client(httpx.MockTransport(
+            lambda r: ok_response({"a": 1}, model="")))
+        out = client.generate_structured("s", "u", SCHEMA)
+        assert out.usage.model_reported in (None, "")
+        assert out.usage.model_configured == "deepseek-test"  # 配置模型单列，不冒充
+
+    def test_oversize_response_rejected_with_declared_length(self) -> None:
+        huge = httpx.Response(
+            200, headers={"content-length": str(10 * 1024 * 1024)},
+            json={"k": "v"})
+        client = make_client(httpx.MockTransport(lambda r: huge))
+        with pytest.raises(LLMRequestError) as exc:
+            client.generate_structured("s", "u", SCHEMA)
+        assert exc.value.reason == "invalid_response"
+
+    def test_oversize_response_rejected_streaming_without_length(self) -> None:
+        big_body = json.dumps({"k": "v" * (3 * 1024 * 1024)}).encode()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=big_body)  # 无 content-length 声明
+
+        client = make_client(httpx.MockTransport(handler))
+        with pytest.raises(LLMRequestError) as exc:
+            client.generate_structured("s", "u", SCHEMA)
+        assert exc.value.reason == "invalid_response"
+
+    def test_no_backoff_after_final_attempt(self) -> None:
+        import time as _time
+
+        attempts = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(_time.monotonic())
+            return httpx.Response(503, json={"error": "down"})
+
+        client = make_client(httpx.MockTransport(handler), max_retries=2)
+        with pytest.raises(LLMRequestError):
+            client.generate_structured("s", "u", SCHEMA)
+        raised_at = _time.monotonic()  # 紧接异常返回之后
+        # 最后一次尝试之后立即抛错，无额外退避
+        assert raised_at - attempts[-1] < 0.3

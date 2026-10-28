@@ -52,6 +52,10 @@ _PARTIAL_MASK_KEYWORDS = ("email", "mail", "phone", "mobile", "tel", "电话", "
 _MAX_SAMPLE_LENGTH = 64
 _SAMPLE_VALUE_LIMIT = 5
 
+# 当前脱敏规则版本。画像持久化时随 payload 记录；外发边界只信任带当前版本
+# 标记且未脱敏的样本——无法证明经过当前规则处理的历史样本默认不外发。
+MASKING_VERSION = "mask-v2"
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _MOBILE_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _ID_CARD_18_RE = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")

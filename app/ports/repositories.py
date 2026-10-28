@@ -57,8 +57,11 @@ class MetadataRepository(ABC):
     # business_confirmed 修订优先于更新的 suggested 修订（人工结论不被模型覆盖）。
 
     @abstractmethod
-    def save_field_semantics(self, record: dict[str, Any]) -> int:
-        """追加字段语义新修订，返回修订号。"""
+    def save_field_semantics(
+        self, record: dict[str, Any], expected_revision: int | None = None
+    ) -> int:
+        """追加字段语义新修订，返回修订号；expected_revision 原子乐观锁
+        （过期抛 RevisionConflictError，多进程安全）。"""
 
     @abstractmethod
     def list_field_semantics(
@@ -71,7 +74,9 @@ class MetadataRepository(ABC):
         """按修订号倒序返回某字段的全部历史（含模型与人工修订）。"""
 
     @abstractmethod
-    def save_table_purpose(self, record: dict[str, Any]) -> int:
+    def save_table_purpose(
+        self, record: dict[str, Any], expected_revision: int | None = None
+    ) -> int:
         ...
 
     @abstractmethod
@@ -81,6 +86,15 @@ class MetadataRepository(ABC):
     @abstractmethod
     def get_table_purpose_history(self, table_id: str) -> list[dict[str, Any]]:
         ...
+
+    @abstractmethod
+    def save_semantics_batch(
+        self,
+        field_records: list[dict[str, Any]],
+        purpose_record: dict[str, Any] | None,
+        run_record: dict[str, Any],
+    ) -> None:
+        """整次分析结果单事务写入：全成或全败，失败运行不产生部分有效结果。"""
 
     @abstractmethod
     def save_semantic_run(self, run: dict[str, Any]) -> None:

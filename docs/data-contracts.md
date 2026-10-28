@@ -77,12 +77,27 @@
   unavailable 不编造）、`prompt_version`、`rules_version`、`created_at`
 - 审核：`review_status` ∈ suggested/business_confirmed/rejected；允许转换
   suggested→confirmed/rejected、confirmed/rejected→suggested(revert)；
-  人工修订需携带 `expected_revision`（过期→409 冲突，不静默覆盖）；
-  **新一轮模型建议不覆盖已确认的人工结论**（两者都保留，effective 取人工确认优先）；
+  人工修订携带 `expected_revision`，**版本比较与新修订写入在仓储同一事务内原子完成**
+  （并发同版本提交恰一个成功，另一个 409；唯一约束为多进程最终仲裁者）；
+  **模型建议不覆盖有效的人工确认；人工 revert 可终止自己此前的确认**（撤销后
+  生效最新修订），两者独立处理；全部历史保留；
+  rejected 不参与检索加权与确认类输出，但保留在历史中；
   人工确认 ≠ M3 关系验证 ≠ M4 生产发布；reviewer 仅为本地开发输入，无身份认证
-- 运行记录：`mode`（rules_only/model_assisted）、`input_complete`（部分快照显式标记）、
-  `status`、llm 用量（`model_reported/llm_calls/llm_prompt_tokens/llm_completion_tokens/
-  elapsed_ms`，服务端未提供则为 None）、`send_samples`、安全错误明细
+- 证据边界：字段证据必须归属**当前字段自身对象**（类型/注释/主键/外键/含本列的
+  索引/本字段已计算画像指标），支持标准、路径（columns.<列>.<字段>[:值]）、
+  值（类型串/metric=value）三种形态并统一核验规范化；引用其他字段的对象无效；
+  画像指标需值非 None 且口径可用（skipped/insufficient 不可作证据）；
+  引用存在 ≠ 结论正确（rationale 如实表述）；仅上下文证据（name_pattern/
+  glossary_term）不足以支撑非 unknown 结论；表用途输出为结构化对象
+  （purpose/confidence/rationale/evidence/alternatives），证据引用表级对象
+  （表名/列名/列注释/表注释/索引/指标键）
+- 运行记录：`mode`（rules_only/model_assisted）、`input_complete`（显式快照按对应
+  扫描任务真实性核定，不无条件视为完整）、`status`、用量计量（`llm_calls`=逻辑调用、
+  `llm_http_attempts`=总 HTTP 尝试、token 为**所有返回过 usage 响应的累计**含结构
+  不合格者、`llm_usage_complete=false` 表示部分已知、`model_reported` 只填服务端
+  返回值且与 `model_configured` 分列）、`send_samples`、安全错误明细；
+  **发布规则**：整次分析结果（字段+表用途+运行记录）单事务提交，failed 运行
+  不产生部分有效结果；模型失败回退规则的 partial 运行可发布（字段来源标记 rules）
 
 ## 表用途分类（M2 新增）
 

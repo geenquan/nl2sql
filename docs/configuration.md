@@ -162,17 +162,24 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 | 配置项 | 默认值 / 用途 |
 | --- | --- |
 | `SEMANTICS_MAX_COLUMNS_PER_RUN` | `40`，单次分析最多处理的列数（超出记 budget_truncated） |
-| `SEMANTICS_LLM_MAX_CALLS` | `2`，单次分析的最大模型调用数（首次 + 一次修复重试） |
-| `SEMANTICS_INPUT_CHAR_LIMIT` | `24000`，模型输入字符上限（超出则本次仅用规则结果） |
+| `SEMANTICS_LLM_MAX_CALLS` | `2`，单次分析的**总 HTTP 尝试预算**：传输重试与结构修复共享，不允许嵌套重试放大 |
+| `SEMANTICS_INPUT_CHAR_LIMIT` | `24000`，模型输入字符上限（超出仅用规则结果；每次修复请求重新检查） |
+| `SEMANTICS_LLM_DEADLINE_SECONDS` | `120`，单次分析模型调用总期限（独立于单次请求超时） |
 | `SEMANTICS_SEND_SAMPLES` | `false`，样本外发总开关；需与请求 `send_samples=true` 同时开启 |
 | `SEMANTICS_SEARCH_DEFAULT_LIMIT` | `20`，语义检索默认返回条数上限（≤100） |
 
 说明：
 
-- 模型输入默认仅含净化后的结构元数据与画像统计（含 metric_basis/sample_row_count 口径），
-  不含 sample_values、源库地址/账号/密码/credential_ref；注释先经 PII 遮蔽、密钥遮蔽与
-  提示注入模式中和。
-- 样本外发双层开关开启后，仍跳过敏感列、已脱敏与全遮蔽样本（≤3 条 × 32 字符）。
+- 模型输入所有文本入口（注释/字段名/表名/约束名/引用字段/修复反馈）统一净化：去控制字符、
+  限长、PII 与密钥键值遮蔽（冒号/等号/全角/空白/大小写变体）、提示注入模式中和；
+  不含 sample_values、源库地址/账号/密码/credential_ref。
+- 样本外发双层开关开启后，仅限带当前 MASKING_VERSION 标记（mask-v2）、未脱敏、
+  非敏感列的样本，外发边界逐值再脱敏（≤3 条 × 32 字符）；无法证明经过当前规则
+  处理的历史样本一律不外发（不以 samples_redacted=false 判断安全）。
+- 用量核算：llm_calls=逻辑调用数，llm_http_attempts=总 HTTP 尝试；token 累计所有
+  返回过 usage 的响应（含结构不合格者），缺失标记 llm_usage_complete=false
+  （部分已知）；model_reported 只填服务端返回值，配置模型单列 model_configured。
+- 结果发布：整次分析（字段+表用途+运行记录）单事务提交；失败运行不产生部分有效结果。
 - 模型调用失败（超时/认证/限流等）与语义 unknown（证据不足）分开表达；失败回退规则结果
   并记录 `model_request_failed:<reason>`，不返回伪造的模型语义。
 - 真实模型集成测试默认跳过：`NL2SQL_MYSQL_INTEGRATION=1 NL2SQL_SEMANTICS_INTEGRATION=1

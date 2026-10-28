@@ -9,6 +9,43 @@
 - 依赖：**PyMySQL 1.2.3**（MySQL 驱动）；**httpx 0.28.1 转为运行时依赖**（DeepSeek 客户端
   使用，未引入供应商 SDK）。其余与 M0 基线一致（fastapi 0.162.0 / sqlalchemy 2.1.6 等）。
 
+## M2 缺陷修复轮（2026-10-28，七组问题全部先复现后修复）
+
+1. **模型输入净化与样本外发【P1】**：键值敏感信息改为“保留键名+遮蔽值”（冒号/等号/
+   全角/空白/大小写变体，原匹配值不再拼回）；所有文本入口（注释/字段名/表名/约束名/
+   引用字段/修复反馈）统一净化；修复反馈只含固定提示与服务端已知对象名（模型编造名
+   不回传）；样本外发边界只信任带当前 MASKING_VERSION（mask-v2，画像持久化时随
+   payload 记录）的未脱敏非敏感样本并逐值再脱敏，历史样本一律不外发；模型输出的
+   business_name/entities/rationale 均经类型/长度/安全校验（类型错误显式失败，
+   不 str() 冒充、不静默清空）。
+2. **跨表同名字段合并【P1】**：`_effective_revision` 等全部按 (table_id, column_name)
+   分组，跨表/跨源/跨快照不合并；审核优先只作用于对应字段。
+3. **审核并发原子性【P1】**：`expected_revision` 传入仓储，版本比较与写入同事务；
+   并发同版本提交恰一个成功（唯一约束为多进程仲裁者，IntegrityError→409）；
+   过期视图优先报冲突而非转换错误；真实并发（线程 Barrier）回归覆盖字段/表用途/
+   模型写入交错。
+4. **证据归属与结构校验【P1】**：证据按“当前字段直接证据/表级上下文证据”区分核验，
+   跨字段引用（他列主键/注释/复合索引）、不可用画像指标（None/skipped/
+   insufficient/值不符）一律无效；支持标准/路径/值三形态并规范化；仅上下文证据
+   降级 unknown；表用途要求结构化对象+可核验证据+备选；输出类型错误显式失败。
+5. **撤销后有效选择【P2】**：确认后的人工修订（revert/改写）终止此前确认生效；
+   模型/规则修订不终止（模型不覆盖人工确认）；字段/表用途/检索一致；rejected
+   不参与检索加权。
+6. **失败运行中间结果【P1】**：整次分析（字段+表用途+运行记录）经
+   `save_semantics_batch` 单事务提交，failed 运行零残留；模型失败回退规则的
+   partial 可发布（来源标记 rules）；显式 snapshot_id 按对应扫描任务核定
+   input_complete，不再无条件视为完整。
+7. **模型预算与用量【P2】**：`SEMANTICS_LLM_MAX_CALLS` 重定义为**总 HTTP 尝试预算**
+   （传输重试与结构修复共享，客户端按剩余预算限定尝试，不嵌套放大）；token 累计
+   所有返回过 usage 的响应（含结构不合格），缺失标记 llm_usage_complete=false；
+   model_reported 只填服务端返回值（配置模型分列 model_configured）；总期限
+   `SEMANTICS_LLM_DEADLINE_SECONDS` 独立于请求超时；响应字节上限在流式读取中执行；
+   修复请求重查输入预算；末次失败不退避。
+
+真实验证（修复后）：hotel 库只读 + deepseek-flash，1 次逻辑调用（1201/680 tokens，
+2415ms）通过全部新校验（含跨字段证据拒绝、值形式规范化、表注释表级对象）；期间曾
+出现“模型输出字符串用途/路径证据被拒→由修复与值形式规范化解决”的真实往返。
+
 ## M2 字段语义理解（2026-10-28 完成主体）
 
 ### 已实现能力
@@ -51,7 +88,7 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| `python -m pytest -q` | **285 passed, 6 skipped**（skipped 为真实 MySQL/DeepSeek 集成，默认关闭；无残留文件） |
+| `python -m pytest -q` | **322 passed, 6 skipped**（修复轮后；skipped 为真实集成，默认关闭；无残留文件） |
 | `python -m ruff check app tests scripts` | **All checks passed** |
 | `python -m pip check` | **No broken requirements found** |
 | `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q`（M1 只读复验） | **5 passed** |

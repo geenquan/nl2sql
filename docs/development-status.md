@@ -1,6 +1,50 @@
 # 开发交接报告
 
-更新时间：2026-10-28（M3 修复轮 2：跨快照重绑依据重算 + SQL 逐语句硬预算；此前修复轮 1 覆盖跨快照链/并发/预算期限/成本门槛/组合键去重；真实只读复验通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-29（M4 业务实体与语义层完成：主题/实体/属性/维度/指标/路径、版本与发布/回滚、JSON/YAML 导出；真实小预算只读演示 + 合成夹具全流程演示通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M4 业务实体与语义层（2026-10-29 完成）
+
+### 已实现能力
+
+| 能力 | 实现 |
+| --- | --- |
+| 领域契约 | `app/domain/semantic_model.py`（semantic-model-v1）：FieldRef/TableRef 完整身份（组合键有序列表，不拼接字符串）、Entity/Attribute/Dimension/Grain（业务描述+结构化键+依据+确认状态）、ModelRelationship（M3 key+revision+完整身份+有序映射，不存自由文本 JOIN）、Metric（受限聚合 count_rows/count_distinct/sum/avg/min/max + 受限过滤操作符 + 类型化值；数据验证与业务确认两个维度分别留证）、QueryPath（M3 find_paths 正向复用，含基数风险/歧义/截断标记）、Topic（中心实体+grain）、依赖清单（快照+M3 修订+规则版本） |
+| 构建 | `app/semantics/model_builder.py`（smodel-build-v1，确定性规则不调用模型）：一表一实体候选（entity_id=schema.table，跨 Schema 同名表不合并）；M2 effective 消费（rejected 不作正向命名/分类，缺失按 unknown）；grain 结构依据（主键/唯一约束；样本唯一率不作依据）；候选指标全部 suggested（金额/数量凭 M2 类别证据生成 sum/avg，事件 count_rows，主数据 count_distinct 组合键元组语义；单位/时间口径/状态过滤进 blocking）；路径覆盖全部实体对（max_hops 限制）暴露竞争路径歧义；敏感列打标签不进维度 |
+| 服务 | `app/services/semantic_model_service.py`：build（默认发布快照，部分快照需 allow_partial 且 input_complete=false；显式快照校验归属且部分快照同样受门槛）/revise（人工修订产生新版本，引用服务端核验——不存在字段/非法聚合/非法操作符/类型不符/任意 SQL 拒绝；expected_revision 由 (model_id,version) 唯一约束仲裁 → 409）/validate（grain 确认、正式指标口径、依赖、阻断风险、部分快照）/publish（发布前全面复查+指针原子切换+审计）/rollback（目标当前可用性核对+指针切换+审计）/diff（新增/移除/变更）/export（JSON/YAML 同语义、顺序稳定、不含凭证/样本值；正式集合与草稿区分） |
+| 持久化 | SQLite 追加三表 `semantic_models`（(model_id,version) 唯一=不可变+并发仲裁）/`semantic_model_pointer`（发布指针）/`semantic_model_log`（发布/回滚审计）；create_all 兼容，不动既有表 |
+| 依赖降级 | M3 关系被拒/stale → needs_revalidation；目录快照更替 → snapshot_changed（旧模型可查看导出但不冒充当前可用；不自动映射新表 ID；源库实际变化未扫描无法检测——如实说明） |
+| API | `app/api/routes/semantic_models.py`：POST build/revise/validate/publish/rollback；GET models/{id}/versions/{v}/diff/export/publication-log/published |
+| 演示 | `scripts/m4_real_demo.py`：真实库（扫描≤5 表×50 行 + M2 规则语义 + M3 验证≤3 候选×45 SQL；0 validated 时如实阻断）+ 合成夹具全流程（构建→grain/指标确认【开发演示假设】→检查→发布→YAML 导出→改版→差异→回滚），清楚区分 |
+
+### 验证结果（Conda `nl2sql`，2026-10-29）
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | **585 passed, 9 skipped**（M4 新增 32 项离线：服务 28 + API 4；skipped 为默认关闭的真实集成） |
+| `python -m ruff check app tests scripts` / `pip check` | 全部通过（新增依赖 **PyYAML** 已声明 pyproject/environment） |
+| 真实集成（`NL2SQL_MYSQL_INTEGRATION=1`） | **8 passed, 1 skipped**（M1–M3 无回归；M4 构建纯本地无需真实集成） |
+| 真实演示（hotel，临时目录） | 扫描 5/18 表（partial 如实）→ M2 规则语义 5 表 → M3 验证 0 validated + 3 needs_review（20 SQL；如实阻断不强行确认）→ 模型草稿 5 实体 0 主题；合成夹具段：12 实体/9 主题/6 关系/21 候选指标 → 确认 → 检查通过 → 发布 → YAML 48473 字符 → 改版差异 → 回滚闭环 |
+
+### 关键回归覆盖（tests/test_semantic_model_service.py + test_semantic_model_api.py）
+
+正常构建/属性 M2 消费；组合粒度键有序；未知粒度表标记；跨 Schema 同名表不合并；部分快照门槛（默认/显式均拦截）；跨源快照拒绝；空目录；rejected 语义不作正向；仅 validated 关系入模型（候选/待审排除）；组合映射顺序保持；单路径 available/竞争路径歧义待审；多对多路径阻断；预算截断如实标记；grain/指标确认前置条件（单位/时间口径/状态过滤）；非法字段/聚合/操作符/SQL 注入值拒绝；人工选路消歧；并发同基线修订恰一成功；重建不覆盖人工版本；发布需确认 grain/有效依赖；指针并发 409；差异检出变更；JSON/YAML 同语义且无敏感内容；持久化失败指针不变；关系 stale/快照更替可用性降级且阻断发布。
+
+### M5 可使用的稳定契约
+
+- 已发布模型：`GET /api/v1/sources/{sid}/semantic-models/published`（含 availability.usable_as_current 与 formal_metric_ids）；
+- 完整模型 JSON/YAML：`GET /semantic-models/{id}/export`（schema_version、依赖修订、有序映射、粒度、指标口径、路径步骤）；
+- 正式可用性判定：发布指针存在 且 availability.dependency_status=="ok"（M3 有效 + 快照未更替）；指标正式集合＝formal_metric_ids（business_confirmed/published）。
+
+### M4 已知限制（如实保留）
+
+- 主题/实体/指标候选为保守规则生成（一表一实体，不自动合并）；业务口径需人工确认（演示中标注为开发假设）。
+- 路径只沿 M3 source→target 正向；桥接/逆向关联不可达（阻断或待审，需人工选路）。
+- 多 validated 边不等于路径可安全聚合：many_to_many 阻断、歧义/基数未知待审、正式指标需可用路径。
+- 无指标对账（M5 数据集质量检查范畴），不产生 data_validated。
+- 可用性检查基于本地元数据（M3 有效状态+目录指针）；源库实际变化未扫描无法检测。
+- reviewer 为本地开发输入，无身份认证；M2 Embedding 仍未完成（不宣称 M2 全部完成）。
+
+
 
 ## M3 最小修补（2026-10-28，修复轮 3：跨 Schema 重验切换目标关系）
 

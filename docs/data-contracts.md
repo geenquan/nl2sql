@@ -223,7 +223,47 @@
 - 验证 SQL 摘要、验证结果、过期条件
 - `candidate` 不等于 `validated`
 
-## 业务语义模型
+## 业务语义模型（M4 已实现，semantic-model-v1）
+
+- 身份：字段=FieldRef(schema,table,column) 完整结构化引用；组合键/映射为
+  **有序字段列表**；实体 entity_id=schema.table（跨 Schema 同名表不合并；
+  不按同名列合并字段）；一次构建限定一个 source+snapshot（默认发布目录
+  快照；部分快照需显式 allow_partial 且 input_complete=false；显式快照
+  校验归属且部分快照同样受门槛）
+- Entity/Attribute/Dimension：一表一实体候选（保守，不自动合并）；属性
+  消费 M2 effective（rejected 不作正向命名/分类；缺失按 unknown；回退
+  原始名注明来源）；维度带允许用途（filter/group/order）；敏感列打标签
+  不进维度
+- grain：业务描述 + 中心表与粒度键结构化引用 + 依据（primary_key/
+  unique_constraint/unknown）+ 确认状态；样本唯一率不作全表唯一依据；
+  “每行一条记录”不算已确认业务粒度
+- Relationship：引用 M3 已验证关系（relationship_key+revision+两端完整
+  身份+有序映射+基数+证据范围），不存自由文本 JOIN；仅同快照 effective
+  validated 非 stale；候选/拒绝/stale 不进入模型
+- Metric：稳定标识/名称/描述/来源实体 + 受限聚合（count_rows/
+  count_distinct/sum/avg/min/max）+ 结构化字段引用 + 去重键（组合键元组
+  语义）+ 受限过滤操作符与类型化值（不接受任意 SQL/Python/eval；展示
+  表达式为派生）+ 时间字段/时间口径/单位 + 状态四态
+  （suggested→data_validated→business_confirmed→published）；数据验证与
+  业务确认两维证据分立；无对账不产生 data_validated；未确认指标不进入
+  正式集合（formal_metric_ids）；口径修改产生新版本
+- QueryPath：复用 M3 find_paths（source→target 正向，不逆向）；保存有序
+  实体/关系修订/字段映射/基数/风险/输入快照/搜索完整性；many_to_many
+  阻断；同对多路径=歧义待审（不默认取最高分）；基数未知待审；预算截断
+  如实标记（不排除存在其他路径）
+- 版本与发布：模型版本**不可变**（修订/确认产生新版本；并发同基线由
+  (model_id,version) 唯一约束仲裁→409）；发布=指针原子切换+审计（不发布
+  数据集、不执行 SQL）；发布前复查（grain 确认/正式指标口径/引用有效/
+  无未处理阻断/非未许可部分快照/依赖未降级/输入快照仍为当前发布快照）；
+  回滚核对目标当前可用性；失败不产生半个模型、不破坏原指针
+- 依赖降级：M3 关系被拒/stale → needs_revalidation；目录快照更替 →
+  snapshot_changed（旧模型可查看/导出，不冒充当前可用；不自动映射新表
+  ID；未扫描的源库实际变化无法检测）
+- 导出：JSON/YAML 表达同一份模型语义；schema_version+版本+来源+状态；
+  顺序稳定；不含凭证/连接信息/sample_values；正式集合与草稿区分；
+  不实现 YAML 导入或任意文件写入
+
+## 业务语义模型（历史约定，保留参考）
 - 实体、属性、关系、指标、维度和查询路径
 - 每个主题有明确粒度
 - 指标含表达式、去重规则、过滤条件和时间口径

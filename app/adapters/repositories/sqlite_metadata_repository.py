@@ -39,6 +39,7 @@ from app.domain.relationships import select_effective_relationship
 from app.ports.repositories import (
     MetadataRepository,
     RelationshipRepository,
+    SemanticModelRepository,
     SourceRepository,
 )
 
@@ -61,8 +62,11 @@ def _load(raw: str | None, default: Any) -> Any:
     return json.loads(raw)
 
 
-class SQLiteMetadataRepository(MetadataRepository, SourceRepository, RelationshipRepository):
-    """实现 MetadataRepository / SourceRepository / RelationshipRepository 端口。"""
+class SQLiteMetadataRepository(
+    MetadataRepository, SourceRepository, RelationshipRepository,
+    SemanticModelRepository,
+):
+    """实现元数据/数据源/关系/语义模型仓储端口。"""
 
     def __init__(self, database_url: str, engine: Engine | None = None) -> None:
         self._database_url = database_url
@@ -209,6 +213,40 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
             Column("created_at", String(40)),
             Column("updated_at", String(40)),
             Column("payload", String(200000)),
+        )
+        # M4 语义模型表：版本内容不可变；发布指针原子切换 + 审计日志。
+        self._semantic_models = Table(
+            "semantic_models",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("model_id", String(64), nullable=False),
+            Column("version", Integer, nullable=False),
+            Column("source_id", String(36), nullable=False),
+            Column("snapshot_id", String(36)),
+            Column("status", String(16), nullable=False),
+            Column("created_at", String(40)),
+            Column("payload", String(2000000)),
+            UniqueConstraint("model_id", "version", name="uq_sm_version"),
+        )
+        self._semantic_model_pointer = Table(
+            "semantic_model_pointer",
+            self._metadata,
+            Column("source_id", String(36), primary_key=True),
+            Column("model_id", String(64), nullable=False),
+            Column("version", Integer, nullable=False),
+            Column("updated_at", String(40)),
+        )
+        self._semantic_model_log = Table(
+            "semantic_model_log",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("source_id", String(36), nullable=False),
+            Column("model_id", String(64), nullable=False),
+            Column("version", Integer, nullable=False),
+            Column("action", String(16), nullable=False),  # publish / rollback
+            Column("operator", String(64)),
+            Column("reason", String(500)),
+            Column("created_at", String(40)),
         )
         # 开发级建表：不存在则创建；正式迁移方案在 M8 引入。
         self._metadata.create_all(self._engine)
@@ -983,6 +1021,131 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository, Relationshi
                 .order_by(self._relationship_runs.c.created_at.desc())
             ).fetchall()
         return [dict(_load(row.payload, {})) for row in rows]
+
+    # -- M4 语义模型持久化 -----------------------------------------------------
+
+    def save_model(self, model: dict[str, Any]) -> None:
+        """插入新版本（不可变）；(model_id, version) 唯一约束仲裁并发。"""
+        from uuid import uuid4 as _uuid4
+
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(self._semantic_models.insert().values(
+                    id=_uuid4().hex,
+                    model_id=model["model_id"],
+                    version=int(model["version"]),
+                    source_id=model["source_id"],
+                    snapshot_id=model.get("snapshot_id"),
+                    status=model.get("status", "draft"),
+                    created_at=model.get("created_at") or _now(),
+                    payload=_dump(model),
+                ))
+        except IntegrityError:
+            raise RevisionConflictError(
+                f"模型版本冲突：{model['model_id']} v{model['version']} 已存在"
+                "（并发基于同一基线版本的修订只有一个成功）") from None
+
+    def get_model(self, model_id: str,
+                  version: int | None = None) -> dict[str, Any] | None:
+        conditions = [self._semantic_models.c.model_id == model_id]
+        if version is not None:
+            conditions.append(self._semantic_models.c.version == int(version))
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._semantic_models).where(and_(*conditions))
+                .order_by(self._semantic_models.c.version.desc()).limit(1)
+            ).first()
+        return dict(_load(row.payload, {})) if row else None
+
+    def list_models(self, source_id: str) -> list[dict[str, Any]]:
+        rows = self._load_model_rows(
+            self._semantic_models.c.source_id == source_id)
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:  # 已按版本倒序
+            latest.setdefault(row["model_id"], row)
+        return [latest[key] for key in sorted(latest)]
+
+    def list_versions(self, model_id: str) -> list[dict[str, Any]]:
+        return self._load_model_rows(
+            self._semantic_models.c.model_id == model_id)
+
+    def _load_model_rows(self, where_clause: Any) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._semantic_models).where(where_clause)
+                .order_by(self._semantic_models.c.version.desc())
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    def get_published(self, source_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(select(self._semantic_model_pointer).where(
+                self._semantic_model_pointer.c.source_id == source_id)
+            ).first()
+        if row is None:
+            return None
+        model = self.get_model(row.model_id, version=row.version)
+        return {
+            "model_id": row.model_id,
+            "version": row.version,
+            "updated_at": row.updated_at,
+            "model": model,
+        }
+
+    def set_published(
+        self, source_id: str, model_id: str, version: int, *,
+        operator: str, reason: str | None, action: str,
+        expected: tuple[str, int] | None = None,
+    ) -> bool:
+        """单事务：目标版本存在性 + 指针乐观校验 + 审计写入。"""
+        from uuid import uuid4 as _uuid4
+
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        with self._engine.begin() as conn:
+            exists = conn.execute(select(func.count()).select_from(
+                self._semantic_models).where(
+                self._semantic_models.c.model_id == model_id,
+                self._semantic_models.c.version == int(version),
+            )).scalar()
+            if not exists:
+                raise ValueError(f"目标模型版本不存在：{model_id} v{version}")
+            current = conn.execute(select(self._semantic_model_pointer).where(
+                self._semantic_model_pointer.c.source_id == source_id)).first()
+            if (expected is not None
+                    and (current is None
+                         or (current.model_id, current.version) != expected)):
+                return False  # 指针已被并发切换 → 409
+            values = {
+                "source_id": source_id, "model_id": model_id,
+                "version": int(version), "updated_at": _now(),
+            }
+            conn.execute(
+                sqlite_insert(self._semantic_model_pointer)
+                .values(values)
+                .on_conflict_do_update(
+                    index_elements=[self._semantic_model_pointer.c.source_id],
+                    set_={k: v for k, v in values.items() if k != "source_id"},
+                ))
+            conn.execute(self._semantic_model_log.insert().values(
+                id=_uuid4().hex, source_id=source_id, model_id=model_id,
+                version=int(version), action=action, operator=operator,
+                reason=(reason or "")[:500], created_at=_now(),
+            ))
+        return True
+
+    def list_publication_log(self, source_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._semantic_model_log).where(
+                    self._semantic_model_log.c.source_id == source_id
+                ).order_by(self._semantic_model_log.c.created_at.desc())
+            ).fetchall()
+        return [{
+            "model_id": row.model_id, "version": row.version,
+            "action": row.action, "operator": row.operator,
+            "reason": row.reason, "created_at": row.created_at,
+        } for row in rows]
 
 
 def _new_id() -> str:

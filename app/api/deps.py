@@ -21,6 +21,7 @@ from app.profiling.profiler import DataProfiler
 from app.security.credentials import CredentialStore, FileCredentialStore
 from app.services.relationship_service import RelationshipService
 from app.services.scan_service import ScanService
+from app.services.semantic_model_service import SemanticModelService
 from app.services.semantics_service import SemanticsService
 from app.services.source_service import SourceService
 
@@ -146,6 +147,13 @@ def _probe_factory() -> ProbeFactory:
             config, statement_counter=params.get("statement_counter"))
 
     return factory
+
+
+def get_semantic_model_service() -> SemanticModelService:
+    return SemanticModelService(
+        metadata_repository=_metadata_repository(),
+        settings=_settings(),
+    )
 
 
 def get_relationship_service() -> RelationshipService:

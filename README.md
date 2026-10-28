@@ -144,6 +144,41 @@ curl -s "http://127.0.0.1:8000/api/v1/sources/<sid>/relationships/paths?from_tab
 validated；真实只读演示脚本 `python scripts/m3_real_validation.py`（临时目录、预算先行、
 不打印业务值）。评测与真实验证结果见 [开发交接报告](docs/development-status.md)。
 
+## M4：业务实体与语义层（可用）
+
+```bash
+# 1) 构建模型草稿（纯本地确定性规则；默认发布快照，部分快照需 allow_partial）
+curl -s -X POST http://127.0.0.1:8000/api/v1/sources/<sid>/semantic-models/build \
+  -H 'Content-Type: application/json' -d '{}'
+# 返回 model_id 与 version；实体/主题/关系（M3 validated）/候选指标（全部 suggested）
+
+# 2) 人工修订：确认 grain 与指标口径（引用经服务端核验；并发基线冲突 409）
+curl -s -X POST http://127.0.0.1:8000/api/v1/semantic-models/<mid>/revise \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 1, "reviewer": "dev",
+    "topic_grains": {"topic.app.booking": {"statement": "一行代表一次预订", "confirm": true}}}'
+
+# 3) 检查 / 发布 / 当前发布版本 / 审计
+curl -s -X POST "http://127.0.0.1:8000/api/v1/semantic-models/<mid>/validate?version=2"
+curl -s -X POST "http://127.0.0.1:8000/api/v1/semantic-models/<mid>/publish?version=2" \
+  -H 'Content-Type: application/json' -d '{"reviewer":"dev","note":"首次发布"}'
+curl -s http://127.0.0.1:8000/api/v1/sources/<sid>/semantic-models/published
+curl -s http://127.0.0.1:8000/api/v1/sources/<sid>/semantic-models/publication-log
+
+# 4) 差异 / 回滚 / 导出（JSON/YAML 同语义）
+curl -s "http://127.0.0.1:8000/api/v1/semantic-models/<mid>/diff?version_a=2&version_b=3"
+curl -s -X POST http://127.0.0.1:8000/api/v1/semantic-models/<mid>/rollback \
+  -H 'Content-Type: application/json' -d '{"target_version":2,"reviewer":"dev","reason":"回滚"}'
+curl -s "http://127.0.0.1:8000/api/v1/semantic-models/<mid>/export?version=2&format=yaml"
+```
+
+约束：模型版本不可变（修订产生新版本）；发布＝切换下游使用指针（不发布
+数据集、不执行 SQL）；仅 M3 validated 非 stale 关系进入模型；路径仅正向且
+多对多阻断、歧义待审；未确认 grain/指标不得发布；依赖降级
+（needs_revalidation/snapshot_changed）时旧模型可查看导出但不冒充当前可用。
+真实演示脚本 `python scripts/m4_real_demo.py`（临时目录、小预算、人工输入
+标注开发演示假设）。
+
 ## 目录
 
 ```text
@@ -195,7 +230,7 @@ tests/
 - [x] M1：数据源连接、元数据扫描、画像与持久化（真实库全链路验证，见交接报告）
 - [~] M2：字段语义理解（规则+DeepSeek 已真实验证；Embedding 检索未接入，见交接报告）
 - [x] M3：跨表关系发现与验证（候选召回/有界只读验证/审核/过期重验/关系图与路径；真实只读演示通过，见交接报告）
-- [ ] M4：业务语义层
+- [x] M4：业务实体与语义层（主题/实体/指标/路径、版本与发布/回滚、JSON/YAML 导出；真实+合成演示通过，见交接报告）
 - [ ] M5：视图/宽表生成和质量校验
 - [ ] M6：NL2SQL、安全执行和结果验证
 - [ ] M7：查询型智能体

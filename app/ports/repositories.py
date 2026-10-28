@@ -200,3 +200,47 @@ class RelationshipRepository(ABC):
         self, source_id: str, run_type: str | None = None
     ) -> list[dict[str, Any]]:
         """按创建时间倒序。"""
+
+
+class SemanticModelRepository(ABC):
+    """M4 语义模型持久化端口。
+
+    版本语义：模型版本内容**不可变**——修改/确认/回滚产生新版本或原子切换
+    发布指针，全部保留审计；唯一约束 (model_id, version) 是并发写入的最终
+    仲裁者（同基线版本的并发修订恰一成功，另一 409）。
+    "发布语义模型"仅切换下游使用的版本指针，不代表发布数据集或执行 SQL。
+    """
+
+    @abstractmethod
+    def save_model(self, model: dict[str, Any]) -> None:
+        """插入新模型版本（不可变）；(model_id, version) 冲突抛 RevisionConflictError。"""
+
+    @abstractmethod
+    def get_model(self, model_id: str, version: int | None = None) -> dict[str, Any] | None:
+        """取模型；version 为空取最新版本。"""
+
+    @abstractmethod
+    def list_models(self, source_id: str) -> list[dict[str, Any]]:
+        """列出数据源下每个模型线的最新版本。"""
+
+    @abstractmethod
+    def list_versions(self, model_id: str) -> list[dict[str, Any]]:
+        """按版本倒序列出全部版本（历史可追溯）。"""
+
+    @abstractmethod
+    def get_published(self, source_id: str) -> dict[str, Any] | None:
+        """当前发布指针 {model_id, version, ...}；无发布返回 None。"""
+
+    @abstractmethod
+    def set_published(
+        self, source_id: str, model_id: str, version: int, *,
+        operator: str, reason: str | None,
+        action: str,  # publish / rollback
+        expected: tuple[str, int] | None = None,
+    ) -> bool:
+        """事务内原子切换发布指针并写审计；expected 为当前指针的乐观校验
+        （不符返回 False→409）；目标版本必须存在。"""
+
+    @abstractmethod
+    def list_publication_log(self, source_id: str) -> list[dict[str, Any]]:
+        """发布/回滚审计记录（按时间倒序）。"""

@@ -245,6 +245,31 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 - M3 真实 MySQL 集成测试默认跳过：
   `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q`。
 
+## M4 语义模型（已实现）
+
+| 配置项 | 默认值 / 用途 |
+| --- | --- |
+| `SEMANTIC_MODEL_MAX_HOPS` | `2`，主题路径搜索最大跳数（仅 validated 正向边） |
+| `SEMANTIC_MODEL_MAX_PATHS_PER_PAIR` | `3`，同对实体候选路径数（超过标记歧义/截断待审） |
+| `SEMANTIC_MODEL_MAX_TOPICS` | `50`，单次构建最多主题数 |
+| `SEMANTIC_MODEL_BUILD_DEADLINE_SECONDS` | `60`，构建期限（确定性规则，纯本地） |
+
+说明：
+
+- 构建/修订/检查/导出均为**纯本地确定性操作**（不调用模型、不连源库）；
+  发布语义模型＝切换下游使用的版本指针（不发布数据集、不执行 SQL）。
+- 模型版本不可变：修订产生新版本，(model_id,version) 唯一约束仲裁并发
+  （同基线并发修订恰一成功，另一 409）；发布/回滚只原子切换指针并写审计。
+- 依赖降级：M3 关系被拒/stale → needs_revalidation；目录快照更替 →
+  snapshot_changed（可查看导出但不冒充当前可用）。
+- 持久化：`semantic_models`/`semantic_model_pointer`/`semantic_model_log`
+  三表随仓储 create_all 追加建表（兼容既有数据库）。
+- 导出 YAML 需要 **PyYAML**（本轮新增运行时依赖，已声明
+  pyproject/environment.yml）。
+- 真实只读演示：`python scripts/m4_real_demo.py`（临时元数据/凭证目录；
+  扫描≤5 表×50 行、M3 验证≤3 候选×45 条 SQL 逐语句硬预算；不调用模型；
+  人工输入标注为开发演示假设；真实不可覆盖的流程用合成夹具清楚区分）。
+
 ## 登录与 JWT
 
 `LOGIN_ENABLED` 和 `JWT_SECRET` 已映射到同名小写配置属性，JWT 密钥使用 `SecretStr`。

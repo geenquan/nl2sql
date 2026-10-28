@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     relationship_path_max_nodes: int = Field(default=200, ge=1)
     relationship_path_deadline_seconds: int = Field(default=10, gt=0)
 
+    # M4 语义模型：确定性规则构建 + 人工确认；不调用模型、不新增基础设施。
+    semantic_model_max_hops: int = Field(default=2, ge=1, le=4)
+    semantic_model_max_paths_per_pair: int = Field(default=3, ge=1, le=10)
+    semantic_model_max_topics: int = Field(default=50, gt=0)
+    semantic_model_build_deadline_seconds: int = Field(default=60, gt=0)
+
     # 系统业务库：与只读查询数据源独立，持久化接入仍待实现。
     biz_mysql_host: str = "127.0.0.1"
     biz_mysql_port: int = Field(default=3306, gt=0, le=65535)

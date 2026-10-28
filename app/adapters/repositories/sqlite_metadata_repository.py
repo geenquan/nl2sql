@@ -27,6 +27,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     delete,
+    func,
     select,
 )
 from sqlalchemy.engine import Engine
@@ -129,6 +130,49 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
             Column("column_name", String(128), nullable=False),
             Column("payload", String(50000)),
             Column("computed_at", String(40)),
+        )
+        # M2 语义表：追加式建表，不影响既有数据。
+        self._field_semantics = Table(
+            "field_semantics",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("source_id", String(36), nullable=False),
+            Column("snapshot_id", String(36), nullable=False),
+            Column("table_id", String(36), nullable=False),
+            Column("column_name", String(128), nullable=False),
+            Column("revision", Integer, nullable=False),
+            Column("review_status", String(24), nullable=False),
+            Column("inference_source", String(12), nullable=False),
+            Column("run_id", String(36)),
+            Column("created_at", String(40)),
+            Column("payload", String(100000)),
+            UniqueConstraint("table_id", "column_name", "revision", name="uq_fs_revision"),
+        )
+        self._table_purposes = Table(
+            "table_purposes",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("source_id", String(36), nullable=False),
+            Column("snapshot_id", String(36), nullable=False),
+            Column("table_id", String(36), nullable=False),
+            Column("revision", Integer, nullable=False),
+            Column("review_status", String(24), nullable=False),
+            Column("inference_source", String(12), nullable=False),
+            Column("run_id", String(36)),
+            Column("created_at", String(40)),
+            Column("payload", String(50000)),
+            UniqueConstraint("table_id", "revision", name="uq_tp_revision"),
+        )
+        self._semantic_runs = Table(
+            "semantic_runs",
+            self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("source_id", String(36), nullable=False),
+            Column("snapshot_id", String(36)),
+            Column("status", String(16)),
+            Column("created_at", String(40)),
+            Column("updated_at", String(40)),
+            Column("payload", String(100000)),
         )
         # 开发级建表：不存在则创建；正式迁移方案在 M8 引入。
         self._metadata.create_all(self._engine)
@@ -443,6 +487,181 @@ class SQLiteMetadataRepository(MetadataRepository, SourceRepository):
                 .order_by(self._column_profiles.c.seq)
             ).fetchall()
         return [dict(_load(row.payload, {}), table_id=row.table_metadata_id) for row in rows]
+
+
+
+    # -- M2 语义持久化 -------------------------------------------------------
+
+    def save_field_semantics(self, record: dict[str, Any]) -> int:
+        table_id = record["table_id"]
+        column_name = record["column_name"]
+        with self._engine.begin() as conn:
+            current = conn.execute(
+                select(func.max(self._field_semantics.c.revision)).where(
+                    self._field_semantics.c.table_id == table_id,
+                    self._field_semantics.c.column_name == column_name,
+                )
+            ).scalar()
+            revision = (current or 0) + 1
+            record = {**record, "revision": revision}
+            conn.execute(
+                self._field_semantics.insert().values(
+                    id=_new_id(),
+                    source_id=record["source_id"],
+                    snapshot_id=record["snapshot_id"],
+                    table_id=table_id,
+                    column_name=column_name,
+                    revision=revision,
+                    review_status=record.get("review_status", "suggested"),
+                    inference_source=record.get("inference_source", "rules"),
+                    run_id=record.get("run_id"),
+                    created_at=record.get("created_at") or _now(),
+                    payload=_dump(record),
+                )
+            )
+        return revision
+
+    def _load_semantic_rows(self, where_clause: Any, order_desc: bool = True) -> list[dict[str, Any]]:
+        order = (
+            self._field_semantics.c.revision.desc() if order_desc
+            else self._field_semantics.c.revision
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._field_semantics).where(where_clause).order_by(
+                    self._field_semantics.c.column_name, order
+                )
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    @staticmethod
+    def _effective_revision(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """每列取一条：最新 business_confirmed 优先，否则最新修订。"""
+        by_column: dict[str, dict[str, Any]] = {}
+        confirmed: dict[str, dict[str, Any]] = {}
+        for row in rows:  # rows 已按 revision 倒序
+            column = row["column_name"]
+            if column not in by_column:
+                by_column[column] = row
+            if row.get("review_status") == "business_confirmed" and column not in confirmed:
+                confirmed[column] = row
+        return [confirmed.get(column, by_column[column]) for column in by_column]
+
+    def list_field_semantics(self, table_id: str, effective: bool = False) -> list[dict[str, Any]]:
+        rows = self._load_semantic_rows(self._field_semantics.c.table_id == table_id)
+        if effective:
+            return self._effective_revision(rows)
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest.setdefault(row["column_name"], row)
+        return [latest[column] for column in sorted(latest)]
+
+    def get_field_semantics_history(self, table_id: str, column_name: str) -> list[dict[str, Any]]:
+        return self._load_semantic_rows(
+            (self._field_semantics.c.table_id == table_id)
+            & (self._field_semantics.c.column_name == column_name)
+        )
+
+    def list_field_semantics_by_source(
+        self, source_id: str, snapshot_id: str, effective: bool = True
+    ) -> list[dict[str, Any]]:
+        rows = self._load_semantic_rows(
+            (self._field_semantics.c.source_id == source_id)
+            & (self._field_semantics.c.snapshot_id == snapshot_id)
+        )
+        if effective:
+            return self._effective_revision(rows)
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest.setdefault((row["table_id"], row["column_name"]), row)
+        return list(latest.values())
+
+    def save_table_purpose(self, record: dict[str, Any]) -> int:
+        table_id = record["table_id"]
+        with self._engine.begin() as conn:
+            current = conn.execute(
+                select(func.max(self._table_purposes.c.revision)).where(
+                    self._table_purposes.c.table_id == table_id
+                )
+            ).scalar()
+            revision = (current or 0) + 1
+            record = {**record, "revision": revision}
+            conn.execute(
+                self._table_purposes.insert().values(
+                    id=_new_id(),
+                    source_id=record["source_id"],
+                    snapshot_id=record["snapshot_id"],
+                    table_id=table_id,
+                    revision=revision,
+                    review_status=record.get("review_status", "suggested"),
+                    inference_source=record.get("inference_source", "rules"),
+                    run_id=record.get("run_id"),
+                    created_at=record.get("created_at") or _now(),
+                    payload=_dump(record),
+                )
+            )
+        return revision
+
+    def _load_purpose_rows(self, where_clause: Any) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._table_purposes).where(where_clause).order_by(
+                    self._table_purposes.c.revision.desc()
+                )
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    def get_table_purpose(self, table_id: str, effective: bool = False) -> dict[str, Any] | None:
+        rows = self._load_purpose_rows(self._table_purposes.c.table_id == table_id)
+        if not rows:
+            return None
+        if effective:
+            confirmed = next(
+                (r for r in rows if r.get("review_status") == "business_confirmed"), None
+            )
+            return confirmed or rows[0]
+        return rows[0]
+
+    def get_table_purpose_history(self, table_id: str) -> list[dict[str, Any]]:
+        return self._load_purpose_rows(self._table_purposes.c.table_id == table_id)
+
+    def save_semantic_run(self, run: dict[str, Any]) -> None:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        record = {
+            "id": run["run_id"],
+            "source_id": run.get("source_id"),
+            "snapshot_id": run.get("snapshot_id"),
+            "status": run.get("status"),
+            "created_at": run.get("created_at") or _now(),
+            "updated_at": _now(),
+            "payload": _dump(run),
+        }
+        with self._engine.begin() as conn:
+            conn.execute(
+                sqlite_insert(self._semantic_runs)
+                .values(record)
+                .on_conflict_do_update(
+                    index_elements=[self._semantic_runs.c.id],
+                    set_={k: v for k, v in record.items() if k != "id"},
+                )
+            )
+
+    def get_semantic_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._semantic_runs).where(self._semantic_runs.c.id == run_id)
+            ).first()
+        return dict(_load(row.payload, {})) if row else None
+
+    def list_semantic_runs(self, source_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._semantic_runs)
+                .where(self._semantic_runs.c.source_id == source_id)
+                .order_by(self._semantic_runs.c.created_at.desc())
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
 
 
 def _new_id() -> str:

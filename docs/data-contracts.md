@@ -63,6 +63,40 @@
 - 模型/提示词版本、审核状态
 - 必须允许 `unknown`
 
+## 字段语义（M2 新增）
+
+- 标识：`source_id / snapshot_id / table_id / column_name`（不跨快照混用）、`run_id`、`revision`
+- 内容：`original_name / original_comment`、`suggested_business_name`、`category`
+  （注册表枚举，见 `app/domain/semantics.py`）、`candidate_entities`、`alternatives`
+  （多候选解释）、`confidence`（low/medium/high，**候选判断强度，不是校准概率**）
+- 证据：`evidence[] = {type, ref, detail}`，type ∈ column_type/comment/primary_key/
+  foreign_key/index/profile_metric/name_pattern/glossary_term；服务端核验引用真实存在
+  （支持标准与 `columns.<列>.<字段>` 路径形态并规范化）；仅不可核验证据不足以支撑
+  非 unknown 结论；模型解释不构成新增事实
+- 来源与版本：`inference_source`（rules/model/human）、`model_name`（服务端返回，缺省
+  unavailable 不编造）、`prompt_version`、`rules_version`、`created_at`
+- 审核：`review_status` ∈ suggested/business_confirmed/rejected；允许转换
+  suggested→confirmed/rejected、confirmed/rejected→suggested(revert)；
+  人工修订需携带 `expected_revision`（过期→409 冲突，不静默覆盖）；
+  **新一轮模型建议不覆盖已确认的人工结论**（两者都保留，effective 取人工确认优先）；
+  人工确认 ≠ M3 关系验证 ≠ M4 生产发布；reviewer 仅为本地开发输入，无身份认证
+- 运行记录：`mode`（rules_only/model_assisted）、`input_complete`（部分快照显式标记）、
+  `status`、llm 用量（`model_reported/llm_calls/llm_prompt_tokens/llm_completion_tokens/
+  elapsed_ms`，服务端未提供则为 None）、`send_samples`、安全错误明细
+
+## 表用途分类（M2 新增）
+
+- 枚举：master_data / transaction_event / detail / dictionary / log_history / relation / unknown
+- 字段结构与修订/审核语义同字段语义；`alternatives` 保留竞争候选
+
+## 语义检索（M2，本地词法基线）
+
+- 入参：`source_id`、概念词 `q`、可选 `snapshot_id`/`limit`；默认限定 source + 发布快照
+- 返回：`method=lexical`（明确标记检索方式，不称向量相似度）、`snapshot_id`、候选字段
+  （含 `business_name/category/review_status/score/match_basis`）
+- 计分：人工确认业务名(3.0) > 建议名(2.0) > 原名(2.0) > 注释/候选实体(1.5) >
+  类别(1.0) > 表名(0.5)；Embedding 向量检索为未完成项，`EmbeddingClient` 端口保留
+
 ## 关系候选
 - 源表/字段、目标表/字段、候选基数
 - 分项证据、评分方法/版本、状态

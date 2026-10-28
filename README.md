@@ -80,6 +80,32 @@ curl -s http://127.0.0.1:8000/api/v1/scans/<job_id>
 关键词整列遮蔽 + 值格式检测（邮箱/手机号/身份证），长文本与 JSON 保守遮蔽；历史画像需用
 `scripts/clear_profile_samples.py` 本地清理（保留统计，只清样本并标记需重扫）。
 
+## M2：字段语义理解（主体可用，Embedding 检索未接入）
+
+```bash
+# 1) 对某张已扫描的表触发语义分析（默认规则模式；DEEPSEEK_ENABLED=true 时为模型辅助）
+curl -s -X POST http://127.0.0.1:8000/api/v1/sources/<sid>/semantics/analyze \
+  -H 'Content-Type: application/json' -d '{"table_id":"<table_id>","column_limit":8}'
+# 返回 run_id；部分快照需显式 {"allow_partial": true}
+
+# 2) 查看运行状态 / 表语义 / 字段修订历史
+curl -s http://127.0.0.1:8000/api/v1/semantics/runs/<run_id>
+curl -s http://127.0.0.1:8000/api/v1/tables/<table_id>/semantics
+curl -s http://127.0.0.1:8000/api/v1/tables/<table_id>/semantics/<column>/history
+
+# 3) 人工审核（expected_revision 并发控制，冲突返回 409）
+curl -s -X POST http://127.0.0.1:8000/api/v1/tables/<table_id>/semantics/<column>/review \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"confirm","business_name":"订单总金额","reviewer":"dev","expected_revision":1}'
+
+# 4) 按业务概念搜索字段（本地词法基线，method=lexical）
+curl -s "http://127.0.0.1:8000/api/v1/sources/<sid>/semantics/search?q=组织机构编码"
+```
+
+约束：模型输入默认不含样本与连接信息（双层样本开关默认关）；证据引用经服务端核验；
+人工确认不被新一轮模型建议覆盖；模型故障与语义 unknown 分开表达。评测指标与真实模型
+验证结果见 [开发交接报告](docs/development-status.md)。
+
 ## 目录
 
 ```text
@@ -129,7 +155,8 @@ tests/
 
 - [x] M0：工程结构、文档、配置、健康检查、里程碑 API、核心契约
 - [x] M1：数据源连接、元数据扫描、画像与持久化（真实库全链路验证，见交接报告）
-- [ ] M2：字段语义理解
+- [~] M2：字段语义理解（规则+DeepSeek 已真实验证；Embedding 检索未接入，见交接报告）
+- [ ] M3：跨表关系发现
 - [ ] M3：关系发现与验证
 - [ ] M4：业务语义层
 - [ ] M5：视图/宽表生成和质量校验

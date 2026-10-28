@@ -144,19 +144,39 @@ M6 也尚未实现 ES 查询适配器，不能将生成的 MySQL SQL 直接当�
 | 配置项 | 默认值 / 用途 |
 | --- | --- |
 | `LLM_PROVIDER` | `deepseek` |
-| `DEEPSEEK_ENABLED` | 默认 `false`，后续客户端是否启用，当前仅加载 |
+| `DEEPSEEK_ENABLED` | 默认 `false`；false 时语义分析明确执行规则模式（rules_only），不伪装模型推断 |
 | `DEEPSEEK_MODEL` | 映射到 `llm_model`，以现有配置及账号可用模型为准 |
 | `DEEPSEEK_BASE_URL` | 映射到 `llm_api_base`，默认 `https://api.deepseek.com` |
 | `DEEPSEEK_API_KEY` | 映射到 `llm_api_key`，凭证不得回显 |
-| `LLM_TIMEOUT_SECONDS` | `60` |
-| `LLM_MAX_RETRIES` | `2`，后续客户端的最大重试次数 |
-| `LLM_MAX_TOKENS` | `4096`，后续客户端的输出 token 上限 |
+| `LLM_TIMEOUT_SECONDS` | `60`，单次请求超时（连接 5s） |
+| `LLM_MAX_RETRIES` | `2`，仅 429/5xx/网络/超时重试；认证错误立即失败 |
+| `LLM_MAX_TOKENS` | `4096`，输出 token 上限；超限或被截断的结果弃用 |
 
-地址与模型名参考 [DeepSeek 官方 API 文档](https://api-docs.deepseek.com/)，可按服务端更新调整。
-当前优先读取 `DEEPSEEK_MODEL / DEEPSEEK_BASE_URL / DEEPSEEK_API_KEY`，
-兼容旧名 `LLM_MODEL / LLM_API_BASE / LLM_API_KEY`。未来客户端应遵守 `DEEPSEEK_ENABLED`。
-M2 将通过 `LLMClient` 接入模型并执行超时、重试、结构化输出校验和成本控制；当前没有发起模型请求。
-Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量化。
+M2 已通过 `LLMClient` 实现 DeepSeek 客户端（httpx，OpenAI 兼容 chat/completions，
+无供应商 SDK 依赖）。结构化输出校验与领域契约见 [data-contracts.md](data-contracts.md)。
+Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量化；当前语义检索为
+本地词法基线（结果标记 `method=lexical`）。
+
+## M2 语义分析预算（已实现）
+
+| 配置项 | 默认值 / 用途 |
+| --- | --- |
+| `SEMANTICS_MAX_COLUMNS_PER_RUN` | `40`，单次分析最多处理的列数（超出记 budget_truncated） |
+| `SEMANTICS_LLM_MAX_CALLS` | `2`，单次分析的最大模型调用数（首次 + 一次修复重试） |
+| `SEMANTICS_INPUT_CHAR_LIMIT` | `24000`，模型输入字符上限（超出则本次仅用规则结果） |
+| `SEMANTICS_SEND_SAMPLES` | `false`，样本外发总开关；需与请求 `send_samples=true` 同时开启 |
+| `SEMANTICS_SEARCH_DEFAULT_LIMIT` | `20`，语义检索默认返回条数上限（≤100） |
+
+说明：
+
+- 模型输入默认仅含净化后的结构元数据与画像统计（含 metric_basis/sample_row_count 口径），
+  不含 sample_values、源库地址/账号/密码/credential_ref；注释先经 PII 遮蔽、密钥遮蔽与
+  提示注入模式中和。
+- 样本外发双层开关开启后，仍跳过敏感列、已脱敏与全遮蔽样本（≤3 条 × 32 字符）。
+- 模型调用失败（超时/认证/限流等）与语义 unknown（证据不足）分开表达；失败回退规则结果
+  并记录 `model_request_failed:<reason>`，不返回伪造的模型语义。
+- 真实模型集成测试默认跳过：`NL2SQL_MYSQL_INTEGRATION=1 NL2SQL_SEMANTICS_INTEGRATION=1
+  python -m pytest tests/integration -q`（小预算：≤3 表扫描、≤8 列分析）。
 
 ## 登录与 JWT
 

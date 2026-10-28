@@ -1,14 +1,79 @@
 # 开发交接报告
 
-更新时间：2026-10-27（M1 完成轮 + 缺陷修复轮 + 收尾修复轮）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-28（M1 完成 + 三轮修复；M2 字段语义理解完成主体，Embedding 检索项未完成）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
 
 ## 当前环境
 
 - 使用现有 Conda 环境 `nl2sql`，实际 Python **3.13.18**，保留当前环境，不降级到 3.12。
 - 本机解释器：`/Users/apple/miniconda3/envs/nl2sql/bin/python`；其他机器激活自己的同名环境。
-- 依赖：**PyMySQL 1.2.3**（MySQL 驱动，`pyproject.toml` 已声明）；其余与 M0 基线一致
-  （fastapi 0.162.0 / sqlalchemy 2.1.6 / pytest 8.4.2 / ruff 0.17.3 等）。
-- 本轮无新增第三方依赖（凭证锁用标准库 `fcntl`，POSIX 范围见下）。
+- 依赖：**PyMySQL 1.2.3**（MySQL 驱动）；**httpx 0.28.1 转为运行时依赖**（DeepSeek 客户端
+  使用，未引入供应商 SDK）。其余与 M0 基线一致（fastapi 0.162.0 / sqlalchemy 2.1.6 等）。
+
+## M2 字段语义理解（2026-10-28 完成主体）
+
+### 已实现能力
+
+| 能力 | 实现 |
+| --- | --- |
+| 结构化语义契约 | `app/domain/semantics.py`：类别/表用途/置信/证据类型注册表（集中可扩展，无行业硬编码）、审核状态机（suggested → business_confirmed/rejected，revert 回 suggested）、FieldSemantics/TablePurpose/SemanticRun |
+| 拆词与术语 | `app/semantics/tokenizer.py`（中英文/下划线/驼峰/缩写/中文贪心组词/虚词分隔）、`glossary.json`（小型通用术语表，中英双语）+ `glossary.py`（最长子词匹配） |
+| 规则初筛 | `app/semantics/rules.py`：约束>术语>类型>命名优先级；信号冲突保留多候选并降置信、类型信号物化为备选；画像引用带口径 caveat（样本唯一≠全表唯一）；无信号必须 unknown；不推断状态码含义 |
+| DeepSeek 客户端 | `app/llm/deepseek_client.py`（httpx）：仅 429/5xx/网络/超时重试；401/403 立即失败；finish_reason=length 或超字符预算判截断弃用；响应字节上限；usage/model 如实记录（缺省 None=unavailable）；固定安全错误消息 |
+| 输入/输出安全 | `app/semantics/prompt.py`：输入白名单（无 sample_values/连接信息/凭证）；注释净化（去控制字符、PII 遮蔽、sk-密钥遮蔽、提示注入模式中和、限长）；输出严格校验（字段覆盖、枚举、长度、证据引用核验）；证据支持标准/路径两种形态并规范化；仅不可核验证据不足以支撑非 unknown |
+| 服务与 API | `services/semantics_service.py` + `routes/semantics.py`：分析（默认发布快照，部分目录需 allow_partial 并标记 input_complete=false，显式 snapshot_id 仅诊断）、运行记录、语义/用途查询、人工修订（expected_revision 并发控制→409）、历史、词法检索 |
+| 持久化 | SQLite 追加三表（field_semantics/table_purposes/semantic_runs，`create_all` 兼容追加）；修订式历史（不覆盖审计）；effective 解析使人工确认不被模型覆盖 |
+| 语义检索 | 本地词法基线（确认业务名 3.0 > 建议 2.0 > 原名 2.0 > 注释/实体 1.5 > 类别 1.0 > 表名 0.5），结果标记 `method=lexical`，默认限定 source+发布快照 |
+
+### 输入安全与模型预算（实际策略）
+
+- 模型输入默认仅含：表名/注释（净化后）、列名/类型/注释（净化后）、约束（表/列名）、画像统计（含 metric_basis/sample_row_count 口径）。**不含 sample_values、源库地址/账号/密码/credential_ref**。
+- 样本外发开关双层：`SEMANTICS_SEND_SAMPLES`（配置，默认 false）且请求 `send_samples=true`；开启后仍跳过敏感列、已脱敏与全遮蔽样本，仅 3 条 × 32 字符。
+- 预算：单次分析列数（`SEMANTICS_MAX_COLUMNS_PER_RUN=40`，演示/验证用 8）、LLM 调用上限（`SEMANTICS_LLM_MAX_CALLS=2`：首次+一次修复）、输入字符上限（24000）、输出 max_tokens 沿用 `LLM_MAX_TOKENS`、响应字节上限 2MB。
+- 错误处理沿用固定安全文案：模型故障（model_request_failed:reason）与证据不足（unknown）分开；不落提示词/响应/异常文本。
+
+### 评测结果（离线，开发测试标签）
+
+标签来源：开发者编写的回归用例（18 字段类别 + 6 表用途 + 2 unknown + 2 冲突 + 1 unknown 表），
+**不是人工金标准**；数值仅作回归监控。
+
+| 指标 | 结果 | 分母 |
+| --- | --- | --- |
+| 字段类别准确率（规则模式） | **0.889**（16/18） | 18 |
+| 表用途准确率（规则模式） | **1.000**（6/6） | 6 |
+| unknown 召回（应 unknown 的用例） | **1.000**（2/2） | 2 |
+| 冲突用例降置信+保留备选 | **2/2 通过** | 2 |
+| 证据引用有效率（规则模式） | **1.000**（核验通过） | 全部证据 |
+| 结构化输出合格率（规则模式） | **1.000**（确定性路径） | 18 |
+| 模型路径结构合格率（离线假模型矩阵） | 合法/虚构/遗漏/重复/无效证据用例全部按预期通过或拒绝 | 12+ 用例 |
+| 候选实体准确率 / 人工修订率 / 成本 | **unavailable**（无可靠标签与价格配置，不虚构） | — |
+
+### 实际验证结果（Conda `nl2sql`，2026-10-28）
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | **285 passed, 6 skipped**（skipped 为真实 MySQL/DeepSeek 集成，默认关闭；无残留文件） |
+| `python -m ruff check app tests scripts` | **All checks passed** |
+| `python -m pip check` | **No broken requirements found** |
+| `NL2SQL_MYSQL_INTEGRATION=1 python -m pytest tests/integration -q`（M1 只读复验） | **5 passed** |
+| `NL2SQL_MYSQL_INTEGRATION=1 NL2SQL_SEMANTICS_INTEGRATION=1 pytest tests/integration -q`（含真实模型） | **6 passed**：真实模型链路通过；曾出现一次“首次校验失败→修复重试→通过”（验证有限修复机制），另一次直接通过 |
+| 真实模型演示（临时库） | hotel 库只读扫描（5 表预算）→ `code_consumption_history`（9 列）8 列预算分析：mode=model_assisted、**deepseek-flash**、1 次调用、1139/633 tokens、2549ms；表用途 log_history；字段类别含 entity_identifier/foreign_identifier_candidate/timestamp/status（证据已核验）；人工确认→修订 2；历史 [(2,human,confirmed),(1,model,suggested)]；词法检索命中并展示 match_basis |
+
+### 未完成项（明确保留）
+
+- **Embedding 语义检索未接入**：当前无 Embedding 配置（DeepSeek 对话接口 ≠ 向量接口），
+  已交付本地词法基线（结果明确标记 `method=lexical`，不称向量相似度），`EmbeddingClient`
+  端口保留；阶段手册“使用 Embedding 检索相似字段”一项未完成 → **M2 整体标记 partial**。
+- 候选实体准确率、人工修订率、成本指标 unavailable（无标签/无价格配置）。
+- 术语表为内置通用版，未做管理界面；人工操作者标识为本地开发输入，无身份认证。
+
+### M3 可使用的输入
+
+- 表/字段语义（含类别、候选实体、证据、置信、审核状态）可按 source+snapshot 稳定读取：
+  `GET /tables/{id}/semantics`、`/sources/{id}/semantics/search`；
+- `foreign_identifier_candidate` 字段清单可直接作为 M3 关系候选召回输入（注意：语义相似
+  ≠ 可 JOIN，M3 必须自行验证）；画像统计（含口径）提供值域覆盖/唯一性证据基础。
+
+## M1 缺陷修复轮（2026-10-27，第三轮：3 项遗漏）
 
 ## M1 缺陷修复轮（2026-10-27）
 

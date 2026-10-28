@@ -116,3 +116,31 @@ def test_sensitive_column_keywords_default_empty_and_env_override(tmp_path, monk
     monkeypatch.setenv("SENSITIVE_COLUMN_KEYWORDS", '["campus", "payroll"]')
     settings = Settings(_env_file=None)
     assert settings.sensitive_column_keywords == ["campus", "payroll"]
+
+
+def test_m2_semantics_budgets_default_and_env(tmp_path, monkeypatch) -> None:
+    settings = Settings(_env_file=None)
+    assert settings.semantics_max_columns_per_run > 0
+    assert settings.semantics_llm_max_calls >= 1
+    assert settings.semantics_input_char_limit > 0
+    assert settings.semantics_send_samples is False  # 样本外发默认关闭
+    assert settings.semantics_search_default_limit > 0
+    monkeypatch.setenv("SEMANTICS_SEND_SAMPLES", "true")
+    monkeypatch.setenv("SEMANTICS_MAX_COLUMNS_PER_RUN", "12")
+    overridden = Settings(_env_file=None)
+    assert overridden.semantics_send_samples is True
+    assert overridden.semantics_max_columns_per_run == 12
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"semantics_max_columns_per_run": 0},
+        {"semantics_llm_max_calls": 0},
+        {"semantics_input_char_limit": 0},
+        {"semantics_search_default_limit": 0},
+    ],
+)
+def test_invalid_m2_budgets_are_rejected(overrides: dict) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **overrides)

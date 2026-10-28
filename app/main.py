@@ -7,8 +7,10 @@ from app.core.config import get_settings
 from app.core.exceptions import (
     CredentialStoreError,
     DataSourceConnectionError,
+    LLMRequestError,
     NotImplementedFeatureError,
     ResourceNotFoundError,
+    RevisionConflictError,
     UnsafeOperationError,
 )
 from app.core.logging import configure_logging
@@ -59,6 +61,17 @@ async def unsafe_operation_handler(request: Request, exc: UnsafeOperationError) 
 @app.exception_handler(ValueError)
 async def bad_request_handler(request: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(RevisionConflictError)
+async def revision_conflict_handler(request: Request, exc: RevisionConflictError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(LLMRequestError)
+async def llm_error_handler(request: Request, exc: LLMRequestError) -> JSONResponse:
+    # 固定安全消息 + reason；不含提示词、响应或密钥。
+    return JSONResponse(status_code=502, content={"detail": str(exc), "reason": exc.reason})
 
 
 @app.exception_handler(CredentialStoreError)

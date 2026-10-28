@@ -18,10 +18,12 @@ def test_milestones_endpoint() -> None:
     assert len(data) == 9
     assert data[0]["id"] == "M0"
     assert data[0]["status"] == "done"
-    # M1 已通过单元测试与真实库集成验证标记完成；M2 起仍为 todo。
+    # M1 已通过验证标记完成；M2 主体完成但 Embedding 检索未接入 → partial；M3 起仍为 todo。
     assert data[1]["id"] == "M1"
     assert data[1]["status"] == "done"
-    assert all(m["status"] == "todo" for m in data[2:])
+    assert data[2]["id"] == "M2"
+    assert data[2]["status"] == "partial"
+    assert all(m["status"] == "todo" for m in data[3:])
 
 
 # 数据源接口的行为（创建、连接测试、扫描、画像）由 tests/test_sources_api.py

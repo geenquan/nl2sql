@@ -4,6 +4,7 @@
 的具体实现；路由与服务通过 port 协作，测试用 dependency_overrides 替换。
 """
 
+from collections.abc import Callable
 from functools import lru_cache
 from typing import Any
 
@@ -12,10 +13,13 @@ from pydantic import SecretStr
 from app.adapters.mysql_connector import MySQLConnectionConfig, MySQLConnector
 from app.adapters.repositories.sqlite_metadata_repository import SQLiteMetadataRepository
 from app.core.config import Settings, get_settings
+from app.llm.deepseek_client import DeepSeekClient
 from app.ports.connectors import ConnectorFactory, DataSourceConnector
+from app.ports.llm import LLMClient
 from app.profiling.profiler import DataProfiler
 from app.security.credentials import CredentialStore, FileCredentialStore
 from app.services.scan_service import ScanService
+from app.services.semantics_service import SemanticsService
 from app.services.source_service import SourceService
 
 
@@ -84,4 +88,31 @@ def get_scan_service() -> ScanService:
         max_tables=settings.scan_max_tables,
         max_columns=settings.profile_max_columns,
         max_recorded_errors=settings.scan_max_recorded_errors,
+    )
+
+
+@lru_cache
+def _llm_factory() -> Callable[[], LLMClient] | None:
+    settings = _settings()
+    if not settings.deepseek_enabled:
+        return None  # 规则模式；不伪装模型推断
+
+    def factory() -> LLMClient:
+        return DeepSeekClient(
+            api_base=settings.llm_api_base,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            timeout_seconds=settings.llm_timeout_seconds,
+            max_retries=settings.llm_max_retries,
+            max_output_tokens=settings.llm_max_tokens,
+        )
+
+    return factory
+
+
+def get_semantics_service() -> SemanticsService:
+    return SemanticsService(
+        metadata_repository=_metadata_repository(),
+        llm_factory=_llm_factory(),
+        settings=_settings(),
     )

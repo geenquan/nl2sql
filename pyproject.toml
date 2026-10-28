@@ -15,10 +15,11 @@ dependencies = [
   "pydantic-settings>=2.4,<3.0",
   "sqlalchemy>=2.0,<3.0",
   "pymysql>=1.1,<2.0",
+  "httpx>=0.27,<1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0,<9.0", "httpx>=0.27,<1.0", "ruff>=0.6,<1.0"]
+dev = ["pytest>=8.0,<9.0", "ruff>=0.6,<1.0"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
@@ -38,3 +39,4 @@ target-version = "py313"
 # 扫描生命周期的边界必须兜底捕获任意异常以完成任务收尾（failed + finished_at），
 # close 失败也必须吞掉以免覆盖主要结果；这里是刻意为之的宽捕获。
 "app/services/scan_service.py" = ["BLE001", "S110"]
+"app/services/semantics_service.py" = ["BLE001"]

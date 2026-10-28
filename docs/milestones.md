@@ -25,13 +25,17 @@
 
 M1 接口与命令示例见 README；扫描为同步执行，后台任务、增量变更检测、跨库 Schema 白名单细化留到 M8 治理阶段。
 
-## M2 — 字段语义理解
-- [ ] 规则初筛、术语拆词、字段语义类别
-- [ ] 通过 `LLMClient` / `EmbeddingClient` 接入模型
-- [ ] 消费 `DEEPSEEK_*` 配置实现 DeepSeek 客户端（配置层映射为 `llm_*`，启用开关为 `deepseek_enabled`），落实超时、重试和输出 token 上限；Embedding 单独选型
-- [ ] 输出结构化字段语义卡片、证据、候选解释和 unknown
-- [ ] 保存模型版本与人工修订记录
-- 验收输出：表用途分类、字段语义列表、语义检索结果。
+## M2 — 字段语义理解（主体完成，Embedding 检索未完成 → partial）
+- [x] 规则初筛、术语拆词、字段语义类别（拆词/术语表/规则引擎，冲突降置信、口径 caveat、unknown 保留）
+- [x] 通过 `LLMClient` 接入模型（`EmbeddingClient` 端口保留，**Embedding 未接入**——无配置，检索用本地词法基线并标记 method=lexical）
+- [x] 消费 `DEEPSEEK_*` 配置实现 DeepSeek 客户端（httpx，超时/有限重试/输出与响应预算/usage 如实记录）
+- [x] 输出结构化字段语义卡片、证据（服务端核验、路径形态规范化）、候选解释和 unknown
+- [x] 保存模型版本与人工修订记录（修订式历史、并发控制、人工确认不被模型覆盖）
+- 验收输出：表用途分类、字段语义列表、语义检索结果（词法基线）；真实模型链路已验证
+  （deepseek-flash，小预算），评测指标见 [开发交接报告](development-status.md)。
+
+未完成：Embedding 向量检索（明确保留，不宣称 M2 全部完成）；候选实体准确率等无标签指标
+标记 unavailable。M3 输入已就绪（foreign_identifier_candidate 清单 + 画像证据）。
 
 ## M3 — 跨表关系发现与验证
 - [ ] 候选关系召回（类型、命名、语义、统计特征）

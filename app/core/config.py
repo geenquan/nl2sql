@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     # 追加固敏感列名关键词（小写子串匹配，JSON 数组）；内置规则见 app/security/masking.py。
     sensitive_column_keywords: list[str] = Field(default_factory=list)
 
+    # M2 语义分析预算：默认不外发样本，只发送结构元数据与画像统计。
+    semantics_max_columns_per_run: int = Field(default=40, gt=0)
+    semantics_llm_max_calls: int = Field(default=2, ge=1)
+    semantics_input_char_limit: int = Field(default=24000, gt=0)
+    semantics_send_samples: bool = False
+    semantics_search_default_limit: int = Field(default=20, gt=0, le=100)
+
     # 系统业务库：与只读查询数据源独立，持久化接入仍待实现。
     biz_mysql_host: str = "127.0.0.1"
     biz_mysql_port: int = Field(default=3306, gt=0, le=65535)

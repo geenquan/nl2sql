@@ -52,6 +52,54 @@ class MetadataRepository(ABC):
     def get_published_snapshot(self, source_id: str) -> dict[str, Any] | None:
         """返回默认发布快照信息 {snapshot_id, job_id, status, complete}；无则 None。"""
 
+    # -- M2 语义持久化 ----------------------------------------------------------
+    # 修订语义：每次写入追加新修订（不覆盖审计历史）；effective=True 时
+    # business_confirmed 修订优先于更新的 suggested 修订（人工结论不被模型覆盖）。
+
+    @abstractmethod
+    def save_field_semantics(self, record: dict[str, Any]) -> int:
+        """追加字段语义新修订，返回修订号。"""
+
+    @abstractmethod
+    def list_field_semantics(
+        self, table_id: str, effective: bool = False
+    ) -> list[dict[str, Any]]:
+        """列出一表的字段语义；effective=False 取每列最新修订，True 取人工确认优先。"""
+
+    @abstractmethod
+    def get_field_semantics_history(self, table_id: str, column_name: str) -> list[dict[str, Any]]:
+        """按修订号倒序返回某字段的全部历史（含模型与人工修订）。"""
+
+    @abstractmethod
+    def save_table_purpose(self, record: dict[str, Any]) -> int:
+        ...
+
+    @abstractmethod
+    def get_table_purpose(self, table_id: str, effective: bool = False) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def get_table_purpose_history(self, table_id: str) -> list[dict[str, Any]]:
+        ...
+
+    @abstractmethod
+    def save_semantic_run(self, run: dict[str, Any]) -> None:
+        """按 run_id upsert 语义分析运行记录。"""
+
+    @abstractmethod
+    def get_semantic_run(self, run_id: str) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def list_semantic_runs(self, source_id: str) -> list[dict[str, Any]]:
+        """按开始时间倒序。"""
+
+    @abstractmethod
+    def list_field_semantics_by_source(
+        self, source_id: str, snapshot_id: str, effective: bool = True
+    ) -> list[dict[str, Any]]:
+        """语义检索用：某数据源在某快照下的全部有效字段语义。"""
+
 
 class SourceRepository(ABC):
     """数据源配置仓储。不得把明文密码作为普通字段保存。

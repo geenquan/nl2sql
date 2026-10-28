@@ -1097,10 +1097,17 @@ class SQLiteMetadataRepository(
         operator: str, reason: str | None, action: str,
         expected: tuple[str, int] | None = None,
     ) -> bool:
-        """单事务：目标版本存在性 + 指针乐观校验 + 审计写入。"""
-        from uuid import uuid4 as _uuid4
+        """原子切换发布指针（修复轮：期望比较进入数据库写入条件）。
 
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        - expected 给定：`UPDATE ... WHERE 当前指针 == expected`，受影响行数
+          为 0 即并发冲突（返回 False，事务内未写任何审计）；
+        - expected 为 None：先读当前指针——无指针时 INSERT（首个发布并发由
+          source_id 主键唯一约束仲裁，IntegrityError → False）；有指针时以
+          读到的值作为隐式期望执行同一条件 UPDATE（读取与写入之间被并发
+          切换 → UPDATE 条件不命中 → False）；
+        - 审计与指针更新同事务：任一失败整体回滚（指针不变、无成功审计）。
+        """
+        from uuid import uuid4 as _uuid4
 
         with self._engine.begin() as conn:
             exists = conn.execute(select(func.count()).select_from(
@@ -1112,21 +1119,37 @@ class SQLiteMetadataRepository(
                 raise ValueError(f"目标模型版本不存在：{model_id} v{version}")
             current = conn.execute(select(self._semantic_model_pointer).where(
                 self._semantic_model_pointer.c.source_id == source_id)).first()
-            if (expected is not None
-                    and (current is None
-                         or (current.model_id, current.version) != expected)):
-                return False  # 指针已被并发切换 → 409
-            values = {
-                "source_id": source_id, "model_id": model_id,
-                "version": int(version), "updated_at": _now(),
-            }
-            conn.execute(
-                sqlite_insert(self._semantic_model_pointer)
-                .values(values)
-                .on_conflict_do_update(
-                    index_elements=[self._semantic_model_pointer.c.source_id],
-                    set_={k: v for k, v in values.items() if k != "source_id"},
-                ))
+            expected_effective = expected
+            if expected_effective is None:
+                if current is None:
+                    # 首次发布并发：唯一约束仲裁，恰一成功
+                    try:
+                        conn.execute(self._semantic_model_pointer.insert().values(
+                            source_id=source_id, model_id=model_id,
+                            version=int(version), updated_at=_now(),
+                        ))
+                    except IntegrityError:
+                        return False
+                else:
+                    expected_effective = (current.model_id, current.version)
+            else:
+                if current is None:
+                    return False  # 期望存在指针但实际没有 → 冲突
+            if expected_effective is not None:
+                result = conn.execute(
+                    self._semantic_model_pointer.update()
+                    .where(
+                        self._semantic_model_pointer.c.source_id == source_id,
+                        self._semantic_model_pointer.c.model_id
+                        == expected_effective[0],
+                        self._semantic_model_pointer.c.version
+                        == expected_effective[1],
+                    )
+                    .values(model_id=model_id, version=int(version),
+                            updated_at=_now())
+                )
+                if result.rowcount == 0:
+                    return False  # 条件不命中：指针已被并发切换 → 409
             conn.execute(self._semantic_model_log.insert().values(
                 id=_uuid4().hex, source_id=source_id, model_id=model_id,
                 version=int(version), action=action, operator=operator,

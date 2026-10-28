@@ -1,6 +1,91 @@
 # 开发交接报告
 
-更新时间：2026-10-29（M4 业务实体与语义层完成：主题/实体/属性/维度/指标/路径、版本与发布/回滚、JSON/YAML 导出；真实小预算只读演示 + 合成夹具全流程演示通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-29（M4 修复轮：八组 P1/P2——敏感文本净化、发布指针原子性、口径修改撤销确认、指标定义共用校验、依赖修订参与可用性、路径风险与人工选路、grain 依据重核、正式可用性语义；全部先复现后修复，真实复验通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M4 缺陷修复轮（2026-10-29，八组，全部先复现后修复）
+
+### 1. 注释敏感内容进入模型与导出【P1】
+- 根因：表/列注释等自由文本直接成为实体名/业务名并进入导出（复现：表注释
+  `password: ReviewDummy123` 原样出现在 JSON 导出）。
+- 修复：`model_builder` 构建前经 `sanitize_text_for_model` 净化（键值/Bearer/
+  引号键名遮蔽）；发生遮蔽的注释不作业务名——回退原始表名/列名并注明来源
+  （结构性标识不净化）；`_enrich` 在读取/导出边界对**历史版本**净化
+  （不改写存储行，回归断言存储行原样、读取已净化）。
+
+### 2. 发布指针并发保护非原子【P1】
+- 根因：`set_published` 先 SELECT 比较再无条件 upsert（复现：两线程同期望
+  指针分别发布 v3/v4 均成功）。
+- 修复：期望比较进入 `UPDATE ... WHERE`（rowcount=0 即冲突）；expected=None
+  语义=读当前值作隐式期望执行条件写（首次发布 INSERT 由 source_id 唯一约束
+  仲裁）；审计与指针同事务（审计失败整体回滚）；发布/回滚共用保护。
+- 回归：真实线程+双连接——同期望并发发布恰一成功；发布 vs 回滚竞争（目标
+  版本故意设为移动型避免无操作假阳性）；首発竞争用引擎事件在 INSERT 处
+  对齐两连接强制同时插入（唯一约束恰一成功）；失败不改指针不写成功审计。
+
+### 3. 口径修改保留旧确认【P1】
+- 修复：口径字段集=聚合/度量字段/去重键/过滤/时间字段/时间口径/单位；实质
+  变化→撤销 business_confirmation 与 data_validation、退 suggested、加阻断
+  （同请求 confirm=先撤销再按新定义完整校验后记录新确认）；非口径字段
+  （名称/描述）保留确认；grain 键/依据变化联动受影响指标重新确认。
+
+### 4. 指标定义与字段引用校验不足【P1】
+- 修复：共用 `_validate_metric_definition`（build 剔除不合规候选/revise 保存
+  前拒绝/publish 重新校验，不只查 status 与 blocking）：各聚合所需字段与
+  类型（count_rows 无字段、count_distinct 去重键有序不重复、sum/avg 数值
+  度量、min/max 明确类型）；time_field 必须日期时间类型；过滤值类型严格
+  相容（不把任意对象 str() 当合法值）；引用字段必须属于指标**自身实体**
+  （跨实体直接拒绝，不隐式补 JOIN）；display_expression 一律从当前结构化
+  定义重派生（dict 修订后不再沿用旧表达式）。
+
+### 5. 依赖修订未参与可用性检查【P1】
+- 根因：只查关系当前状态是否 validated，不比较采用的修订（复现：M3 修订
+  变更且基数变化后旧模型仍 ok）。
+- 修复：依赖清单记录 M2 字段语义/表用途修订（`m2_field_semantics`/
+  `m2_table_purposes`）；`_dependency_status` 逐项比对当前 effective 修订
+  （缺失/否决/撤销/不一致 → needs_revalidation）；缺完整依赖信息的旧模型
+  保守降级；发布/回滚/读取/导出共用同一判定。
+
+### 6. 路径风险遗漏与人工选路绕过【P1】
+- 修复：按方向识别 one_to_many/many_to_many 扇出（均阻断）；未知基数待审；
+  人工选路只解除"多条路径"歧义——预算截断/扇出/基数未知不因此消除，状态
+  按剩余风险重判；未选路径 blocked 不降级；验证报告用结构化实体引用替代
+  `metric.app.<table>` 前缀硬编码（非 app Schema 指标同判定；单实体指标
+  不被无关路径误伤）。
+
+### 7. grain 变更保留错误结构依据【P1】
+- 修复：键变化重核依据——与主键/唯一索引**精确匹配**才可 confirm；普通
+  非唯一列人工 confirm 保留为待验证草稿（confirmed=False+basis=unknown+
+  missing 说明）；重复列/缺列拒绝；主题与中心实体 grain 同步；指标
+  grain_statement 始终解析自主题 grain；发布时重新核验（不只信 confirmed
+  布尔值）；grain 实质变化使受影响指标重新确认。
+
+### 8. 未发布草稿被标记当前正式可用【P1】
+- 修复：`usable_as_current` = 发布指针命中 **且** 依赖 ok；`formal_metric_ids`
+  仅在当前可用时返回（未发布/依赖失效→空），已确认草稿另列
+  `confirmed_metric_ids`；validate/_enrich/publish 去递归（检查独立于
+  "已发布"——发布前检查可在未发布版本上通过）。
+
+### 9. 契约补齐【P2】
+- Entity.purpose 消费有效 M2 表用途（rejected 记 unknown+purpose_note，
+  不作正向主题分类）；Topic.metric_ids/dimension_ids 填充真实归属引用。
+
+### 验证（修复轮后）
+
+| 检查 | 结果 |
+| --- | --- |
+| `python -m pytest -q` | **623 passed, 9 skipped**（修复轮新增 38 项：全部先在旧实现复现失败后修复；未删测试/未放宽/无新增跳过） |
+| `python -m ruff check app tests scripts` / `pip check` | 全部通过 |
+| 真实集成（`NL2SQL_MYSQL_INTEGRATION=1`） | **8 passed, 1 skipped**（M1–M3 无回归） |
+| M4 真实演示复跑 | 真实库段如实（partial 5/18、0 validated 阻断）；合成段全流程通过（发布→导出→改版→差异→回滚）；项目根无残留 metadata.db/凭证文件 |
+
+### M5 正式可用性判定（修复后口径）
+
+模型可用 = `availability.is_published_version && availability.dependency_status
+== "ok"`（即 usable_as_current）；指标正式集合 = 该版本 `formal_metric_ids`
+（仅当前可用时非空；草稿已确认见 confirmed_metric_ids）。依赖判定覆盖
+M2/M3 采用修订 vs 当前 effective、目录快照指针。
+
+
 
 ## M4 业务实体与语义层（2026-10-29 完成）
 

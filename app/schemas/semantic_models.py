@@ -32,9 +32,12 @@ class MetricFilterIn(BaseModel):
 
 class MetricChange(BaseModel):
     action: str  # confirm | reject | update
+    name: str | None = None  # 非口径字段（改名不撤销确认）
+    description: str | None = None  # 非口径字段
     unit: str | None = None
     time_basis: str | None = None
     time_field: MetricFieldRef | None = None
+    measure_field: MetricFieldRef | None = None  # 聚合变更时可同步提供度量字段
     filters: list[MetricFilterIn] | None = None
     aggregation: str | None = None
     skip_status_filter: bool = False

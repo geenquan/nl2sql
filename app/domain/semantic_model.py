@@ -128,9 +128,11 @@ class Entity:
     entity_id: str  # schema.table（完整身份，不跨 Schema 合并）
     name: str
     aliases: list[str] = field(default_factory=list)
-    purpose: str = "unknown"  # M2 表用途
+    purpose: str = "unknown"  # M2 表用途（rejected 不作正向，记 unknown）
+    purpose_note: str | None = None  # 用途消费说明（如被否决/缺失）
     source: TableRef | None = None
     primary_key: list[str] = field(default_factory=list)  # 结构依据（有序）
+    unique_indexes: list[list[str]] = field(default_factory=list)  # 唯一约束（有序组合）
     attributes: list[Attribute] = field(default_factory=list)
     grain: Grain = field(default_factory=Grain)
     status: str = "suggested"
@@ -141,8 +143,10 @@ class Entity:
             "name": self.name,
             "aliases": list(self.aliases),
             "purpose": self.purpose,
+            "purpose_note": self.purpose_note,
             "source": self.source.to_dict() if self.source else None,
             "primary_key": list(self.primary_key),
+            "unique_indexes": [list(cols) for cols in self.unique_indexes],
             "attributes": [a.to_dict() for a in self.attributes],
             "grain": self.grain.to_dict(),
             "status": self.status,
@@ -250,7 +254,13 @@ class Metric:
             "business_confirmation": self.business_confirmation,
             "blocking": list(self.blocking),
             "evidence": list(self.evidence),
-            "display_expression": self.display_expression(),
+            "display_expression": derive_display_expression({
+                "aggregation": self.aggregation,
+                "measure_field": self.measure_field.to_dict()
+                if self.measure_field else None,
+                "distinct_keys": [k.to_dict() for k in self.distinct_keys],
+                "filters": [f.to_dict() for f in self.filters],
+            }),
         }
 
 
@@ -332,11 +342,19 @@ class Topic:
 
 @dataclass
 class ModelDependencies:
-    """依赖清单：历史模型内容可重现，不因后来审核静默变化。"""
+    """依赖清单：历史模型内容可重现，不因后来审核静默变化。
+
+    修复轮：除 M3 关系修订外，记录实际采用的 M2 字段语义修订
+    （table_id.column_name → revision）与 M2 表用途修订（table_id →
+    revision）；可用性检查逐项与当前 effective 修订比对——状态仍为
+    validated 不代表旧修订/旧基数仍可继续使用。
+    """
 
     metadata_snapshot_id: str | None = None
     m2_semantics_snapshot_id: str | None = None
     relationship_revisions: dict[str, int] = field(default_factory=dict)
+    m2_field_semantics: dict[str, int] = field(default_factory=dict)
+    m2_table_purposes: dict[str, int] = field(default_factory=dict)
     rules_version: str = MODEL_BUILDER_VERSION
     input_complete: bool = True
     partial_missing: list[str] = field(default_factory=list)
@@ -346,10 +364,33 @@ class ModelDependencies:
             "metadata_snapshot_id": self.metadata_snapshot_id,
             "m2_semantics_snapshot_id": self.m2_semantics_snapshot_id,
             "relationship_revisions": dict(self.relationship_revisions),
+            "m2_field_semantics": dict(self.m2_field_semantics),
+            "m2_table_purposes": dict(self.m2_table_purposes),
             "rules_version": self.rules_version,
             "input_complete": self.input_complete,
             "partial_missing": list(self.partial_missing),
         }
+
+
+def derive_display_expression(metric: dict[str, Any]) -> str:
+    """从当前结构化定义派生展示表达式（修复轮：dict 修订后必须重派生，
+    不得沿用构建时保存的旧表达式；结构化定义才是事实来源）。"""
+    aggregation = metric.get("aggregation")
+    if aggregation == "count_rows":
+        expr = "COUNT(*)"
+    elif aggregation == "count_distinct":
+        keys = ", ".join(
+            k.get("column", "?") for k in metric.get("distinct_keys") or [])
+        expr = f"COUNT(DISTINCT ({keys or '?'}))"
+    else:
+        column = (metric.get("measure_field") or {}).get("column", "?")
+        expr = f"{str(aggregation).upper()}({column})"
+    filters = metric.get("filters") or []
+    if filters:
+        expr += " WHERE " + " AND ".join(
+            f"{flt['field']['column']} {flt['operator']} ..."
+            for flt in filters)
+    return expr
 
 
 @dataclass

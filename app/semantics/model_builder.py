@@ -42,6 +42,7 @@ from app.domain.semantic_model import (
 )
 from app.relationships.graph import PathSearchBudget, find_paths
 from app.security.masking import is_sensitive_column
+from app.semantics.prompt import sanitize_text_for_model
 
 _TOPIC_PURPOSES = ("master_data", "transaction_event", "detail")
 _DIMENSION_CATEGORIES = {
@@ -88,7 +89,7 @@ class SemanticModelBuilder:
         validated = [r for r in relationships if r.get("status") == "validated"]
 
         entities, dimensions = self._build_entities(
-            tables, semantics_by_key, sensitive_keywords)
+            tables, semantics_by_key, purposes, sensitive_keywords)
         model_relationships = self._build_relationships(validated)
         topics, paths = self._build_topics_and_paths(
             tables, entities, validated, purposes,
@@ -96,6 +97,7 @@ class SemanticModelBuilder:
             max_topics=max_topics, get_time=get_time,
             deadline=deadline_monotonic)
         metrics = self._build_metrics(topics, entities)
+        self._fill_topic_refs(topics, entities, dimensions, metrics)
 
         return SemanticModel(
             model_id=model_id,
@@ -116,11 +118,43 @@ class SemanticModelBuilder:
                 m2_semantics_snapshot_id=snapshot_id,
                 relationship_revisions={
                     r["relationship_key"]: r["revision"] for r in validated},
+                m2_field_semantics={
+                    f"{table_id}.{column}": record["revision"]
+                    for (table_id, column), record in semantics_by_key.items()
+                    if record.get("revision") is not None},
+                m2_table_purposes={
+                    table_id: record["revision"]
+                    for table_id, record in purposes.items()
+                    if record.get("revision") is not None},
                 rules_version=MODEL_BUILDER_VERSION,
                 input_complete=input_complete,
                 partial_missing=list(partial_missing or []),
             ),
         )
+
+    @staticmethod
+    def _fill_topic_refs(
+        topics: list[Topic], entities: list[Entity],
+        dimensions: list[Dimension], metrics: list[Metric],
+    ) -> None:
+        """主题的指标/维度引用真实存在且归属正确（P2：归属中心实体）。"""
+        entity_dimension_ids: dict[str, list[str]] = {}
+        for dimension in dimensions:
+            entity_id = dimension.attribute_id.rsplit(".", 1)[0]
+            entity_dimension_ids.setdefault(entity_id, []).append(
+                dimension.dimension_id)
+        entity_metric_ids: dict[str, list[str]] = {}
+        for metric in metrics:
+            entity_metric_ids.setdefault(metric.entity_id, []).append(
+                metric.metric_id)
+        for topic in topics:
+            topic.metric_ids = sorted(
+                entity_metric_ids.get(topic.central_entity_id, []))
+            topic.dimension_ids = sorted(
+                entity_dimension_ids.get(topic.central_entity_id, []))
+            # 实体引用剔除不存在的 id（保守：多跳中间实体见路径步骤）
+            known = {e.entity_id for e in entities}
+            topic.entity_ids = [e for e in topic.entity_ids if e in known]
 
     # -- 实体与属性 -----------------------------------------------------------
 
@@ -128,6 +162,7 @@ class SemanticModelBuilder:
         self,
         tables: list[dict[str, Any]],
         semantics_by_key: dict[tuple[str, str], dict[str, Any]],
+        purposes: dict[str, dict[str, Any]],
         sensitive_keywords: tuple[str, ...],
     ) -> tuple[list[Entity], list[Dimension]]:
         entities: list[Entity] = []
@@ -135,8 +170,25 @@ class SemanticModelBuilder:
         for table in tables:
             ref = _table_ref(table)
             entity_id = f"{ref.schema_name}.{ref.table_name}"
-            comment = (table.get("table_comment") or "").strip()
-            name = comment[:30] if 0 < len(comment) <= 30 else ref.table_name
+            # 自由文本净化（修复轮）：表注释进入实体名前净化；发生遮蔽
+            # （净化结果 ≠ 原文，说明含敏感内容）则不作业务名——安全回退
+            # 原始表名并注明来源（结构性标识不净化）
+            raw_comment = (table.get("table_comment") or "").strip()
+            sanitized_comment = (
+                sanitize_text_for_model(raw_comment, 30) if raw_comment else "")
+            if (sanitized_comment and sanitized_comment == raw_comment
+                    and 0 < len(raw_comment) <= 30):
+                name = raw_comment
+            else:
+                name = ref.table_name
+            # 实体用途消费有效 M2 结果（修复轮 P2）；rejected 不作正向依据
+            purpose_record = purposes.get(table["table_id"]) or {}
+            if purpose_record.get("review_status") == "rejected":
+                purpose = "unknown"
+                purpose_note = "M2 表用途已被人工否决，不作正向分类依据"
+            else:
+                purpose = purpose_record.get("purpose") or "unknown"
+                purpose_note = None
             pk = list(table.get("primary_key") or [])
             attributes: list[Attribute] = []
             for column in table.get("columns") or []:
@@ -158,8 +210,11 @@ class SemanticModelBuilder:
                             business_name = suggested[:60]
                             name_source_attr = "m2_business_name"
                         elif (column.get("comment") or "").strip():
-                            business_name = column["comment"].strip()[:60]
-                            name_source_attr = "m2_comment"
+                            sanitized_comment = sanitize_text_for_model(
+                                column["comment"].strip(), 60)
+                            if sanitized_comment.strip():
+                                business_name = sanitized_comment
+                                name_source_attr = "m2_comment"
                     evidence.append({
                         "type": "m2_semantics",
                         "ref": f"{semantics.get('revision')}",
@@ -194,9 +249,14 @@ class SemanticModelBuilder:
             entities.append(Entity(
                 entity_id=entity_id,
                 name=name,
-                purpose="unknown",
+                purpose=purpose,
+                purpose_note=purpose_note,
                 source=ref,
                 primary_key=pk,
+                unique_indexes=[
+                    list(index.get("columns") or [])
+                    for index in (table.get("indexes") or [])
+                    if index.get("unique")],
                 attributes=attributes,
                 grain=self._structural_grain(table),
             ))
@@ -275,9 +335,10 @@ class SemanticModelBuilder:
             f"{t['schema_name']}.{t['table_name']}": t["table_id"] for t in tables}
         central_entities = [
             e for e in entities
-            if (purposes.get(
+            if (record := purposes.get(
                 table_key_by_entity.get(e.entity_id, ""), {}) or {})
-            .get("purpose") in _TOPIC_PURPOSES
+            and record.get("review_status") != "rejected"  # 否决不作正向分类
+            and record.get("purpose") in _TOPIC_PURPOSES
         ][:max_topics]
         relationship_by_key = {r["relationship_key"]: r for r in validated}
         topics: list[Topic] = []
@@ -380,10 +441,17 @@ class SemanticModelBuilder:
                 cardinality=hop.get("cardinality") or "unknown",
             ))
             cardinality = hop.get("cardinality")
+            # 按路径方向识别扇出风险（修复轮）：路径沿 source→target 行进，
+            # one_to_many（源唯一、目标非唯一）与 many_to_many（两端非唯一）
+            # 都会造成行 fan-out/重复计数 → 阻断；many_to_one/one_to_one 安全。
             if cardinality == "many_to_many":
                 risks.append({"type": "many_to_many",
                               "note": "多对多连接：聚合需显式去重/条件方案"})
                 reasons.append("多对多步骤：扇出/重复计数风险，需明确聚合方案")
+            elif cardinality == "one_to_many":
+                risks.append({"type": "fanout_one_to_many",
+                              "note": "一对多方向连接：目标端非唯一，行数膨胀"})
+                reasons.append("一对多方向步骤：扇出/重复计数风险，需明确聚合方案")
             elif cardinality in ("unknown", None):
                 reasons.append("步骤基数未知（口径不足）")
             if len(record["source_columns"]) > 1:
@@ -394,7 +462,8 @@ class SemanticModelBuilder:
         if budget_truncated:
             reasons.append("路径搜索受预算截断：不排除存在其他路径")
         status = "available" if not reasons else (
-            "blocked" if any(r["type"] == "many_to_many" for r in risks)
+            "blocked" if any(r["type"] in ("many_to_many", "fanout_one_to_many")
+                             for r in risks)
             else "needs_review")
         return QueryPath(
             path_id=f"path.{uuid4().hex[:12]}",

@@ -125,6 +125,12 @@ def revise_model(
                     "table": payload["time_field"]["table"],
                     "column": payload["time_field"]["column"],
                 }
+            if payload.get("measure_field") is not None:
+                payload["measure_field"] = {
+                    "schema": payload["measure_field"]["schema_name"],
+                    "table": payload["measure_field"]["table"],
+                    "column": payload["measure_field"]["column"],
+                }
             for flt in payload.get("filters") or []:
                 flt["field"] = {
                     "schema": flt["field"]["schema_name"],

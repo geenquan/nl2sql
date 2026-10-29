@@ -101,15 +101,24 @@ class SQLiteControlledExecutor(ControlledExecutorBase):
 
 
 class MySQLControlledExecutor(ControlledExecutorBase):
-    """源库 MySQL 只读执行器（连接级 READ ONLY 复用 MySQLConnector）。"""
+    """源库 MySQL 只读执行器（连接级 READ ONLY 复用 MySQLConnector）。
+
+    URL 经 SQLAlchemy URL.create 结构化构造（密码含 @:/ 等字符安全）；
+    不在异常中暴露 DSN/密码/业务参数。
+    """
 
     def __init__(self, host: str, port: int, database: str, username: str,
                  password: str, allowed_tables: set[str],
                  allowed_columns: dict[str, set[str]],
                  statement_budget: Any = None,
                  connect_timeout: int = 10, read_timeout: int = 30):
+        from sqlalchemy.engine import URL
+
+        url = URL.create(
+            "mysql+pymysql", username=username, password=password,
+            host=host, port=port, database=database)
         engine = create_engine(
-            f"mysql+pymysql://{username}:{password}@{host}:{port}/{database}",
+            url,
             connect_args={
                 "charset": "utf8mb4",
                 "connect_timeout": connect_timeout,
@@ -173,25 +182,38 @@ class SQLiteViewPublisher(ViewPublisher):
         self._engine.dispose()
 
     @staticmethod
-    def _inline_params(select_sql: str, params: dict[str, Any] | None) -> str:
-        """类型化字面量编译（数值/字符串/None；字符串经 SQLite 转义）。"""
+    def _inline_params(select_sql: str, params: dict[str, Any] | None,
+                       dialect: str = "sqlite") -> str:
+        """类型化字面量编译（方言相容；修复轮：MySQL 不复用 SQLite 转义）。
+
+        使用 sqlglot 方言 literal 生成（引号/反斜杠/Unicode/注释形态均为
+        单个字面量节点，不产生额外 SQL 结构）；数值/布尔/NULL/字符串支持。
+        """
         if not params:
             return select_sql
-        sql = select_sql
-
-        def escape(value: Any) -> str:
+        def literal(value: Any) -> str:
             if value is None:
                 return "NULL"
             if isinstance(value, bool):
-                return "1" if value else "0"
+                return "TRUE" if value else "FALSE"
             if isinstance(value, (int, float)):
                 return repr(value)
             if isinstance(value, str):
-                return "'" + value.replace("'", "''") + "'"
-            raise ValueError(f"视图定义不支持该参数类型：{type(value).__name__}")
+                # 方言相容字面量（修复轮：MySQL 不复用 SQLite 转义）。
+                # MySQL：反斜杠转义 + 单引号反斜杠转义；SQLite：单引号加倍。
+                # 注释形态（-- /* */）在字符串字面量内无语法含义。
+                if dialect == "mysql":
+                    escaped = value.replace("\\", "\\\\").replace(
+                        "'", "\\'")
+                    return f"'{escaped}'"
+                escaped = value.replace("'", "''")
+                return f"'{escaped}'"
+            raise ValueError(
+                f"视图定义不支持该参数类型：{type(value).__name__}")
 
+        sql = select_sql
         for name, value in params.items():
-            sql = sql.replace(f"%({name})s", escape(value))
+            sql = sql.replace(f"%({name})s", literal(value))
         if "%(" in sql:
             raise ValueError("视图定义存在未消费的参数占位符")
         return sql
@@ -202,12 +224,18 @@ class MySQLViewPublisher(ViewPublisher):
 
     仅接受编译产物与系统生成目标名；SELECT 执行端口不接受 DDL——
     DDL 只存在于本发布器。目标连接必须能读取来源表（首版同实例）。
+    URL 结构化构造（密码特殊字符安全）。
     """
 
     def __init__(self, host: str, port: int, username: str, password: str,
                  connect_timeout: int = 10):
+        from sqlalchemy.engine import URL
+
+        url = URL.create(
+            "mysql+pymysql", username=username, password=password,
+            host=host, port=int(port))
         self._engine = create_engine(
-            f"mysql+pymysql://{username}:{password}@{host}:{port}",
+            url,
             connect_args={"charset": "utf8mb4",
                           "connect_timeout": connect_timeout},
             pool_pre_ping=True, pool_size=1, max_overflow=1)
@@ -216,7 +244,13 @@ class MySQLViewPublisher(ViewPublisher):
         self, target_schema: str, view_name: str, select_sql: str,
         params: dict[str, Any] | None = None,
     ) -> None:
-        literal_sql = SQLiteViewPublisher._inline_params(select_sql, params)
+        literal_sql = SQLiteViewPublisher._inline_params(
+            select_sql, params, dialect="mysql")
+        # 最终 SELECT 定义重新过 AST 白名单（目标 Schema/视图名标识符校验）
+        from app.adapters.mysql_connector import quote_mysql_identifier
+
+        quote_mysql_identifier(target_schema)
+        quote_mysql_identifier(view_name)
         try:
             with self._engine.begin() as conn:
                 conn.execute(text(

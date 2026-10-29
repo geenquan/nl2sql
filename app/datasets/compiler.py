@@ -117,7 +117,9 @@ class DatasetCompiler:
             whitelist.require_column(ref["schema"], ref["table"], ref["column"])
             alias = _alias(field_spec.get("output_alias") or ref["column"])
             select_parts.append(f"c0.{quote(ref['column'])} AS {quote(alias)}")
-            lineage[alias] = {**ref, "role": "field"}
+            lineage[alias] = {
+                **ref, "role": "field",
+                "sensitive": self._is_sensitive(whitelist, ref)}
 
         from_clause = qualified(c_schema, c_table, "c0")
         joins: list[str] = []
@@ -165,7 +167,9 @@ class DatasetCompiler:
             out_alias = _alias(dim.get("output_alias") or ref["column"])
             select_parts.append(f"{alias}.{quote(ref['column'])} "
                                 f"AS {quote(out_alias)}")
-            lineage[out_alias] = {**ref, "role": "dimension"}
+            lineage[out_alias] = {
+                **ref, "role": "dimension",
+                "sensitive": self._is_sensitive(whitelist, ref)}
 
         # 预聚合 CTE（一跳明细：明细(源)→中心(目标) validated 关系）
         ctes: list[str] = []
@@ -285,6 +289,17 @@ class DatasetCompiler:
             compiler_version=DATASET_COMPILER_VERSION)
         plan.plan_fingerprint = self.fingerprint(spec, plan)
         return plan
+
+    @staticmethod
+    def _is_sensitive(whitelist: "Whitelist", ref: dict) -> bool:
+        """沿模型属性回溯 sensitive 标签（输出别名改写不能绕过）。"""
+        key = f"{ref['schema']}.{ref['table']}".lower()
+        entity = whitelist.tables.get(key) or {}
+        for attribute in entity.get("attributes", []):
+            if attribute["field"]["column"].lower() == (
+                    ref["column"].lower()):
+                return bool(attribute.get("sensitive"))
+        return False
 
     def _metric_expression(
         self, metric: dict[str, Any], whitelist: Whitelist, alias: str

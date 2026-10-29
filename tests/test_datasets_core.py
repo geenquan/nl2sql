@@ -101,7 +101,7 @@ class TestCompileAndSafety:
         service = make_service(env)
         definition = aggregate_definition(env, env["model"])
         definition["preaggregations"][0]["relationship_key"] = "bogus"
-        with pytest.raises(ValueError, match="关系不在模型中"):
+        with pytest.raises(ValueError, match="关系不在模型"):
             service.create_dataset(env["source_id"], definition)
 
 

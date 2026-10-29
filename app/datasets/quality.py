@@ -103,7 +103,10 @@ def run_quality_checks(
     _metric_reconciliation(
         checks, executor, model, spec, rows, basis, truncated)
 
-    all_passed = all(c.outcome == "passed" for c in checks) and bool(checks)
+    # 修复轮：未完成（incomplete）的关键检查阻断 all_passed
+    all_passed = (
+        bool(checks)
+        and all(c.outcome == "passed" for c in checks))
     report = QualityReport(
         dataset_id=spec["dataset_id"], dataset_version=spec["version"],
         plan_fingerprint=spec.get("plan_fingerprint"),
@@ -157,11 +160,15 @@ def _uniqueness_check(checks, rows, grain_outputs, basis, truncated) -> None:
     keys = [_grain_typed(tuple(row.get(a) for a in grain_outputs))
             for row in rows]
     duplicates = len(keys) - len(set(keys))
-    outcome = "passed" if duplicates == 0 else "failed"
-    reason = ""
-    if duplicates == 0 and truncated:
+    if truncated:
+        outcome = "incomplete"
+        reason = "窗口截断：无法验证完整 grain 唯一性（不冒充全量唯一）"
+    elif duplicates == 0:
         outcome = "passed"
-        reason = "窗口截断：仅验证窗口内唯一性（sample 口径），不证明全表唯一"
+        reason = ""
+    else:
+        outcome = "failed"
+        reason = "存在重复 grain 键"
     checks.append(QualityCheck(
         check="grain_unique", expected="grain 键组合无重复",
         actual=duplicates, denominator=len(keys),
@@ -188,9 +195,9 @@ def _row_count_check(checks, rows, central_count, basis, truncated,
     else:
         outcome = "failed"
         reason = "输出行数与中心基准不符（JOIN 行丢失或膨胀）"
-    if truncated and not has_aggregation:
+    if truncated:
         outcome = "incomplete"
-        reason = "输出窗口截断：无法比对全量行数（不据此发布）"
+        reason = "输出窗口截断：无法比对全量行数（关键检查未覆盖完整定义范围，不据此发布）"
     checks.append(QualityCheck(
         check="row_count_vs_central", expected=expected,
         actual=len(rows), denominator=central_count,

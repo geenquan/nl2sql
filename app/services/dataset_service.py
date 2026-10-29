@@ -181,23 +181,95 @@ class DatasetService:
 
     def _validate_definition(self, spec: DatasetSpec,
                              model: dict[str, Any]) -> None:
+        """服务端核验（修复轮：topic/snapshot/实体归属/字段来源一致性）。"""
         entities = {e["entity_id"]: e for e in model.get("entities", [])}
         central = entities.get(spec.central_entity_id)
         if central is None:
             raise ValueError(
                 f"中心实体不在模型：{spec.central_entity_id}")
+        # snapshot 一致性（修复轮：未传绑定模型快照；传入必须一致）
+        if spec.snapshot_id is not None and \
+                spec.snapshot_id != model.get("snapshot_id"):
+            raise ValueError(
+                f"快照不一致：数据集 {spec.snapshot_id} vs 模型 "
+                f"{model.get('snapshot_id')}（必须与采用模型一致）")
+        if spec.snapshot_id is None:
+            spec.snapshot_id = model.get("snapshot_id")
+        # topic 存在性与中心实体归属（修复轮）
+        topics = {t["topic_id"]: t for t in model.get("topics", [])}
+        topic = topics.get(spec.topic_id)
+        if topic is None:
+            raise ValueError(f"主题不在模型：{spec.topic_id}")
+        if topic.get("central_entity_id") != spec.central_entity_id:
+            raise ValueError(
+                f"中心实体不属于该主题：{spec.central_entity_id} "
+                f"≠ {topic.get('central_entity_id')}")
         if not spec.grain_keys:
             raise ValueError("数据集必须声明 grain 键")
         columns = {a["field"]["column"] for a in central.get("attributes", [])}
         for key in spec.grain_keys:
             if key not in columns:
                 raise ValueError(f"grain 键不在中心表：{key}")
+        # 普通 fields 必须属于中心实体（修复轮：完整 schema+table 身份比较）
+        central_source = central.get("source") or {}
+        for field_spec in spec.fields:
+            ref = field_spec["field"]
+            if (ref["schema"], ref["table"]) != (
+                    central_source.get("schema"),
+                    central_source.get("table")):
+                raise ValueError(
+                    f"字段不属于中心实体：{ref['schema']}.{ref['table']}"
+                    f".{ref['column']}（来源 {central_source.get('table')}）")
+        # 维度字段必须属于对应关系的目标表
+        relationships = {
+            r["relationship_key"]: r
+            for r in model.get("relationships", [])}
+        for dim in spec.dimensions:
+            relation = relationships.get(dim["relationship_key"])
+            if relation is None:
+                raise ValueError(
+                    f"维度关系不在模型：{dim['relationship_key']}")
+            ref = dim["field"]
+            target = relation.get("target") or {}
+            if (ref["schema"], ref["table"]) != (
+                    target.get("schema"), target.get("table")):
+                raise ValueError(
+                    f"维度字段不属于关系目标表：{ref['schema']}.{ref['table']}"
+                    f"（关系目标 {target.get('table')}）")
         formal = set(model.get("formal_metric_ids") or [])
-        for selection in spec.metrics + spec.preaggregations:
+        metrics_by_id = {m["metric_id"]: m for m in model.get("metrics", [])}
+        # 直接指标必须属于中心实体（修复轮）
+        for selection in spec.metrics:
             if selection["metric_id"] not in formal:
                 raise ValueError(
                     f"指标不属于模型正式集合：{selection['metric_id']}"
                     "（需 M4 business_confirmed 且模型当前可用）")
+            metric = metrics_by_id.get(selection["metric_id"])
+            if metric and metric.get("entity_id") != spec.central_entity_id:
+                raise ValueError(
+                    f"直接指标不属于中心实体：{selection['metric_id']}"
+                    f"（属于 {metric.get('entity_id')}）")
+        # 预聚合指标必须属于对应明细源实体（完整 schema+table 比较）
+        for pre in spec.preaggregations:
+            if pre["metric_id"] not in formal:
+                raise ValueError(
+                    f"预聚合指标不属于模型正式集合：{pre['metric_id']}")
+            metric = metrics_by_id.get(pre["metric_id"])
+            relation = relationships.get(pre["relationship_key"])
+            if relation is None:
+                raise ValueError(
+                    f"预聚合关系不在模型：{pre['relationship_key']}")
+            detail_source = relation.get("source") or {}
+            metric_entity = (entities.get(metric.get("entity_id"))
+                             if metric else None)
+            metric_source = (metric_entity.get("source") or {}
+                             if metric_entity else {})
+            if (metric_source.get("schema"), metric_source.get("table")) != (
+                    detail_source.get("schema"), detail_source.get("table")):
+                raise ValueError(
+                    f"预聚合指标不属于明细表实体：{pre['metric_id']}"
+                    f"（属于 {metric_source.get('table')}，"
+                    f"关系源 {detail_source.get('table')}）")
         if spec.kind not in ("detail_view", "aggregate"):
             raise ValueError(f"未知数据集类型：{spec.kind}")
         if spec.target not in ("view", "elasticsearch"):
@@ -334,11 +406,7 @@ class DatasetService:
             run["status"] = "succeeded"
             run["result"] = {"all_passed": report.all_passed,
                              "checks": len(report.checks)}
-        except Exception as exc:  # noqa: BLE001 - 收尾兜底
-            import os as _os
-            if _os.environ.get("M5_DEBUG"):
-                import traceback as _tb
-                _tb.print_exc()
+        except Exception as exc:  # noqa: BLE001 - 收尾兜底（固定安全错误）
             run["status"] = "failed"
             run["errors"].append({
                 "reason": "internal_error",
@@ -450,12 +518,13 @@ class DatasetService:
             run["errors"].append({
                 "reason": "publish_failed",
                 "message": f"发布失败[{type(exc).__name__}]；错误详情已抑制"})
-            # 外部对象已创建但本地失败 → 结果不明（needs_reconciliation，
-            # 可显式核对恢复）；未及外部 → failed_publish
+            # 修复轮：失败方只更新自己拥有的操作状态——
+            # 并发成功方可能已写入 published；此时 failed→needs_reconciliation
+            # 的转换被状态机拒绝（published 不可被失败方覆盖为 failed）
+            target_status = ("needs_reconciliation" if external_created
+                             else "failed_publish")
             self._repo.update_dataset_status(
-                payload["dataset_id"], payload["version"],
-                "needs_reconciliation" if external_created
-                else "failed_publish")
+                payload["dataset_id"], payload["version"], target_status)
             self._safe_finish_run(run)
             raise
         finally:
@@ -561,6 +630,10 @@ class DatasetService:
                     timeout_ms=60_000)
                 if not rows:
                     break
+                # 敏感字段排除（修复轮）：沿血缘回溯属性 sensitive 标签，
+                # 输出别名改写不能绕过
+                sensitive_aliases = self._sensitive_aliases(
+                    plan, grain_aliases)
                 documents = []
                 for row in rows:
                     grain_values = [row.get(a) for a in grain_aliases]
@@ -568,7 +641,9 @@ class DatasetService:
                         raise ValueError(
                             "grain 键存在 NULL：阻断导出（不静默丢行/覆盖）")
                     doc_id = grain_document_id(grain_values)
-                    source = {k: _es_value(v) for k, v in row.items()}
+                    source = {
+                        k: _es_value(v) for k, v in row.items()
+                        if k not in sensitive_aliases}
                     documents.append({"_id": doc_id, "_source": source})
                 result = es.bulk_index(index_name, documents)
                 exported += result["indexed"]
@@ -581,6 +656,19 @@ class DatasetService:
             raise ValueError(
                 f"达到导出硬上限 {max_rows}：发布失败（不切换正式别名）")
         return {"expected_rows": exported}
+
+    @staticmethod
+    def _sensitive_aliases(
+        plan: dict[str, Any], grain_aliases: list[str],
+    ) -> set[str]:
+        """沿血缘回溯输出别名的敏感标签（改别名不能绕过）。"""
+        sensitive: set[str] = set()
+        for alias, info in (plan.get("lineage") or {}).items():
+            if info.get("role") in ("grain_key",):
+                continue  # grain 键为结构化标识，不按敏感排除
+            if info.get("sensitive"):
+                sensitive.add(alias)
+        return sensitive
 
     def _es_mapping(self, payload: dict[str, Any],
                     plan: dict[str, Any]) -> dict[str, Any]:
@@ -619,10 +707,26 @@ class DatasetService:
     def rollback(self, dataset_id: str, target_version: int, *,
                  operator: str = "local-dev",
                  expected_pointer: int | None = None) -> dict[str, Any]:
+        """回滚：统一流程切换外部别名与本地指针（修复轮）。"""
         target = self._repo.get_dataset(dataset_id, version=target_version)
         if target is None or target.get("status") != "published":
             raise ValueError(
                 f"回滚目标必须是仍处 published 状态的版本：v{target_version}")
+        # ES 目标：先切换别名再切本地指针（统一流程）
+        if target.get("target") == "elasticsearch" and \
+                self._settings.dataset_es_publish_enabled:
+            es = self._es_publisher_factory()
+            current_version = self._repo.get_published_dataset(
+                target["source_id"], dataset_id)
+            if current_version and current_version != target_version:
+                current_payload = self._repo.get_dataset(
+                    dataset_id, version=current_version)
+                previous_index = (
+                    self._es_index_name(current_payload)
+                    if current_payload else None)
+                es.switch_alias(
+                    self._es_alias_name(target),
+                    self._es_index_name(target), previous_index)
         switched = self._repo.set_published_dataset(
             target["source_id"], dataset_id, target_version,
             operator=operator, expected=expected_pointer,
@@ -658,16 +762,35 @@ class DatasetService:
         es = self._es_publisher_factory()
         index_name = self._es_index_name(payload)
         count = es.count(index_name)
-        if count > 0:
+        # 完整性核对（修复轮）：索引存在且有完整文档才恢复
+        run = next(
+            (r for r in reversed(self._repo.list_dataset_runs(dataset_id))
+             if r.get("run_type") == "publish"
+             and r.get("dataset_version") == version
+             and r.get("result", {}).get("documents")),
+            None)
+        expected = (run["result"]["documents"]
+                    if run and run.get("result") else None)
+        if expected is not None and count == expected:
+            # 本地指针也需恢复（外部成功本地失败 → 指针可能未提交）
+            self._repo.set_published_dataset(
+                payload["source_id"], dataset_id, version,
+                operator="reconcile")
             self._repo.update_dataset_status(dataset_id, version,
                                              "published")
             return {"dataset_id": dataset_id, "version": version,
-                    "reconciled": "external_index_has_documents",
-                    "documents": count}
+                    "reconciled": "external_index_complete",
+                    "documents": count, "expected": expected}
+        if expected is None and count > 0:
+            # 无预期记录：保持 needs_reconciliation（不凭存在判成功）
+            return {"dataset_id": dataset_id, "version": version,
+                    "reconciled": "external_index_incomplete",
+                    "documents": count, "expected": expected}
         self._repo.update_dataset_status(dataset_id, version,
-                                         "failed_publish")
+                                        "failed_publish")
         return {"dataset_id": dataset_id, "version": version,
-                "reconciled": "external_index_missing"}
+                "reconciled": "external_index_missing_or_incomplete",
+                "documents": count, "expected": expected}
 
     # -- 命名/工具 -----------------------------------------------------------------
 

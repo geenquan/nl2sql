@@ -170,10 +170,13 @@ def _dataset_executor_factory(payload: dict, model: dict,
             a["field"]["column"].lower()
             for a in entity.get("attributes", [])}
     source = _metadata_repository().get_source(payload["source_id"])
-    from app.security.credentials import get_credential_store
+    # 复用组装根凭证存储实例（修复 ImportError；找不到凭证安全失败）
+    password = _credential_store().get(source["credential_ref"])
+    if password is None:
+        from app.core.exceptions import CredentialStoreError
 
-    store = get_credential_store()
-    password = store.get(source["credential_ref"]) or ""
+        raise CredentialStoreError(
+            "源数据源凭证不存在或已被删除，无法构建数据集只读执行器")
     return MySQLControlledExecutor(
         host=source["host"], port=int(source["port"]),
         database=source["database"], username=source["username"],

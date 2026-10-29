@@ -179,6 +179,46 @@ curl -s "http://127.0.0.1:8000/api/v1/semantic-models/<mid>/export?version=2&for
 真实演示脚本 `python scripts/m4_real_demo.py`（临时目录、小预算、人工输入
 标注开发演示假设）。
 
+## M5：数据集、主题视图与 ES 宽表（离线闭环可用；发布目标默认关闭）
+
+```bash
+# 1) 创建数据集（服务端核验 M4 门槛；结构化定义不接受 SQL 片段）
+curl -s -X POST http://127.0.0.1:8000/api/v1/sources/<sid>/datasets \
+  -H 'Content-Type: application/json' -d '{
+    "name": "预订聚合", "model_id": "<mid>", "model_version": 2,
+    "topic_id": "topic.app.booking", "kind": "aggregate",
+    "central_entity_id": "app.booking", "grain_keys": ["id"],
+    "preaggregations": [{"metric_id": "...", "output_alias": "a_count",
+      "relationship_key": "...", "scope_note": "按关联键预聚合"}]}'
+
+# 2) 质量验证（独立基准对账；报告绑定指纹）/ 预览（脱敏有界）
+curl -s -X POST "http://127.0.0.1:8000/api/v1/datasets/<did>/validate?version=1"
+curl -s "http://127.0.0.1:8000/api/v1/datasets/<did>/preview?version=1&max_rows=20"
+
+# 3) 发布（view/ES；需先启用目标配置；并发冲突 409）/ 刷新 / 回滚 / 核对
+curl -s -X POST "http://127.0.0.1:8000/api/v1/datasets/<did>/publish?version=1" \
+  -H 'Content-Type: application/json' -d '{"operator":"dev"}'
+curl -s -X POST http://127.0.0.1:8000/api/v1/datasets/<did>/refresh \
+  -H 'Content-Type: application/json' -d '{"operator":"dev"}'
+curl -s -X POST http://127.0.0.1:8000/api/v1/datasets/<did>/rollback \
+  -H 'Content-Type: application/json' -d '{"target_version":1,"operator":"dev"}'
+curl -s -X POST "http://127.0.0.1:8000/api/v1/datasets/<did>/reconcile?version=2"
+
+# 4) 修订产生新版本（旧 SQL/质量报告不背书新定义）/ 版本与运行记录
+curl -s -X POST http://127.0.0.1:8000/api/v1/datasets/<did>/revise \
+  -H 'Content-Type: application/json' -d '{"base_version":1, "filters": [...]}'
+curl -s http://127.0.0.1:8000/api/v1/datasets/<did>/versions
+curl -s http://127.0.0.1:8000/api/v1/datasets/<did>/runs
+```
+
+约束：SQL 只由结构化定义经确定性编译产生（AST 白名单：表/列/函数；
+DDL/DML/多语句拒绝）；预览只读脱敏；一跳明细预聚合保持中心 grain
+（5×5/3 不膨胀，独立基准对账）；质量未通过/报告指纹不匹配/依赖失效
+不能发布；发布/回滚指针原子切换；外部成功本地失败 →
+needs_reconciliation 显式核对恢复。**视图/ES 发布目标默认关闭**
+（实现经离线适配器闭环验证，真实发布未验证）。演示脚本
+`python scripts/m5_real_demo.py`。
+
 ## 目录
 
 ```text

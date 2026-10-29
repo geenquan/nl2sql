@@ -19,6 +19,7 @@ from app.ports.connectors import ConnectorFactory, DataSourceConnector, ProbeFac
 from app.ports.llm import LLMClient
 from app.profiling.profiler import DataProfiler
 from app.security.credentials import CredentialStore, FileCredentialStore
+from app.services.dataset_service import DatasetService
 from app.services.relationship_service import RelationshipService
 from app.services.scan_service import ScanService
 from app.services.semantic_model_service import SemanticModelService
@@ -153,6 +154,68 @@ def get_semantic_model_service() -> SemanticModelService:
     return SemanticModelService(
         metadata_repository=_metadata_repository(),
         settings=_settings(),
+    )
+
+
+def _dataset_executor_factory(payload: dict, model: dict,
+                              settings) -> object:
+    """构建受控只读执行器（白名单来自模型实体；源库连接）。"""
+    from app.adapters.dataset_executors import MySQLControlledExecutor
+
+    tables: dict[str, set[str]] = {}
+    for entity in model.get("entities", []):
+        source = entity.get("source") or {}
+        key = f"{source.get('schema')}.{source.get('table')}".lower()
+        tables[key] = {
+            a["field"]["column"].lower()
+            for a in entity.get("attributes", [])}
+    source = _metadata_repository().get_source(payload["source_id"])
+    from app.security.credentials import get_credential_store
+
+    store = get_credential_store()
+    password = store.get(source["credential_ref"]) or ""
+    return MySQLControlledExecutor(
+        host=source["host"], port=int(source["port"]),
+        database=source["database"], username=source["username"],
+        password=password, allowed_tables=set(tables.keys()),
+        allowed_columns=tables,
+        read_timeout=settings.mysql_read_timeout_seconds)
+
+
+def _view_publisher_factory():
+    from app.adapters.dataset_executors import MySQLViewPublisher
+
+    settings = _settings()
+    dsn = settings.dataset_view_target_dsn.get_secret_value()
+    if not dsn or not settings.dataset_view_target_schema:
+        raise ValueError("视图发布目标未配置（dataset_view_target_dsn/schema）")
+    # DSN 形如 user:password@host:port
+    credentials, _, hostport = dsn.rpartition("@")
+    username, _, password = credentials.partition(":")
+    host, _, port = hostport.partition(":")
+    return MySQLViewPublisher(host=host, port=int(port or 3306),
+                              username=username, password=password)
+
+
+def _es_publisher_factory():
+    from app.adapters.es_publisher import ESHttpPublisher
+
+    settings = _settings()
+    return ESHttpPublisher(
+        hosts=settings.es_hosts, username=settings.es_username,
+        password=settings.es_password, api_key=settings.es_api_key,
+        timeout_seconds=settings.es_request_timeout_seconds,
+        verify_certs=settings.es_verify_certs)
+
+
+def get_dataset_service() -> DatasetService:
+    return DatasetService(
+        metadata_repository=_metadata_repository(),
+        semantic_models=get_semantic_model_service(),
+        settings=_settings(),
+        executor_factory=_dataset_executor_factory,
+        view_publisher_factory=_view_publisher_factory,
+        es_publisher_factory=_es_publisher_factory,
     )
 
 

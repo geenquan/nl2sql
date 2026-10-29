@@ -244,3 +244,73 @@ class SemanticModelRepository(ABC):
     @abstractmethod
     def list_publication_log(self, source_id: str) -> list[dict[str, Any]]:
         """发布/回滚审计记录（按时间倒序）。"""
+
+
+class DatasetRepository(ABC):
+    """M5 数据集持久化端口：版本不可变 + 指针原子切换 + 运行记录。"""
+
+    @abstractmethod
+    def save_dataset(self, payload: dict[str, Any]) -> None:
+        """插入数据集版本（不可变）；(dataset_id, version) 冲突→409。"""
+
+    @abstractmethod
+    def get_dataset(self, dataset_id: str,
+                    version: int | None = None) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def list_datasets(self, source_id: str) -> list[dict[str, Any]]:
+        """每个数据集线最新版本。"""
+
+    @abstractmethod
+    def list_dataset_versions(self, dataset_id: str) -> list[dict[str, Any]]:
+        ...
+
+    @abstractmethod
+    def update_dataset_status(self, dataset_id: str, version: int,
+                              status: str) -> bool:
+        """状态条件更新（仅允许合法转换）；rowcount=0 → 冲突/不匹配。"""
+
+    @abstractmethod
+    def save_plan(self, dataset_id: str, version: int,
+                  plan: dict[str, Any]) -> None:
+        ...
+
+    @abstractmethod
+    def get_latest_plan(self, dataset_id: str,
+                        version: int) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def save_quality(self, dataset_id: str, version: int,
+                     report: dict[str, Any]) -> None:
+        ...
+
+    @abstractmethod
+    def get_latest_quality(self, dataset_id: str,
+                           version: int) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    def save_dataset_run(self, run: dict[str, Any]) -> None:
+        ...
+
+    @abstractmethod
+    def list_dataset_runs(self, dataset_id: str) -> list[dict[str, Any]]:
+        ...
+
+    @abstractmethod
+    def set_published_dataset(
+        self, source_id: str, dataset_id: str, version: int, *,
+        operator: str, expected: int | None = None,
+        action: str = "publish") -> bool:
+        """原子切换数据集发布指针（条件更新；False→并发冲突）。"""
+
+    @abstractmethod
+    def get_published_dataset(self, source_id: str,
+                              dataset_id: str) -> int | None:
+        ...
+
+    @abstractmethod
+    def get_published_dataset_version(self, dataset_id: str) -> int | None:
+        ...

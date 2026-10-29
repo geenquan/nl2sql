@@ -63,6 +63,20 @@ class Settings(BaseSettings):
     relationship_path_max_nodes: int = Field(default=200, ge=1)
     relationship_path_deadline_seconds: int = Field(default=10, gt=0)
 
+    # M5 ES 宽表发布（复用 es_*；显式写入开关默认关闭）
+    dataset_es_publish_enabled: bool = False
+
+    # M5 数据集：只读预览/质量验证；发布目标默认关闭。
+    dataset_preview_rows: int = Field(default=20, gt=0, le=1000)
+    dataset_validation_rows: int = Field(default=1000, gt=0, le=100000)
+    dataset_export_batch_size: int = Field(default=500, gt=0)
+    dataset_export_max_rows: int = Field(default=100000, gt=0)
+    # 视图发布目标（独立连接；默认关闭；只创建应用前缀版本化视图）
+    dataset_view_publish_enabled: bool = False
+    dataset_view_target_dsn: SecretStr = SecretStr("")
+    dataset_view_target_schema: str = ""
+    dataset_view_prefix: str = "nl2sql_ds_"
+
     # M4 语义模型：确定性规则构建 + 人工确认；不调用模型、不新增基础设施。
     semantic_model_max_hops: int = Field(default=2, ge=1, le=4)
     semantic_model_max_paths_per_pair: int = Field(default=3, ge=1, le=10)

@@ -35,8 +35,10 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
 from app.core.exceptions import RevisionConflictError
+from app.domain.datasets import DATASET_STATUS_TRANSITIONS
 from app.domain.relationships import select_effective_relationship
 from app.ports.repositories import (
+    DatasetRepository,
     MetadataRepository,
     RelationshipRepository,
     SemanticModelRepository,
@@ -64,7 +66,7 @@ def _load(raw: str | None, default: Any) -> Any:
 
 class SQLiteMetadataRepository(
     MetadataRepository, SourceRepository, RelationshipRepository,
-    SemanticModelRepository,
+    SemanticModelRepository, DatasetRepository,
 ):
     """实现元数据/数据源/关系/语义模型仓储端口。"""
 
@@ -247,6 +249,34 @@ class SQLiteMetadataRepository(
             Column("operator", String(64)),
             Column("reason", String(500)),
             Column("created_at", String(40)),
+        )
+        # M5 数据集表：版本不可变 + 指针 + 运行/计划/质量记录。
+        self._datasets = Table(
+            "datasets", self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("dataset_id", String(64), nullable=False),
+            Column("version", Integer, nullable=False),
+            Column("source_id", String(36), nullable=False),
+            Column("status", String(24), nullable=False),
+            Column("created_at", String(40)),
+            Column("payload", String(2000000)),
+            UniqueConstraint("dataset_id", "version", name="uq_ds_version"),
+        )
+        self._dataset_pointer = Table(
+            "dataset_pointer", self._metadata,
+            Column("source_id", String(36), primary_key=True),
+            Column("dataset_id", String(64), primary_key=True),
+            Column("version", Integer, nullable=False),
+            Column("updated_at", String(40)),
+        )
+        self._dataset_plans = Table(
+            "dataset_plans", self._metadata,
+            Column("id", String(36), primary_key=True),
+            Column("dataset_id", String(64), nullable=False),
+            Column("version", Integer, nullable=False),
+            Column("kind", String(16), nullable=False),  # plan|quality|run
+            Column("created_at", String(40)),
+            Column("payload", String(2000000)),
         )
         # 开发级建表：不存在则创建；正式迁移方案在 M8 引入。
         self._metadata.create_all(self._engine)
@@ -1169,6 +1199,215 @@ class SQLiteMetadataRepository(
             "action": row.action, "operator": row.operator,
             "reason": row.reason, "created_at": row.created_at,
         } for row in rows]
+
+    # -- M5 数据集持久化 ---------------------------------------------------------
+
+    def save_dataset(self, payload: dict[str, Any]) -> None:
+        from uuid import uuid4 as _uuid4
+
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(self._datasets.insert().values(
+                    id=_uuid4().hex,
+                    dataset_id=payload["dataset_id"],
+                    version=int(payload["version"]),
+                    source_id=payload["source_id"],
+                    status=payload.get("status", "draft"),
+                    created_at=payload.get("created_at") or _now(),
+                    payload=_dump(payload),
+                ))
+        except IntegrityError:
+            raise RevisionConflictError(
+                f"数据集版本冲突：{payload['dataset_id']} "
+                f"v{payload['version']} 已存在") from None
+
+    def get_dataset(self, dataset_id: str,
+                    version: int | None = None) -> dict[str, Any] | None:
+        conditions = [self._datasets.c.dataset_id == dataset_id]
+        if version is not None:
+            conditions.append(self._datasets.c.version == int(version))
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(self._datasets).where(and_(*conditions))
+                .order_by(self._datasets.c.version.desc()).limit(1)
+            ).first()
+        return dict(_load(row.payload, {})) if row else None
+
+    def list_datasets(self, source_id: str) -> list[dict[str, Any]]:
+        rows = self._dataset_rows(
+            self._datasets.c.source_id == source_id)
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest.setdefault(row["dataset_id"], row)
+        return [latest[key] for key in sorted(latest)]
+
+    def list_dataset_versions(self, dataset_id: str) -> list[dict[str, Any]]:
+        return self._dataset_rows(self._datasets.c.dataset_id == dataset_id)
+
+    def _dataset_rows(self, where_clause: Any) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._datasets).where(where_clause)
+                .order_by(self._datasets.c.version.desc())
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    def update_dataset_status(self, dataset_id: str, version: int,
+                              status: str) -> bool:
+        """状态条件更新（转换合法性在 SQL 外核验后条件写回）。"""
+        current = self.get_dataset(dataset_id, version)
+        if current is None:
+            return False
+        allowed = DATASET_STATUS_TRANSITIONS.get(current.get("status"), ())
+        if status != current.get("status") and status not in allowed:
+            return False
+        current["status"] = status
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                self._datasets.update().where(
+                    self._datasets.c.dataset_id == dataset_id,
+                    self._datasets.c.version == int(version),
+                    self._datasets.c.status != status,
+                ).values(status=status, payload=_dump(current)))
+            if result.rowcount == 0:
+                return False
+        with self._engine.begin() as conn:
+            from uuid import uuid4 as _uuid4
+
+            conn.execute(
+                self._dataset_plans.insert().values(
+                    id=_uuid4().hex, dataset_id=dataset_id,
+                    version=int(version), kind="status",
+                    created_at=_now(),
+                    payload=_dump({"status": status, "at": _now()})))
+        return True
+
+    def save_plan(self, dataset_id: str, version: int,
+                  plan: dict[str, Any]) -> None:
+        from uuid import uuid4 as _uuid4
+
+        with self._engine.begin() as conn:
+            conn.execute(self._dataset_plans.insert().values(
+                id=_uuid4().hex, dataset_id=dataset_id, version=int(version),
+                kind="plan", created_at=_now(), payload=_dump(plan)))
+
+    def get_latest_plan(self, dataset_id: str,
+                        version: int) -> dict[str, Any] | None:
+        return self._latest_aux(dataset_id, version, "plan")
+
+    def save_quality(self, dataset_id: str, version: int,
+                     report: dict[str, Any]) -> None:
+        from uuid import uuid4 as _uuid4
+
+        with self._engine.begin() as conn:
+            conn.execute(self._dataset_plans.insert().values(
+                id=_uuid4().hex, dataset_id=dataset_id, version=int(version),
+                kind="quality", created_at=_now(), payload=_dump(report)))
+
+    def get_latest_quality(self, dataset_id: str,
+                           version: int) -> dict[str, Any] | None:
+        return self._latest_aux(dataset_id, version, "quality")
+
+    def save_dataset_run(self, run: dict[str, Any]) -> None:
+        """按 run_id upsert（running→finished 同一记录更新）。"""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        record = {"kind": "run", "run": run}
+        values = {
+            "id": run["run_id"], "dataset_id": run["dataset_id"],
+            "version": int(run["dataset_version"]), "kind": "run",
+            "created_at": _now(), "payload": _dump(record)}
+        with self._engine.begin() as conn:
+            conn.execute(
+                sqlite_insert(self._dataset_plans).values(values)
+                .on_conflict_do_update(
+                    index_elements=[self._dataset_plans.c.id],
+                    set_={"payload": values["payload"],
+                          "created_at": values["created_at"]}))
+
+    def list_dataset_runs(self, dataset_id: str) -> list[dict[str, Any]]:
+        rows = self._aux_rows(dataset_id, "run")
+        return [row["run"] for row in rows]
+
+    def _latest_aux(self, dataset_id: str, version: int, kind: str) \
+            -> dict[str, Any] | None:
+        rows = self._aux_rows(dataset_id, kind, version)
+        return rows[0] if rows else None
+
+    def _aux_rows(self, dataset_id: str, kind: str,
+                  version: int | None = None) -> list[dict[str, Any]]:
+        conditions = [
+            self._dataset_plans.c.dataset_id == dataset_id,
+            self._dataset_plans.c.kind == kind,
+        ]
+        if version is not None:
+            conditions.append(self._dataset_plans.c.version == int(version))
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(self._dataset_plans).where(and_(*conditions))
+                .order_by(self._dataset_plans.c.created_at.desc(),
+                          self._dataset_plans.c.id.desc())
+            ).fetchall()
+        return [dict(_load(row.payload, {})) for row in rows]
+
+    def set_published_dataset(
+        self, source_id: str, dataset_id: str, version: int, *,
+        operator: str, expected: int | None = None,
+        action: str = "publish") -> bool:
+        """原子条件切换数据集发布指针（条件 UPDATE / INSERT 竞争仲裁）。"""
+
+        with self._engine.begin() as conn:
+            current = conn.execute(
+                select(self._dataset_pointer).where(
+                    self._dataset_pointer.c.source_id == source_id,
+                    self._dataset_pointer.c.dataset_id == dataset_id,
+                )).first()
+            if (expected is not None
+                    and (current is None or current.version != expected)):
+                return False
+            if current is None:
+                try:
+                    conn.execute(self._dataset_pointer.insert().values(
+                        source_id=source_id, dataset_id=dataset_id,
+                        version=int(version), updated_at=_now()))
+                except IntegrityError:
+                    return False
+            else:
+                if expected is None:
+                    expected = current.version
+                result = conn.execute(
+                    self._dataset_pointer.update().where(
+                        self._dataset_pointer.c.source_id == source_id,
+                        self._dataset_pointer.c.dataset_id == dataset_id,
+                        self._dataset_pointer.c.version == expected,
+                    ).values(version=int(version), updated_at=_now()))
+                if result.rowcount == 0:
+                    return False
+            from uuid import uuid4 as _uuid4
+
+            conn.execute(self._dataset_plans.insert().values(
+                id=_uuid4().hex, dataset_id=dataset_id,
+                version=int(version), kind="publish_log",
+                created_at=_now(),
+                payload=_dump({"action": action, "operator": operator,
+                               "version": version, "at": _now()})))
+        return True
+
+    def get_published_dataset(self, source_id: str,
+                              dataset_id: str) -> int | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(select(self._dataset_pointer).where(
+                self._dataset_pointer.c.source_id == source_id,
+                self._dataset_pointer.c.dataset_id == dataset_id,
+            )).first()
+        return int(row.version) if row else None
+
+    def get_published_dataset_version(self, dataset_id: str) -> int | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(select(self._dataset_pointer).where(
+                self._dataset_pointer.c.dataset_id == dataset_id,
+            )).first()
+        return int(row.version) if row else None
 
 
 def _new_id() -> str:

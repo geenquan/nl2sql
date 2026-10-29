@@ -298,7 +298,66 @@
 - 指标含表达式、去重规则、过滤条件和时间口径
 - 来源、状态、版本和权限策略
 
-## 数据集定义
+## 数据集定义（M5 已实现，dataset-v1）
+
+- 标识：dataset_id、version（不可变）；source_id、snapshot_id、
+  model_id+model_version、topic_id、central_entity_id
+- grain：中心表有序键列表+业务描述；**一行=中心 grain 的一个键值**
+- 两类首版：detail_view（中心字段+沿 validated many_to_one/one_to_one
+  的维度 LEFT/INNER JOIN，默认 LEFT 保留中心行缺失记 NULL）；
+  aggregate（中心 grain 分组 + **一跳明细预聚合**：明细按指向中心的
+  完整关联键分组独立聚合→关联键上至多一行→再连中心表；5×5/3 不膨胀；
+  不用 DISTINCT/SUM(DISTINCT) 掩盖错误 JOIN；AVG=SUM/COUNT 口径）
+- 引用：M4 formal_metric_ids 指标（服务端从仓储重载校验，不信任客户端
+  status）；关系键+修订+方向+有序映射（该快照 validated 修订）
+- 类型化过滤：值参数化（pyformat）；过滤位置区分（维度列入 ON 不改
+  LEFT 语义；明细表列首版拒绝）；进视图定义时类型化字面量编译
+- 指纹：definition_fingerprint（定义变化即失效旧 SQL/质量报告）+
+  plan_fingerprint（SQL+参数形状）
+- 状态：draft→validating→ready/failed_validation→publishing→published/
+  failed_publish/**needs_reconciliation**（外部成功本地失败→显式核对
+  恢复；不伪装成功不盲目删除）；并发由状态条件更新+指针原子切换仲裁
+
+## M5 SQL 编译与执行安全（已实现）
+
+- 编译：标识符全部来自模型白名单+反引号；输出别名唯一稳定；血缘
+  （输出别名→来源字段+角色）；dialect=mysql
+- AST 校验（sqlglot）：单 SELECT/受控 CTE；表/列白名单（别名作用域
+  解析；CTE 内部对象豁免）；函数白名单；DDL/DML/多语句/分号/文件
+  输出/锁定读/危险函数拒绝；pyformat 占位替换后解析
+- 执行端口：ControlledQueryExecutor 只接受已校验 SQL（执行前强制）；
+  MySQL 连接级 READ ONLY；SELECT 执行器不接受 DDL——视图 DDL 在
+  独立 ViewPublisher 端口
+- 预算：预览行数（20）/质量窗口（1000）/导出批次与硬上限；截断
+  如实标记（LIMIT 不宣称限制扫描量）
+
+## M5 质量报告（dataset-quality-v1）
+
+- 每项：检查项/期望/实际/分母/范围/口径(exact|sample|unknown)/
+  结果(passed|failed|incomplete)/原因；报告绑定 dataset_version+
+  双指纹+model_version+snapshot（定义变化后必须重验）
+- 检查：grain 非空/唯一（窗口 sample 不冒充全量）；中心行数↔中心表
+  独立计数；JOIN 覆盖率；必填缺失；**明细预聚合↔各明细表独立分组
+  聚合对账**（Decimal 容差 0.01）；中心指标↔中心表独立聚合
+- 独立基准不重复执行生成 SQL；金额 Decimal 策略；空数据区分
+  不适用/通过；时点证据（元数据快照≠源数据事务快照）
+- 发布门槛：质量通过+报告指纹匹配定义+M4 依赖重载校验
+
+## M5 视图与 ES 发布（已实现；真实发布未验证）
+
+- 视图：独立目标 DSN/Schema（默认关闭）；应用前缀版本化视图名
+  （nl2sql_ds_前缀）；不覆盖用户对象（已存在→幂等刷新或 409）；
+  回滚=指针切回仍 published 的旧版本（视图不删除）
+- ES：显式 mapping；grain→SHA256 文档 ID（组合键无歧义编码）；
+  NULL/重复 grain 阻断（不静默覆盖）；Decimal→字符串（金额精度）；
+  仅导出显式选定字段；分批 bulk+逐项结果检查（永久失败阻断/可重试
+  有限重试）；行数核对后原子切换应用别名；版本索引保留不删除；
+  导出硬上限触发失败（不切换别名）
+- 外部目标与本地指针不跨库原子：先记录发布尝试→创建版本目标→
+  验证→切换指针；外部成功本地失败→needs_reconciliation（显式
+  reconcile 核对外部对象存在性后恢复）
+
+## 数据集定义（历史约定，保留参考）
 - 名称、主题、grain、一行代表什么
 - 来源表、关系路径、字段和指标
 - 生成 SQL、质量检查、刷新策略

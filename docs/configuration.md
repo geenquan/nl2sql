@@ -270,6 +270,37 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
   扫描≤5 表×50 行、M3 验证≤3 候选×45 条 SQL 逐语句硬预算；不调用模型；
   人工输入标注为开发演示假设；真实不可覆盖的流程用合成夹具清楚区分）。
 
+## M5 数据集与发布目标（已实现；发布目标默认关闭）
+
+| 配置项 | 默认值 / 用途 |
+| --- | --- |
+| `DATASET_PREVIEW_ROWS` | `20`，数据预览行数上限（脱敏展示） |
+| `DATASET_VALIDATION_ROWS` | `1000`，质量验证窗口行数（exact/sample 口径判定） |
+| `DATASET_EXPORT_BATCH_SIZE` | `500`，ES 导出批次大小 |
+| `DATASET_EXPORT_MAX_ROWS` | `100000`，ES 导出硬上限（达到即失败不切别名） |
+| `DATASET_VIEW_PUBLISH_ENABLED` | `false`，MySQL 视图发布开关（独立目标连接；不写源库） |
+| `DATASET_VIEW_TARGET_DSN` | 空，目标 DSN `user:password@host:port`（目标须能读来源表；首版同实例） |
+| `DATASET_VIEW_TARGET_SCHEMA` | 空，目标 Schema（应用拥有视图的命名空间） |
+| `DATASET_VIEW_PREFIX` | `nl2sql_ds_`，应用视图名前缀 |
+| `DATASET_ES_PUBLISH_ENABLED` | `false`，ES 宽表发布开关（复用 `ES_*` 连接配置） |
+
+说明：
+
+- **源库只读边界**：`DATA_MYSQL_*` 不创建视图、不建表、不写入；
+  `ALLOW_SOURCE_DB_WITES` 不为 M5 打开；`BIZ_MYSQL_*` 不自动当作发布
+  目标。视图发布使用独立显式配置的目标连接，只创建应用前缀版本化视图，
+  不覆盖用户对象；SELECT 执行器（预览/质量）与 DDL 发布器是分离端口。
+- **ES 发布边界**：只管理 `nl2sql_wide` 前缀命名空间；版本索引+应用
+  别名切换；不删除旧索引、不使用通配符删除。
+- **实现已测试、真实发布未验证**：视图/ES 发布代码经 SQLite 视图适配
+  器与 ES 替身（可控故障注入）离线闭环验证；未对真实 MySQL/ES 执行
+  创建操作。启用前需配置目标并做小范围真实验证。
+- SQL 编译/AST 白名单依赖 **sqlglot**（本轮新增运行时依赖，已声明
+  pyproject）。
+- 真实只读演示：`python scripts/m5_real_demo.py`（临时元数据/凭证；
+  扫描≤5 表×50 行、M3≤3 候选×45 SQL、M5 预览≤20 行/质量≤50 SQL；
+  不调用模型、不访问 ES、不发布远端目标；合成段完整闭环清楚区分）。
+
 ## 登录与 JWT
 
 `LOGIN_ENABLED` 和 `JWT_SECRET` 已映射到同名小写配置属性，JWT 密钥使用 `SecretStr`。

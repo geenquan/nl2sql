@@ -1254,12 +1254,14 @@ class SQLiteMetadataRepository(
 
     def update_dataset_status(self, dataset_id: str, version: int,
                               status: str) -> bool:
-        """状态条件更新（转换合法性在 SQL 外核验后条件写回）。"""
+        """状态原子条件更新（修复轮：期望当前状态进入 WHERE——
+        并发同目标状态恰一成功，另一 rowcount=0 返回 False）。"""
         current = self.get_dataset(dataset_id, version)
         if current is None:
             return False
-        allowed = DATASET_STATUS_TRANSITIONS.get(current.get("status"), ())
-        if status != current.get("status") and status not in allowed:
+        expected_status = current.get("status")
+        allowed = DATASET_STATUS_TRANSITIONS.get(expected_status, ())
+        if status != expected_status and status not in allowed:
             return False
         current["status"] = status
         with self._engine.begin() as conn:
@@ -1267,11 +1269,10 @@ class SQLiteMetadataRepository(
                 self._datasets.update().where(
                     self._datasets.c.dataset_id == dataset_id,
                     self._datasets.c.version == int(version),
-                    self._datasets.c.status != status,
+                    self._datasets.c.status == expected_status,
                 ).values(status=status, payload=_dump(current)))
             if result.rowcount == 0:
-                return False
-        with self._engine.begin() as conn:
+                return False  # 并发窗口：状态已被另一写入变更
             from uuid import uuid4 as _uuid4
 
             conn.execute(

@@ -467,6 +467,15 @@ class DatasetService:
         view_name = self._view_name(payload)
         external_created = False
         try:
+            # 数据集级仲裁（修复轮）：检查同数据集无其他 publishing 版本
+            # （跨版本同样受控——不能 v1 和 v2 同时发布）
+            for other in self._repo.list_dataset_versions(
+                    payload["dataset_id"]):
+                if other["version"] != payload["version"] and \
+                        other.get("status") == "publishing":
+                    raise RevisionConflictError(
+                        f"数据集级发布冲突：另一版本 v{other['version']} "
+                        "正在发布中（同数据集同时只允许一个发布操作）")
             if not self._repo.update_dataset_status(
                     payload["dataset_id"], payload["version"], "publishing"):
                 raise RevisionConflictError(
@@ -549,6 +558,14 @@ class DatasetService:
         alias_name = self._es_alias_name(payload)
         external_created = False
         try:
+            # 数据集级仲裁（修复轮）：同数据集跨版本互斥
+            for other in self._repo.list_dataset_versions(
+                    payload["dataset_id"]):
+                if other["version"] != payload["version"] and \
+                        other.get("status") == "publishing":
+                    raise RevisionConflictError(
+                        f"数据集级发布冲突：另一版本 v{other['version']} "
+                        "正在发布中（同数据集同时只允许一个发布操作）")
             if not self._repo.update_dataset_status(
                     payload["dataset_id"], payload["version"], "publishing"):
                 raise RevisionConflictError(
@@ -687,21 +704,31 @@ class DatasetService:
 
     def refresh(self, dataset_id: str, *, operator: str = "local-dev") \
             -> dict[str, Any]:
+        """刷新：实际重新验证当前源数据（修复轮：不直接复用旧报告）。
+
+        已发布版本的刷新＝重置为 draft→重验→幂等发布；
+        质量失败时保持旧发布版本和别名不变。
+        """
         current = self._repo.get_published_dataset_version(dataset_id)
         if current is None:
             raise ResourceNotFoundError(
                 "dataset", f"数据集没有已发布版本：{dataset_id}")
         payload = self._repo.get_dataset(dataset_id, version=current)
-        # 刷新＝对当前发布版本重跑质量；通过后幂等发布（目标已存在则复用）
-        if payload.get("status") in ("draft", "failed_validation"):
-            report = self.validate(dataset_id, current)
-            if report.get("status") == "failed_validation":
-                return {"dataset_id": dataset_id, "version": current,
-                        "refreshed": False,
-                        "reason": "质量验证未通过（发布版本保持不变）"}
-        elif payload.get("status") == "published":
-            # 已发布版本：直接幂等发布（视图存在 → 复用；不重复创建）
-            pass
+        if payload.get("status") == "published" and \
+                not self._repo.update_dataset_status(
+                    dataset_id, current, "draft"):
+            # 已发布版本刷新：重置为 draft 强制重验（不直接复用旧报告）
+            return {"dataset_id": dataset_id, "version": current,
+                    "refreshed": False,
+                    "reason": "版本状态无法重置（并发变更）"}
+        report = self.validate(dataset_id, current)
+        if report.get("status") == "failed_validation":
+            # 恢复为 published（旧发布保持有效）
+            self._repo.update_dataset_status(dataset_id, current,
+                                            "published")
+            return {"dataset_id": dataset_id, "version": current,
+                    "refreshed": False,
+                    "reason": "质量验证未通过（发布版本保持不变）"}
         return self.publish(dataset_id, current, operator=operator)
 
     def rollback(self, dataset_id: str, target_version: int, *,

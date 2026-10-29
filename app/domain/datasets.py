@@ -43,7 +43,8 @@ DATASET_STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
     # 不在→failed_publish
     "needs_reconciliation": ("publishing", "draft", "published",
                              "failed_publish"),
-    "published": ("publishing",),  # 重新刷新/发布新目标
+    # draft 仅用于刷新重验（refresh 重置后走 draft→validating→ready→publishing→published）
+    "published": ("publishing", "draft"),
 }
 # 发布目标
 DATASET_TARGETS: tuple[str, ...] = ("view", "elasticsearch")

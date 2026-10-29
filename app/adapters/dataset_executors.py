@@ -65,12 +65,13 @@ class ControlledExecutorBase(ControlledQueryExecutor):
         return (rows[:max_rows], truncated)
 
     def _adapt_params(self, sql: str) -> str:
-        """编译产物统一使用 pyformat %(name)s 占位；SQLite 方言转 :name。"""
-        if self._dialect == "sqlite":
-            import re as _re
+        """编译产物统一使用 pyformat %(name)s 占位（修复轮：两种方言
+        均转换为 SQLAlchemy :name 命名绑定——MySQL 方言下 text() 不会
+        将 %(name)s 识别为绑定参数，会产生 %% 转义导致 compiled.params
+        为空）。"""
+        import re as _re
 
-            return _re.sub(r"%\((\w+)\)s", r":\1", sql)
-        return sql
+        return _re.sub(r"%\((\w+)\)s", r":\1", sql)
 
     def close(self) -> None:
         self._engine.dispose()
@@ -184,39 +185,71 @@ class SQLiteViewPublisher(ViewPublisher):
     @staticmethod
     def _inline_params(select_sql: str, params: dict[str, Any] | None,
                        dialect: str = "sqlite") -> str:
-        """类型化字面量编译（方言相容；修复轮：MySQL 不复用 SQLite 转义）。
+        """AST 单趟参数字面量化（修复轮：彻底移除逐参数字符串替换）。
 
-        使用 sqlglot 方言 literal 生成（引号/反斜杠/Unicode/注释形态均为
-        单个字面量节点，不产生额外 SQL 结构）；数值/布尔/NULL/字符串支持。
+        解析原始 SQL 为 AST，将参数占位符替换为类型化字面量节点后
+        序列化——值中含 "%(pN)s" 形态也只是一段字符串数据，不会被
+        后续替换扫描产生注入。拒绝 NaN/Infinity；完成后重新过
+        语句类型校验。
         """
         if not params:
             return select_sql
-        def literal(value: Any) -> str:
+        import math
+
+        import sqlglot
+        from sqlglot import exp as _exp
+
+        def _literal_node(value: Any) -> _exp.Expression:
             if value is None:
-                return "NULL"
+                return _exp.null()
             if isinstance(value, bool):
-                return "TRUE" if value else "FALSE"
+                return _exp.true() if value else _exp.false()
             if isinstance(value, (int, float)):
-                return repr(value)
+                if isinstance(value, float) and (
+                        math.isnan(value) or math.isinf(value)):
+                    raise ValueError(
+                        f"视图定义不支持 NaN/Infinity 数值：{value}")
+                return _exp.Literal.number(str(value))
             if isinstance(value, str):
-                # 方言相容字面量（修复轮：MySQL 不复用 SQLite 转义）。
-                # MySQL：反斜杠转义 + 单引号反斜杠转义；SQLite：单引号加倍。
-                # 注释形态（-- /* */）在字符串字面量内无语法含义。
-                if dialect == "mysql":
-                    escaped = value.replace("\\", "\\\\").replace(
-                        "'", "\\'")
-                    return f"'{escaped}'"
-                escaped = value.replace("'", "''")
-                return f"'{escaped}'"
+                return _exp.Literal.string(value)
             raise ValueError(
                 f"视图定义不支持该参数类型：{type(value).__name__}")
 
-        sql = select_sql
-        for name, value in params.items():
-            sql = sql.replace(f"%({name})s", literal(value))
-        if "%(" in sql:
-            raise ValueError("视图定义存在未消费的参数占位符")
-        return sql
+        # 将 pyformat %(name)s 替换为 :name（sqlglot 解析为 Placeholder）
+        import re as _re
+
+        placeholder_sql = _re.sub(r"%\((\w+)\)s", r":\1", select_sql)
+        try:
+            tree = sqlglot.parse_one(placeholder_sql, read=dialect)
+        except Exception as exc:  # noqa: BLE001 - 解析失败即拒绝
+            raise ValueError(
+                f"视图 SQL 解析失败（{type(exc).__name__}）") from None
+
+        # 单趟：将所有命名占位符节点替换为字面量
+        replaced: set[str] = set()
+        for node in list(tree.find_all(_exp.Placeholder)):
+            # Placeholder 的 this 为参数名标识符
+            name = (node.name or node.this
+                    if isinstance(node.this, str) else str(
+                        node.this or ""))
+            if not name:
+                continue
+            name = str(name)
+            if name in params:
+                node.replace(_literal_node(params[name]))
+                replaced.add(name)
+
+        missing = set(params) - replaced
+        if missing:
+            raise ValueError(
+                f"视图定义存在未消费的参数占位符：{', '.join(sorted(missing))}")
+
+        result = tree.sql(dialect=dialect)
+        # 完成后重新过语句类型校验（防御性）
+        from app.datasets.safety import validate_statement_type
+
+        validate_statement_type(result, dialect=dialect)
+        return result
 
 
 class MySQLViewPublisher(ViewPublisher):

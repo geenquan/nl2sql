@@ -105,6 +105,30 @@ class DatasetCompiler:
             params[name] = value
             return f"%({name})s"
 
+        def _metric_filters_sql(
+            metric: dict[str, Any], alias: str,
+        ) -> list[str]:
+            """M4 指标结构化过滤 → 参数化谓词列表（作用于该指标的计算范围）。"""
+            entity = whitelist.entities.get(metric.get("entity_id")) or {}
+            source = entity.get("source") or {}
+            predicates: list[str] = []
+            for flt in metric.get("filters") or []:
+                ref = flt.get("field") or {}
+                # 过滤字段必须属于指标实体
+                if (ref.get("schema"), ref.get("table")) != (
+                        source.get("schema"), source.get("table")):
+                    raise ValueError(
+                        f"指标过滤字段不属于指标实体：{ref.get('table')}"
+                        f".{ref.get('column')}")
+                whitelist.require_column(
+                    ref.get("schema", ""), ref.get("table", ""),
+                    ref.get("column", ""))
+                qualifier = f"{alias}.{quote(ref['column'])}"
+                predicates.append(self._predicate(
+                    qualifier, flt.get("operator", "eq"), flt.get("value"),
+                    _param))
+            return predicates
+
         # 中心 grain 键 + 字段
         for key in spec.grain_keys:
             whitelist.require_column(c_schema, c_table, key)
@@ -196,13 +220,18 @@ class DatasetCompiler:
                     f"预聚合指标必须属于明细表实体：{pre['metric_id']}")
             group_cols = list(relation["source"]["columns"])
             metric_sql = self._metric_expression(metric, whitelist, "pa")
+            # M4 指标过滤（修复轮：作用于明细聚合前——与独立基准同口径）
+            metric_predicates = _metric_filters_sql(metric, "pa")
+            cte_where = f" WHERE {' AND '.join(metric_predicates)}" \
+                if metric_predicates else ""
             cte_name = f"pa_{index}"
             select_cte = [f"pa.{quote(col)} AS {quote(col)}"
                           for col in group_cols]
             select_cte.append(f"{metric_sql} AS {quote(pre['output_alias'])}")
             ctes.append(
                 f"{cte_name} AS (SELECT {', '.join(select_cte)} "
-                f"FROM {qualified(detail_schema, detail_table, 'pa')} "
+                f"FROM {qualified(detail_schema, detail_table, 'pa')}"
+                f"{cte_where} "
                 f"GROUP BY {', '.join(f'pa.{quote(c)}' for c in group_cols)})")
             join_on = " AND ".join(
                 f"{cte_name}.{quote(sc)} = c0.{quote(tc)}"
@@ -224,10 +253,15 @@ class DatasetCompiler:
             del detail_key
 
         # 中心表直接聚合指标（aggregate 类型）
+        # M4 指标过滤：首版中心直接指标的过滤与数据集 WHERE 合并
+        # （同作用于中心表；不与其他指标的过滤混淆——各指标独立编译）
+        central_metric_filters: list[str] = []
         for metric_sel in spec.metrics:
             metric = whitelist.metrics.get(metric_sel["metric_id"])
             if metric is None:
                 raise ValueError(f"指标不在模型：{metric_sel['metric_id']}")
+            central_metric_filters.extend(
+                _metric_filters_sql(metric, "c0"))
             expr = self._metric_expression(metric, whitelist, "c0")
             alias = _alias(metric_sel.get("output_alias")
                            or metric_sel["metric_id"].rsplit(".", 1)[-1])
@@ -268,8 +302,10 @@ class DatasetCompiler:
                     extra = " AND ".join(dim_on_conditions[alias])
                     joins[index] = f"{join} AND ({extra})"
 
-        where = f" WHERE {' AND '.join(central_conditions)}" \
-            if central_conditions else ""
+        all_central_conditions = central_conditions + \
+            central_metric_filters
+        where = f" WHERE {' AND '.join(all_central_conditions)}" \
+            if all_central_conditions else ""
         with_clause = f"WITH {', '.join(ctes)}\n" if ctes else ""
         group_by = ""
         if spec.grain_keys:

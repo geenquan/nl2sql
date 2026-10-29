@@ -316,28 +316,52 @@ class TestDefinitionValidation:
 
 class TestMetricFilterCompilation:
     def test_m4_metric_filters_applied_to_sql_and_benchmark(self, env):
-        """M4 指标过滤编译（批次 2 保留项——如实标记未完成）。"""
-        pytest.skip(
-            "M4 指标结构化过滤编译进数据集 SQL 为批次 2 保留项"
-            "（首版预聚合 CTE 未携带指标级过滤；不放宽对账断言）")
+        """M4 指标 qty>=3 过滤编译进预聚合 CTE + 独立基准对账。
+
+        夹具 detail_a qty 范围：booking 1:1..5, 2:1..4, 3:1..3, 4:1..2, 5:1。
+        过滤 qty>=3 后：booking 1→3 行, 2→2 行, 3→1 行, 4→0, 5→0。
+        LEFT JOIN 无补零：4/5 为 NULL。
+        预期：{1:3, 2:2, 3:1, 4:NULL, 5:NULL}。
+        """
+        from app.domain.relationships import relationship_key
         from tests.semantic_model_fixtures import SCHEMA as APP
 
-        model = env["model_service"].get_model(
+        # 通过 M4 修订流程给 detail_a 指标加 qty>=3 过滤
+        model_service = env["model_service"]
+        model = model_service.get_model(
             env["model"]["model_id"], version=env["model"]["version"])
-        # 给 detail_a 的 count_rows 指标加 qty >= 3 过滤
         detail_metric = next(
             (m for m in model["metrics"]
              if m["entity_id"] == f"{APP}.detail_a"
              and m["aggregation"] == "count_rows"), None)
-        if detail_metric is None:
-            pytest.skip("夹具无 detail_a 指标")
-        from app.domain.relationships import relationship_key
+        assert detail_metric is not None, "夹具缺少 detail_a 指标"
+
+        # M4 修订：给指标加 qty>=3 过滤
+        revised = model_service.revise_model(
+            model["model_id"], model["version"], {
+                "metrics": {detail_metric["metric_id"]: {
+                    "action": "update",
+                    "filters": [{"field": {
+                        "schema": APP, "table": "detail_a",
+                        "column": "qty"},
+                        "operator": "ge", "value": 3}]}}},
+            reviewer="dev")
+        # 重新确认使指标在 formal 集合
+        reconfirmed = model_service.revise_model(
+            revised["model_id"], revised["version"], {
+                "metrics": {detail_metric["metric_id"]: {
+                    "action": "confirm", "time_basis": "自然日",
+                    "skip_status_filter": True}}},
+            reviewer="dev")
+        model_service.publish_model(
+            reconfirmed["model_id"], reconfirmed["version"], reviewer="dev")
+
         rel_key = relationship_key(
             env["source_id"], APP, "detail_a", ["booking_id"],
             APP, "booking", ["id"])
         definition = {
-            "name": "过滤口径聚合", "model_id": env["model"]["model_id"],
-            "model_version": env["model"]["version"], "kind": "aggregate",
+            "name": "过滤口径聚合", "model_id": reconfirmed["model_id"],
+            "model_version": reconfirmed["version"], "kind": "aggregate",
             "central_entity_id": f"{APP}.booking",
             "topic_id": f"topic.{APP}.booking",
             "grain_keys": ["id"], "grain_statement": "一行代表一次预订",
@@ -351,19 +375,27 @@ class TestMetricFilterCompilation:
         }
         service = make_service(env)
         dataset = service.create_dataset(env["source_id"], definition)
-        service.validate(dataset["dataset_id"], dataset["version"])
-        # 质量必须验证过滤口径（qty>=3 的行才计入）
+        result = service.validate(dataset["dataset_id"], dataset["version"])
+        # 质量验证通过（过滤口径经独立基准对账）
+        assert result["status"] == "ready", (
+            f"质量验证未通过：{result['quality']}")
+        # 预聚合对账检查通过
+        pre_checks = [
+            c for c in result["quality"]["checks"]
+            if c["check"] == "preaggregation_reconciliation"]
+        assert all(c["outcome"] == "passed" for c in pre_checks)
+
+        # 预览：逐行断言准确值
         preview = service.preview(
             dataset["dataset_id"], dataset["version"])
+        counts = {}
         for row in preview["rows"]:
-            count = row.get("a_filtered")
-            if count is not None:
-                # detail_a 每个 booking 的行：qty 1..5 → qty>=3 后各 3 行
-                assert int(str(count)) <= 3, (
-                    f"过滤未生效：{count} > 3（qty 范围 1..5 中 >=3 的行数）")
-
-
-# == 批次 2.8：截断不得 ready ====================================================
+            bid = str(row["id"])
+            val = row.get("a_filtered")
+            counts[bid] = None if val in (None, "None") else int(str(val))
+        # qty>=3 后各中心行的明细 A 计数（LEFT JOIN 无补零）
+        assert counts == {"1": 3, "2": 2, "3": 1, "4": None, "5": None}, (
+            f"过滤未生效或值不准确：{counts}")
 
 
 class TestTruncationGate:

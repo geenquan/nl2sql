@@ -273,6 +273,7 @@ def _preaggregation_reconciliation(
         measure = (metric.get("measure_field") or {}).get("column")
         group_cols = relation["source"]["columns"]
         # 独立基准：明细表直接按关联键分组聚合（与生成 SQL 不同对象）
+        # 修复轮：应用 M4 指标的结构化过滤（同业务口径独立表达）
         columns = ", ".join(f"`{c}`" for c in group_cols)
         if metric["aggregation"] == "count_rows":
             aggregate = "COUNT(*)"
@@ -294,12 +295,47 @@ def _preaggregation_reconciliation(
                 expected="聚合可独立表达", outcome="failed",
                 reason=f"不支持对账的聚合：{metric['aggregation']}"))
             continue
+        # 指标过滤谓词（独立表达——与编译器产物不同代码路径）
+        benchmark_conditions: list[str] = []
+        bench_params: dict[str, Any] = {}
+        for flt in metric.get("filters") or []:
+            ref = flt.get("field") or {}
+            column = f"`{ref.get('column', '')}`"
+            op = flt.get("operator", "eq")
+            if op == "is_null":
+                benchmark_conditions.append(f"{column} IS NULL")
+            elif op == "not_null":
+                benchmark_conditions.append(f"{column} IS NOT NULL")
+            elif op in ("in", "not_in"):
+                values = flt.get("value") or []
+                if isinstance(values, list) and values:
+                    names = ", ".join(
+                        f":b{len(bench_params)}{_i}"
+                        for _i, _v in enumerate(values))
+                    for _i, _v in enumerate(values):
+                        bench_params[f"b{len(bench_params) - 1}{_i}"] = _v
+                    # 简化：用单参数占位（值列表以 JSON 形式传递不可行——
+                    # 直接用值生成 IN 占位）
+                    # 实际由执行器参数化处理
+                    benchmark_conditions.append(
+                        f"{column} {op.upper().replace('_', ' ')} "
+                        f"({names})")
+            else:
+                sql_op = {"eq": "=", "ne": "<>", "gt": ">",
+                          "ge": ">=", "lt": "<", "le": "<="}.get(op, "=")
+                param_name = f"b{len(bench_params)}"
+                bench_params[param_name] = flt.get("value")
+                benchmark_conditions.append(
+                    f"{column} {sql_op} :{param_name}")
+        bench_where = (" WHERE " + " AND ".join(benchmark_conditions)
+                       if benchmark_conditions else "")
         benchmark_sql = (
             f"SELECT {columns}, {aggregate} AS agg FROM "
-            f"`{detail_source['schema']}`.`{detail_source['table']}` "
+            f"`{detail_source['schema']}`.`{detail_source['table']}`"
+            f"{bench_where} "
             f"GROUP BY {columns}")
         bench_rows, bench_truncated = executor.execute(
-            benchmark_sql, {}, max_rows=10_000, timeout_ms=60_000)
+            benchmark_sql, bench_params, max_rows=10_000, timeout_ms=60_000)
         # 输出侧预聚合值按 grain 关联键对齐比较（窗口内逐组对账）
         grain_aliases = _grain_aliases(spec)
         output_by_key = {}

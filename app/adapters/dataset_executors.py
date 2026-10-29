@@ -8,12 +8,16 @@
 - 视图发布器（SQLite）：离线测试替身（同端口语义）。
 """
 
+import time as _time
 from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from app.core.exceptions import DataSourceConnectionError
+from app.core.exceptions import (
+    DataSourceConnectionError,
+    ValidationDeadlineExceededError,
+)
 from app.datasets.safety import (
     SQLSafetyError,
     validate_controlled_select,
@@ -28,20 +32,31 @@ class ControlledExecutorBase(ControlledQueryExecutor):
     def __init__(self, engine: Engine, dialect: str,
                  allowed_tables: set[str],
                  allowed_columns: dict[str, set[str]],
-                 statement_budget: Any = None):
+                 statement_budget: Any = None,
+                 deadline_monotonic: float | None = None,
+                 max_result_bytes: int | None = None):
         self._engine = engine
         self._dialect = dialect
         self._allowed_tables = allowed_tables
         self._allowed_columns = allowed_columns
-        self._statement_budget = statement_budget  # 可选：逐语句硬预算
+        self._statement_budget = statement_budget
+        self._deadline = deadline_monotonic
+        self._max_result_bytes = max_result_bytes  # 可选：逐语句硬预算
 
     def _before_statement(self) -> None:
+        """语句发出前的统一硬闸：先查运行总期限（超期抛
+        ValidationDeadlineExceededError），再原子消耗预算（耗尽抛
+        ValidationStatementBudgetExceeded，保留真实 issued/limit）。
+        期限已耗尽时不再消耗预算——被拒绝的语句从未发出。"""
+        if self._deadline is not None and \
+                _time.monotonic() >= self._deadline:
+            raise ValidationDeadlineExceededError(
+                "验证运行总期限耗尽：后续语句在发出前被拒绝（未执行）")
         if self._statement_budget is not None:
             self._statement_budget.allow_one()
 
     def execute(self, sql, params, *, max_rows: int, timeout_ms: int) \
             -> tuple[list[dict[str, Any]], bool]:
-        del timeout_ms  # 期限由调用方预算/连接超时控制；此处不额外实现
         validate_statement_type(sql, dialect=self._dialect)
         validate_controlled_select(
             sql, self._allowed_tables, self._allowed_columns,
@@ -49,11 +64,23 @@ class ControlledExecutorBase(ControlledQueryExecutor):
         fetch_cap = max_rows + 1  # 多取一行判断截断
         self._before_statement()
         executable_sql = self._adapt_params(sql)
+        rows: list[dict[str, Any]] = []
+        byte_capped = False
         try:
             with self._engine.connect() as conn:
                 result = conn.execute(text(executable_sql), params or {})
-                rows = [dict(row) for row in
-                        result.mappings().fetchmany(fetch_cap)]
+                mappings = result.mappings()
+                while len(rows) < fetch_cap:
+                    batch = mappings.fetchmany(
+                        min(500, fetch_cap - len(rows)))
+                    if not batch:
+                        break
+                    rows.extend(dict(row) for row in batch)
+                    # 逐批检查结果字节上限（超限即停：如实标记截断）
+                    if self._max_result_bytes is not None and \
+                            self._rows_bytes(rows) > self._max_result_bytes:
+                        byte_capped = True
+                        break
         except Exception as exc:
             if isinstance(exc, (SQLSafetyError, DataSourceConnectionError)):
                 raise
@@ -61,8 +88,18 @@ class ControlledExecutorBase(ControlledQueryExecutor):
                 "query_failed",
                 "数据集查询执行失败（query_failed）；错误详情已抑制"
             ) from None
-        truncated = len(rows) > max_rows
+        truncated = len(rows) > max_rows or byte_capped
+        # 查询返回后检查总期限（超期结果标记截断，由上层阻断 ready）
+        if self._deadline is not None and \
+                _time.monotonic() >= self._deadline:
+            truncated = True
         return (rows[:max_rows], truncated)
+
+    @staticmethod
+    def _rows_bytes(rows: list[dict[str, Any]]) -> int:
+        """结果集字节的保守估计（按值文本长度下界）。"""
+        return sum(len(str(value))
+                   for row in rows for value in row.values())
 
     def _adapt_params(self, sql: str) -> str:
         """编译产物统一使用 pyformat %(name)s 占位（修复轮：两种方言
@@ -87,7 +124,9 @@ class SQLiteControlledExecutor(ControlledExecutorBase):
     def __init__(self, database_url: str, allowed_tables: set[str],
                  allowed_columns: dict[str, set[str]],
                  statement_budget: Any = None,
-                 attach: dict[str, str] | None = None):
+                 attach: dict[str, str] | None = None,
+                 deadline_monotonic: float | None = None,
+                 max_result_bytes: int | None = None):
         engine = create_engine(database_url)
         if attach:
             from sqlalchemy import event
@@ -98,7 +137,8 @@ class SQLiteControlledExecutor(ControlledExecutorBase):
                     dbapi_conn.execute(
                         f"ATTACH DATABASE '{path}' AS {schema}")
         super().__init__(engine, "sqlite", allowed_tables, allowed_columns,
-                         statement_budget)
+                         statement_budget, deadline_monotonic,
+                         max_result_bytes)
 
 
 class MySQLControlledExecutor(ControlledExecutorBase):
@@ -112,7 +152,9 @@ class MySQLControlledExecutor(ControlledExecutorBase):
                  password: str, allowed_tables: set[str],
                  allowed_columns: dict[str, set[str]],
                  statement_budget: Any = None,
-                 connect_timeout: int = 10, read_timeout: int = 30):
+                 connect_timeout: int = 10, read_timeout: int = 30,
+                 deadline_monotonic: float | None = None,
+                 max_result_bytes: int | None = None):
         from sqlalchemy.engine import URL
 
         url = URL.create(
@@ -128,7 +170,8 @@ class MySQLControlledExecutor(ControlledExecutorBase):
             },
             pool_pre_ping=True, pool_size=2, max_overflow=2)
         super().__init__(engine, "mysql", allowed_tables, allowed_columns,
-                         statement_budget)
+                         statement_budget, deadline_monotonic,
+                         max_result_bytes)
 
 
 class SQLiteViewPublisher(ViewPublisher):

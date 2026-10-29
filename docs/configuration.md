@@ -276,6 +276,9 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 | --- | --- |
 | `DATASET_PREVIEW_ROWS` | `20`，数据预览行数上限（脱敏展示） |
 | `DATASET_VALIDATION_ROWS` | `1000`，质量验证窗口行数（exact/sample 口径判定） |
+| `DATASET_VALIDATION_MAX_QUERIES` | `120`，单次验证运行 SQL 语句硬预算（逐语句原子消耗；耗尽即拒绝后续语句，不到达数据库） |
+| `DATASET_VALIDATION_DEADLINE_SECONDS` | `300`，单次验证运行总期限（monotonic 时钟；超期后新语句被拒、已返回结果标记截断，不进 ready） |
+| `DATASET_MAX_RESULT_BYTES` | `10000000`，单查询结果字节上限（逐批检查；超限即停并如实标记截断） |
 | `DATASET_EXPORT_BATCH_SIZE` | `500`，ES 导出批次大小 |
 | `DATASET_EXPORT_MAX_ROWS` | `100000`，ES 导出硬上限（达到即失败不切别名） |
 | `DATASET_VIEW_PUBLISH_ENABLED` | `false`，MySQL 视图发布开关（独立目标连接；不写源库） |
@@ -295,6 +298,9 @@ Embedding 模型需要单独选型，不假定 DeepSeek 对话 API 支持向量�
 - **实现已测试、真实发布未验证**：视图/ES 发布代码经 SQLite 视图适配
   器与 ES 替身（可控故障注入）离线闭环验证；未对真实 MySQL/ES 执行
   创建操作。启用前需配置目标并做小范围真实验证。
+- **运行预算接线范围（最小修复轮）**：验证、预览与 ES 导出三类运行
+  均以运行上下文（语句预算+总期限+结果字节上限）构建受控执行器——
+  不存在无界查询入口；发布/回滚/核对共用数据集级发布占用互斥。
 - SQL 编译/AST 白名单依赖 **sqlglot**（本轮新增运行时依赖，已声明
   pyproject）。
 - 真实只读演示：`python scripts/m5_real_demo.py`（临时元数据/凭证；

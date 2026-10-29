@@ -212,7 +212,7 @@ def make_service(
     attach = {SCHEMA: env["data_url"].replace("sqlite:///", "") + ".app",
               ARCHIVE: env["data_url"].replace("sqlite:///", "") + ".archive"}
 
-    def executor_factory(payload, model, cfg):
+    def executor_factory(payload, model, cfg, run_context=None):
         tables: dict[str, set[str]] = {}
         for entity in model.get("entities", []):
             source = entity.get("source") or {}
@@ -221,7 +221,10 @@ def make_service(
                 a["field"]["column"].lower()
                 for a in entity.get("attributes", [])}
         return SQLiteControlledExecutor(
-            env["data_url"], set(tables.keys()), tables, attach=attach)
+            env["data_url"], set(tables.keys()), tables, attach=attach,
+            statement_budget=(run_context or {}).get("budget"),
+            deadline_monotonic=(run_context or {}).get("deadline"),
+            max_result_bytes=(run_context or {}).get("max_result_bytes"))
 
     return DatasetService(
         metadata_repository=env["repo"],

@@ -1,6 +1,68 @@
 # 开发交接报告
 
-更新时间：2026-10-29（M4 收尾修复轮 2：历史模型泄漏净化全覆盖、grain 业务描述变化撤销确认、重确认解除待确认类阻断、依赖检查改用 effective、无关风险路径不再误伤本表指标；五项全部先复现后修复，全量离线验证通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-30（M5 最小修复轮：条件 AVG 分母、中心指标独立对账、回滚发布占用、核对指针提交、正式预算接入五项完成；另修复执行中发现的预算双重扣减、AVG 预聚合基准列错位、ES 失败发布保留锁、超期判定被覆盖、MySQL 执行器期限/字节参数缺失五处缺陷；全部离线验证通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M5 最小修复轮（2026-10-30，五项指定 + 五处执行中发现，先复现后修复）
+
+指定五项（基于 a690e02）：
+
+1. **条件 AVG 分母排除 NULL 度量值**：`compiler._conditional_aggregate`
+   的 AVG 分母原为 `SUM(CASE WHEN cond THEN 1 ...)`（计入度量值为 NULL
+   的行），与分子 `SUM(CASE WHEN cond THEN col)`（自动跳过 NULL）口径
+   不一致。修复：分母改为 `SUM(CASE WHEN cond AND col IS NOT NULL THEN
+   1 ELSE 0 END)`；分子分母同为"满足条件且度量非空"口径。
+2. **中心指标独立对账**：`quality._metric_reconciliation` 此前未按各
+   指标自身过滤独立构建基准。修复：逐指标应用其 M4 结构化过滤
+   （各指标独立、不合并条件），AVG 基准=`SUM(col)/NULLIF(COUNT(col),0)`
+   （分母只计非 NULL；不把 COUNT 当 AVG 结果）。
+3. **回滚尊重发布占用**：`rollback` 在外部副作用（ES 别名切换）前经
+   `dataset_publish_locks` 取得数据集级占用；占用被他方持有时 409 拒绝
+   且无外部副作用；期望指针不匹配在外部切换前拒绝。
+4. **核对完成指针提交**：`_reconcile_locked` 恢复 published 时经
+   `_commit_pointer()` 同时提交发布指针+审计+版本状态（旧实现只改
+   status，指针仍指向旧版本——视图存在但指针未恢复）。核对自身也须
+   取得占用（不绕过互斥）。
+5. **正式预算接入（不留限制）**：运行上下文（`StatementBudget` 逐语句
+   原子额度 + monotonic 总期限 + 结果字节上限）贯穿验证/预览/ES 导出
+   三类运行：service 创建 → 装配工厂转发 → 执行器强制；`del timeout_ms`
+   类临时占位已移除。
+
+执行中复现并一并修复的缺陷：
+
+6. **预算双重扣减**：`execute` 同时经 `_before_query` 与
+   `_before_statement` 各消耗一次额度（限额实际减半，既有回归测试
+   失败暴露）。修复：合并为单一 `_before_statement` 硬闸——先查总期限
+   （超期抛 `ValidationDeadlineExceededError`，不消耗预算），再原子
+   消耗预算（耗尽抛 `ValidationStatementBudgetExceeded`，保留真实
+   issued/limit）；SIM103 一并消除。
+7. **AVG 预聚合基准列错位**：`_preaggregation_reconciliation` 的 AVG
+   基准为 `SUM(x), COUNT(x)` 双列（别名只作用于 COUNT，比较对象错位，
+   5 组中 4 组误报不一致）。修复：单表达式 `SUM(x)/NULLIF(COUNT(x),0)`，
+   与编译产物同口径（分母只计非 NULL 度量行）。
+8. **ES 失败发布保留 active 锁**：`_publish_es` 在外部索引已建、本地
+   失败（needs_reconciliation）时保留 active 锁，而 reconcile 也须
+   acquire——恢复路径永久死锁。修复：与 view 路径一致，获得锁即始终
+   释放（reconcile 是恢复路径，经正常 acquire 取得占用）。
+9. **超期判定被覆盖**：`validate` 在超期置 failed_validation 后又被
+   `payload.update({"status": "ready" if all_passed ...})` 无条件覆盖。
+   修复：`passed = all_passed and not expired`，超期一律不进 ready。
+10. **MySQL 执行器参数缺失**：`MySQLControlledExecutor` 不接受装配工厂
+    传入的 `deadline_monotonic/max_result_bytes`（真实 MySQL 路径
+    TypeError；离线 SQLite 夹具不暴露）。修复：接受并转发至基类。
+    另补齐 `max_result_bytes` 的真实执行（逐批字节检查，超限即停并
+    如实标记截断）与预览/导出的运行上下文接线（原为无界查询入口）。
+
+- 回归（`tests/test_m5_min_fix_round.py`，12 项，其中 4 项在修复前
+  失败：AVG 分母值断言、中心指标独立对账、期限不消耗预算、字节上限
+  标记截断）：另含回滚占用拒绝+释放后成功、核对指针恢复断言、单次
+  额度消耗计数、超期验证不进 ready、预览运行上下文接线、MySQL 执行器
+  参数、装配工厂转发、ES needs_reconciliation 后锁已释放且 reconcile
+  可运行。
+- 验证：`python -m pytest -q` → **707 passed, 9 skipped**；ruff /
+  pip check 通过（全部离线；skipped=默认关闭的真实集成）。
+- 新增配置：`DATASET_VALIDATION_MAX_QUERIES=120`、
+  `DATASET_VALIDATION_DEADLINE_SECONDS=300`、
+  `DATASET_MAX_RESULT_BYTES=10000000`（见 docs/configuration.md）。
 
 ## M4 净化链路收尾修补（2026-10-29，两处遗漏，先复现后修复）
 
@@ -797,8 +859,8 @@ incompatible 不召回，人工登记保留）；时间条件缺失（多对多�
 
 ## 实现边界与下一步
 
-未实现项不变：字段语义理解（M2）、关系发现（M3）、语义层（M4）、视图/宽表与 ES（M5）、
-NL2SQL 与任意 SQL 执行（M6）、智能体（M7）、登录/JWT、后台任务与正式迁移（M8）。
+未实现项：NL2SQL 与任意 SQL 执行（M6）、智能体（M7）、登录/JWT、后台任务与正式迁移（M8）。
+M0–M5 离线闭环完成（M5 视图/ES 真实发布未验证，目标默认关闭）；Embedding 检索未接入。
 扫描仍为同步执行；`BIZ_MYSQL_*` 业务表未接入。
 
 **M2 输入就绪**：表/字段元数据与画像（含口径标记）可从元数据库稳定读取；

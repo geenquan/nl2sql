@@ -278,7 +278,9 @@ def _preaggregation_reconciliation(
         if metric["aggregation"] == "count_rows":
             aggregate = "COUNT(*)"
         elif metric["aggregation"] in ("sum", "avg"):
-            aggregate = (f"SUM(`{measure}`), COUNT(`{measure}`)"
+            # AVG 基准＝和/非空计数（单表达式；分母只计非 NULL 度量行，
+            # 与编译产物同口径；不得拆成两列——别名会错位到 COUNT）
+            aggregate = (f"SUM(`{measure}`) / NULLIF(COUNT(`{measure}`), 0)"
                          if metric["aggregation"] == "avg"
                          else f"SUM(`{measure}`)")
         elif metric["aggregation"] == "count_distinct":
@@ -378,7 +380,7 @@ def _preaggregation_reconciliation(
 
 def _metric_reconciliation(
         checks, executor, model, spec, rows, basis, truncated) -> None:
-    """中心聚合指标 ↔ 中心表独立聚合对账。"""
+    """中心聚合指标 ↔ 中心表独立聚合对账（修复轮：各指标独立过滤）。"""
     metrics = {m["metric_id"]: m for m in model.get("metrics", [])}
     for selection in spec.get("metrics", []):
         metric = metrics.get(selection["metric_id"])
@@ -397,7 +399,8 @@ def _metric_reconciliation(
         elif metric["aggregation"] == "sum":
             aggregate = f"SUM(`{measure}`)"
         elif metric["aggregation"] == "avg":
-            aggregate = f"SUM(`{measure}`), COUNT(`{measure}`)"
+            # AVG 基准返回真正平均值（修复轮：不把 COUNT 当 AVG）
+            aggregate = (f"SUM(`{measure}`) / NULLIF(COUNT(`{measure}`), 0)")
         elif metric["aggregation"] == "count_distinct":
             aggregate = "COUNT(DISTINCT " + ", ".join(
                 f"`{k['column']}`" for k in keys) + ")"
@@ -407,12 +410,43 @@ def _metric_reconciliation(
             aggregate = None
         if aggregate is None:
             continue
+        # 修复轮：应用该指标自身的 filters（各指标独立，不合并条件）
+        bench_conditions: list[str] = []
+        bench_params: dict[str, Any] = {}
+        for flt in metric.get("filters") or []:
+            ref = flt.get("field") or {}
+            column = f"`{ref.get('column', '')}`"
+            op = flt.get("operator", "eq")
+            if op == "is_null":
+                bench_conditions.append(f"{column} IS NULL")
+            elif op == "not_null":
+                bench_conditions.append(f"{column} IS NOT NULL")
+            elif op in ("in", "not_in"):
+                values = flt.get("value") or []
+                if isinstance(values, list) and values:
+                    names = []
+                    for value in values:
+                        param_name = f"m{len(bench_params)}"
+                        bench_params[param_name] = value
+                        names.append(f":{param_name}")
+                    bench_conditions.append(
+                        f"{column} {'IN' if op == 'in' else 'NOT IN'} "
+                        f"({', '.join(names)})")
+            else:
+                sql_op = {"eq": "=", "ne": "<>", "gt": ">",
+                          "ge": ">=", "lt": "<", "le": "<="}.get(op, "=")
+                param_name = f"m{len(bench_params)}"
+                bench_params[param_name] = flt.get("value")
+                bench_conditions.append(f"{column} {sql_op} :{param_name}")
+        bench_where = (" WHERE " + " AND ".join(bench_conditions)
+                       if bench_conditions else "")
         group = ", ".join(f"`{c}`" for c in grain)
         bench_sql = (f"SELECT {group}, {aggregate} AS agg FROM "
-                     f"`{source['schema']}`.`{source['table']}` "
+                     f"`{source['schema']}`.`{source['table']}`"
+                     f"{bench_where} "
                      f"GROUP BY {group}")
         bench_rows, bench_truncated = executor.execute(
-            bench_sql, {}, max_rows=10_000, timeout_ms=60_000)
+            bench_sql, bench_params, max_rows=10_000, timeout_ms=60_000)
         grain_aliases = _grain_aliases(spec)
         output_by_key = {}
         for row in rows:

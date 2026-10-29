@@ -328,7 +328,10 @@
 - 执行端口：ControlledQueryExecutor 只接受已校验 SQL（执行前强制）；
   MySQL 连接级 READ ONLY；SELECT 执行器不接受 DDL——视图 DDL 在
   独立 ViewPublisher 端口
-- 预算：预览行数（20）/质量窗口（1000）/导出批次与硬上限；截断
+- 预算：预览行数（20）/质量窗口（1000）/导出批次与硬上限；**运行
+  上下文三要素**（逐语句硬额度 120 + monotonic 总期限 300s + 单查询
+  结果字节上限 10MB）贯穿验证/预览/导出——每条语句发出前经单一硬闸
+  （先期限后额度；期限拒绝不消耗额度），不存在无界查询入口；截断
   如实标记（LIMIT 不宣称限制扫描量）
 
 ## M5 质量报告（dataset-quality-v1）
@@ -345,10 +348,11 @@
 
 ## M5 视图与 ES 发布（已实现；真实发布未验证）
 
-- 发布所有权（修复轮 2+3）：`dataset_publish_locks` 表**原子占用**
+- 发布所有权（修复轮 2+3+最小轮）：`dataset_publish_locks` 表**原子占用**
   （dataset_id 唯一键，INSERT/条件 UPDATE）；**只有获得了锁的线程才
   更新版本状态**（未获锁的 409 失败方不覆盖他方状态）；全部路径
-  finally 释放锁；needs_reconciliation 保留锁给恢复操作；
+  finally 释放锁（**含 needs_reconciliation**——保留 active 锁会卡死
+  reconcile 恢复路径，reconcile 自身经正常 acquire 取得占用）；
   状态更新原子条件（期望当前状态入 WHERE，恰一成功）
 - 视图：独立目标 DSN/Schema（默认关闭）；应用前缀版本化视图名
   （nl2sql_ds_前缀）；不覆盖用户对象（已存在→幂等刷新或 409）；

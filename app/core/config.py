@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # M5 ES 宽表发布（复用 es_*；显式写入开关默认关闭）
     dataset_es_publish_enabled: bool = False
 
+    dataset_validation_max_queries: int = Field(default=120, gt=0)
+    dataset_validation_deadline_seconds: int = Field(default=300, gt=0)
+    dataset_max_result_bytes: int = Field(default=10_000_000, gt=0)
     # M5 数据集：只读预览/质量验证；发布目标默认关闭。
     dataset_preview_rows: int = Field(default=20, gt=0, le=1000)
     dataset_validation_rows: int = Field(default=1000, gt=0, le=100000)

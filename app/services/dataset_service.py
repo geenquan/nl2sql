@@ -189,8 +189,7 @@ class DatasetService:
             raise ValueError(
                 f"中心实体不在模型：{spec.central_entity_id}")
         # snapshot 一致性（修复轮：未传绑定模型快照；传入必须一致）
-        if spec.snapshot_id is not None and \
-                spec.snapshot_id != model.get("snapshot_id"):
+        if spec.snapshot_id is not None and                 spec.snapshot_id != model.get("snapshot_id"):
             raise ValueError(
                 f"快照不一致：数据集 {spec.snapshot_id} vs 模型 "
                 f"{model.get('snapshot_id')}（必须与采用模型一致）")
@@ -322,7 +321,10 @@ class DatasetService:
             raise ValueError("该版本尚未编译（先执行质量验证）")
         model = self._models.get_model(
             payload["model_id"], version=payload["model_version"])
-        executor = self._executor_factory(payload, model, self._settings)
+        # 预览同样受预算+期限+字节上限约束（修复轮 5：不留无界查询入口）
+        executor = self._executor_factory(
+            payload, model, self._settings,
+            run_context=self._new_run_context())
         rows, truncated = executor.execute(
             plan["sql"], plan["params"],
             max_rows=max_rows or self._settings.dataset_preview_rows,
@@ -345,6 +347,25 @@ class DatasetService:
         return masked
 
     # -- 质量验证 ---------------------------------------------------------------
+
+    def _new_run_context(self) -> dict[str, Any]:
+        """创建共享运行上下文（预算+期限+字节上限），贯穿整次运行。"""
+        import time as _time
+
+        from app.relationships.execution import StatementBudget
+
+        return {
+            "budget": StatementBudget(
+                self._settings.dataset_validation_max_queries),
+            "deadline": _time.monotonic()
+            + self._settings.dataset_validation_deadline_seconds,
+            "max_result_bytes": self._settings.dataset_max_result_bytes,
+        }
+
+    def _expired(self, context: dict[str, Any]) -> bool:
+        import time as _time
+
+        return _time.monotonic() >= context["deadline"]
 
     def validate(self, dataset_id: str, version: int) -> dict[str, Any]:
         payload = self._repo.get_dataset(dataset_id, version=version)
@@ -384,7 +405,9 @@ class DatasetService:
             plan = self._compiler.compile(spec, model)
             spec.definition_fingerprint = definition_fingerprint(spec)
             spec.plan_fingerprint = plan.plan_fingerprint
-            executor = self._executor_factory(payload, model, self._settings)
+            run_context = self._new_run_context()
+            executor = self._executor_factory(
+                payload, model, self._settings, run_context=run_context)
             try:
                 lineage = plan.lineage
                 grain_aliases = list(lineage.keys())[:len(spec.grain_keys)]
@@ -396,16 +419,22 @@ class DatasetService:
                     max_rows=self._settings.dataset_validation_rows)
             finally:
                 executor.close()
+            expired = self._expired(run_context)
+            if expired:
+                run["errors"].append({
+                    "reason": "deadline_exceeded",
+                    "message": "质量验证运行超期，不进入 ready"})
             self._repo.save_plan(dataset_id, version, plan.to_dict())
             self._repo.save_quality(dataset_id, version, report.to_dict())
+            # 超期一律 failed_validation（超期判定不可被 all_passed 覆盖）
+            passed = report.all_passed and not expired
             payload.update({
-                "status": "ready" if report.all_passed
-                else "failed_validation",
+                "status": "ready" if passed else "failed_validation",
                 "plan_fingerprint": plan.plan_fingerprint,
                 "definition_fingerprint": spec.definition_fingerprint,
             })
             run["status"] = "succeeded"
-            run["result"] = {"all_passed": report.all_passed,
+            run["result"] = {"all_passed": passed,
                              "checks": len(report.checks)}
         except Exception as exc:  # noqa: BLE001 - 收尾兜底（固定安全错误）
             run["status"] = "failed"
@@ -541,13 +570,11 @@ class DatasetService:
         finally:
             # 修复轮 3：成功与一般失败路径释放锁；needs_reconciliation
             # （外部成功本地失败）保留锁给恢复操作
-            if lock_acquired and run["status"] != "failed":
+            if lock_acquired:
+                outcome = ("released" if run["status"] != "failed"
+                           else "failed")
                 self._repo.release_publish_lock(
-                    payload["dataset_id"], run["run_id"])
-            elif lock_acquired and not external_created:
-                self._repo.release_publish_lock(
-                    payload["dataset_id"], run["run_id"],
-                    outcome="failed")
+                    payload["dataset_id"], run["run_id"], outcome=outcome)
             publisher.close()
         self._safe_finish_run(run)
         return {"dataset_id": payload["dataset_id"],
@@ -625,14 +652,14 @@ class DatasetService:
             self._safe_finish_run(run)
             raise
         finally:
-            # 修复轮 3：成功/一般失败释放锁；needs_reconciliation 保留
-            if lock_acquired and run["status"] != "failed":
+            # 修复轮 5：与 view 路径一致——获得锁即始终释放（含
+            # needs_reconciliation：保留 active 锁会卡死 reconcile，
+            # 而 reconcile 正是恢复路径，也须经 acquire 取得占用）
+            if lock_acquired:
+                outcome = ("released" if run["status"] != "failed"
+                           else "failed")
                 self._repo.release_publish_lock(
-                    payload["dataset_id"], run["run_id"])
-            elif lock_acquired and not external_created:
-                self._repo.release_publish_lock(
-                    payload["dataset_id"], run["run_id"],
-                    outcome="failed")
+                    payload["dataset_id"], run["run_id"], outcome=outcome)
         self._safe_finish_run(run)
         return {"dataset_id": payload["dataset_id"],
                 "version": payload["version"], "published": True,
@@ -644,7 +671,10 @@ class DatasetService:
             -> dict[str, Any]:
         model = self._models.get_model(
             payload["model_id"], version=payload["model_version"])
-        executor = self._executor_factory(payload, model, self._settings)
+        # 导出分页循环同样受预算+期限+字节上限约束（修复轮 5）
+        executor = self._executor_factory(
+            payload, model, self._settings,
+            run_context=self._new_run_context())
         batch = self._settings.dataset_export_batch_size
         max_rows = self._settings.dataset_export_max_rows
         grain_aliases = list(plan["lineage"].keys())[
@@ -780,43 +810,81 @@ class DatasetService:
     def rollback(self, dataset_id: str, target_version: int, *,
                  operator: str = "local-dev",
                  expected_pointer: int | None = None) -> dict[str, Any]:
-        """回滚：统一流程切换外部别名与本地指针（修复轮）。"""
+        """回滚：复用 dataset_publish_locks 在外部副作用前取得占用。"""
         target = self._repo.get_dataset(dataset_id, version=target_version)
         if target is None or target.get("status") != "published":
             raise ValueError(
                 f"回滚目标必须是仍处 published 状态的版本：v{target_version}")
-        # ES 目标：先切换别名再切本地指针（统一流程）
-        if target.get("target") == "elasticsearch" and \
-                self._settings.dataset_es_publish_enabled:
-            es = self._es_publisher_factory()
-            current_version = self._repo.get_published_dataset(
+        rollback_op = uuid4().hex
+        if not self._repo.acquire_publish_lock(
+                dataset_id, rollback_op, "rollback"):
+            raise RevisionConflictError(
+                "数据集级发布冲突：另一操作进行中，回滚被拒绝")
+        try:
+            # 核对期望指针（在外部切换前拒绝）
+            current_pointer = self._repo.get_published_dataset(
                 target["source_id"], dataset_id)
-            if current_version and current_version != target_version:
-                current_payload = self._repo.get_dataset(
-                    dataset_id, version=current_version)
-                previous_index = (
-                    self._es_index_name(current_payload)
-                    if current_payload else None)
-                es.switch_alias(
-                    self._es_alias_name(target),
-                    self._es_index_name(target), previous_index)
-        switched = self._repo.set_published_dataset(
-            target["source_id"], dataset_id, target_version,
-            operator=operator, expected=expected_pointer,
-            action="rollback")
-        if not switched:
-            raise RevisionConflictError("发布指针并发冲突（回滚）")
+            if (expected_pointer is not None
+                        and current_pointer != expected_pointer):
+                raise RevisionConflictError(
+                    f"回滚期望指针不匹配：当前 v{current_pointer}，"
+                    f"期望 v{expected_pointer}")
+            # ES 目标：先切换别名再切本地指针
+            if (target.get("target") == "elasticsearch"
+                        and self._settings.dataset_es_publish_enabled):
+                es = self._es_publisher_factory()
+                if current_pointer and current_pointer != target_version:
+                    current_payload = self._repo.get_dataset(
+                        dataset_id, version=current_pointer)
+                    previous_index = (
+                        self._es_index_name(current_payload)
+                        if current_payload else None)
+                    es.switch_alias(
+                        self._es_alias_name(target),
+                        self._es_index_name(target), previous_index)
+            switched = self._repo.set_published_dataset(
+                target["source_id"], dataset_id, target_version,
+                operator=operator, expected=expected_pointer,
+                action="rollback")
+            if not switched:
+                raise RevisionConflictError("发布指针并发冲突（回滚）")
+        finally:
+            self._repo.release_publish_lock(dataset_id, rollback_op)
         return {"dataset_id": dataset_id, "version": target_version,
                 "rolled_back": True}
 
     def reconcile(self, dataset_id: str, version: int) -> dict[str, Any]:
-        """显式核对结果不明的发布尝试（外部成功本地失败）。"""
+        """显式核对结果不明的发布尝试（修复轮：完成指针+释放锁）。"""
         payload = self._repo.get_dataset(dataset_id, version=version)
         if payload is None:
             raise ResourceNotFoundError("dataset", "数据集不存在")
         if payload.get("status") != "needs_reconciliation":
             raise ValueError(
                 f"版本状态 {payload.get('status')} 无需核对")
+        # 恢复也须取得占用（不绕过其他操作）
+        reconcile_op = uuid4().hex
+        if not self._repo.acquire_publish_lock(
+                dataset_id, reconcile_op, "reconcile"):
+            raise RevisionConflictError(
+                "数据集级发布冲突：另一操作进行中，恢复被拒绝")
+        try:
+            return self._reconcile_locked(dataset_id, version, payload)
+        finally:
+            self._repo.release_publish_lock(dataset_id, reconcile_op)
+
+    def _reconcile_locked(
+        self, dataset_id: str, version: int, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        def _commit_pointer() -> bool:
+            """条件更新指针+审计；失败不返回成功。"""
+            switched = self._repo.set_published_dataset(
+                payload["source_id"], dataset_id, version,
+                operator="reconcile")
+            if not switched:
+                return False
+            return self._repo.update_dataset_status(
+                dataset_id, version, "published")
+
         if payload.get("target") == "view":
             publisher = self._view_publisher_factory()
             view_name = self._view_name(payload)
@@ -824,45 +892,63 @@ class DatasetService:
                 self._settings.dataset_view_target_schema, view_name)
             publisher.close()
             if exists:
-                self._repo.update_dataset_status(dataset_id, version,
-                                                 "published")
+                # 修复轮：提交指针+审计+状态（不能只改 status）
+                if not _commit_pointer():
+                    return {"dataset_id": dataset_id, "version": version,
+                            "reconciled": "pointer_commit_conflict"}
                 return {"dataset_id": dataset_id, "version": version,
-                        "reconciled": "external_object_exists"}
+                        "reconciled": "external_object_exists",
+                        "pointer_restored": True}
             self._repo.update_dataset_status(dataset_id, version,
-                                             "failed_publish")
+                                            "failed_publish")
             return {"dataset_id": dataset_id, "version": version,
                     "reconciled": "external_object_missing"}
+
         es = self._es_publisher_factory()
         index_name = self._es_index_name(payload)
-        count = es.count(index_name)
-        # 完整性核对（修复轮）：索引存在且有完整文档才恢复
-        run = next(
-            (r for r in reversed(self._repo.list_dataset_runs(dataset_id))
-             if r.get("run_type") == "publish"
-             and r.get("dataset_version") == version
-             and r.get("result", {}).get("documents")),
-            None)
-        expected = (run["result"]["documents"]
-                    if run and run.get("result") else None)
-        if expected is not None and count == expected:
-            # 本地指针也需恢复（外部成功本地失败 → 指针可能未提交）
-            self._repo.set_published_dataset(
-                payload["source_id"], dataset_id, version,
-                operator="reconcile")
+        try:
+            count = es.count(index_name)
+        except Exception:  # noqa: BLE001 - 索引不存在
             self._repo.update_dataset_status(dataset_id, version,
-                                             "published")
+                                            "failed_publish")
+            return {"dataset_id": dataset_id, "version": version,
+                    "reconciled": "external_index_missing",
+                    "documents": 0, "expected": None}
+        # 预期文档数：从发布运行记录获取（可能为 None→不恢复）
+        expected = None
+        for run in self._repo.list_dataset_runs(dataset_id):
+            if (run.get("run_type") == "publish"
+                    and run.get("dataset_version") == version
+                    and isinstance(run.get("result"), dict)):
+                documents = run["result"].get("documents")
+                if documents is not None:
+                    expected = documents
+                    break
+        if expected is None:
+            # 无预期记录：保留待恢复（不凭存在判成功）
+            return {"dataset_id": dataset_id, "version": version,
+                    "reconciled": "expected_unknown",
+                    "documents": count, "expected": None}
+        # 完整性核对：文档数与预期一致才恢复
+        if count == expected:
+            if not _commit_pointer():
+                return {"dataset_id": dataset_id, "version": version,
+                        "reconciled": "pointer_commit_conflict",
+                        "documents": count, "expected": expected}
             return {"dataset_id": dataset_id, "version": version,
                     "reconciled": "external_index_complete",
                     "documents": count, "expected": expected}
-        if expected is None and count > 0:
-            # 无预期记录：保持 needs_reconciliation（不凭存在判成功）
+        if expected == 0 and count == 0:
+            if not _commit_pointer():
+                return {"dataset_id": dataset_id, "version": version,
+                        "reconciled": "pointer_commit_conflict"}
             return {"dataset_id": dataset_id, "version": version,
-                    "reconciled": "external_index_incomplete",
-                    "documents": count, "expected": expected}
+                    "reconciled": "empty_dataset_confirmed",
+                    "documents": 0, "expected": 0}
         self._repo.update_dataset_status(dataset_id, version,
                                         "failed_publish")
         return {"dataset_id": dataset_id, "version": version,
-                "reconciled": "external_index_missing_or_incomplete",
+                "reconciled": "external_index_incomplete",
                 "documents": count, "expected": expected}
 
     # -- 命名/工具 -----------------------------------------------------------------

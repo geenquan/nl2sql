@@ -157,8 +157,8 @@ def get_semantic_model_service() -> SemanticModelService:
     )
 
 
-def _dataset_executor_factory(payload: dict, model: dict,
-                              settings) -> object:
+def _dataset_executor_factory(payload: dict, model: dict, settings,
+                              run_context: dict | None = None) -> object:
     """构建受控只读执行器（白名单来自模型实体；源库连接）。"""
     from app.adapters.dataset_executors import MySQLControlledExecutor
 
@@ -182,7 +182,10 @@ def _dataset_executor_factory(payload: dict, model: dict,
         database=source["database"], username=source["username"],
         password=password, allowed_tables=set(tables.keys()),
         allowed_columns=tables,
-        read_timeout=settings.mysql_read_timeout_seconds)
+        read_timeout=settings.mysql_read_timeout_seconds,
+        statement_budget=(run_context or {}).get("budget"),
+        deadline_monotonic=(run_context or {}).get("deadline"),
+        max_result_bytes=(run_context or {}).get("max_result_bytes"))
 
 
 def _view_publisher_factory():

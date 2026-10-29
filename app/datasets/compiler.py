@@ -361,9 +361,12 @@ class DatasetCompiler:
             return f"{aggregation.upper()}(CASE WHEN {condition} THEN {col} END)"
         if aggregation == "avg":
             col = f"{alias}.{quote(measure)}"
+            # 分母只统计"满足条件且度量值非 NULL"的行（修复轮：
+            # SUM(CASE cond THEN col) 自动跳过 col=NULL，分母也须排除）
             return (
                 f"SUM(CASE WHEN {condition} THEN {col} END) / "
-                f"NULLIF(SUM(CASE WHEN {condition} THEN 1 ELSE 0 END), 0)")
+                f"NULLIF(SUM(CASE WHEN {condition} AND {col} IS NOT NULL "
+                f"THEN 1 ELSE 0 END), 0)")
         raise ValueError(f"不支持的聚合：{aggregation}")
 
     def _metric_expression(

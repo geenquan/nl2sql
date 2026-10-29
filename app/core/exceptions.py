@@ -62,3 +62,10 @@ class ValidationStatementBudgetExceeded(AppError):
         super().__init__(
             f"验证 SQL 语句预算耗尽：已发出 {issued}/{limit} 条，"
             "后续语句在发出前被拒绝（未执行）")
+
+
+class ValidationDeadlineExceededError(AppError):
+    """验证运行总期限耗尽：后续语句在发出前被拒绝（未到达数据库）。
+
+    与 ValidationStatementBudgetExceeded 同级的安全闸：固定文案、无细节；
+    区别在于这是整次运行的时间期限，不是语句条数额度。"""

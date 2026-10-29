@@ -113,6 +113,10 @@ class SemanticModelService:
             payload.setdefault("dependencies", {})["partial_missing"] = list(
                 payload["dependencies"].get("partial_missing") or []
             ) + [f"构建时剔除不合规候选指标：{','.join(invalid[:5])}"]
+        # 保存前统一净化（收尾修补）：保存与响应用一致的净化结果，
+        # 不只在返回时遮蔽；_sanitize_model_text 只处理自由文本并返回
+        # 独立深拷贝，不引入 availability 等动态字段。
+        payload = self._sanitize_model_text(payload)
         try:
             self._repo.save_model(payload)
         except RevisionConflictError:
@@ -318,6 +322,10 @@ class SemanticModelService:
             entity["aliases"] = [
                 _clean(alias, 60) for alias in entity.get("aliases") or []]
             entity["purpose_note"] = _clean(entity.get("purpose_note"), 120)
+            entity_grain = entity.get("grain") or {}
+            entity_grain["statement"] = _clean(entity_grain.get("statement"), 200)
+            entity_grain["missing"] = [
+                _clean(m, 160) for m in entity_grain.get("missing") or []]
             for attribute in entity.get("attributes", []):
                 if attribute.get("name_source") != "column_name":
                     attribute["business_name"] = _clean(
@@ -366,6 +374,9 @@ class SemanticModelService:
             "change_note": sanitize_text_for_model(note, 200) if note else None,
         })
         self._apply_changes(revised, changes, reviewer)
+        # 保存前统一净化（收尾修补）：覆盖从历史版本继承的文本与
+        # 待验证草稿等所有分支；确认失效/发布门槛/版本并发行为不变。
+        revised = self._sanitize_model_text(revised)
         try:
             self._repo.save_model(revised)
         except RevisionConflictError:

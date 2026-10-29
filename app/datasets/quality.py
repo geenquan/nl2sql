@@ -296,6 +296,7 @@ def _preaggregation_reconciliation(
                 reason=f"不支持对账的聚合：{metric['aggregation']}"))
             continue
         # 指标过滤谓词（独立表达——与编译器产物不同代码路径）
+        # 修复轮 3：IN 参数在同一个循环中分配名称、追加占位符和写入字典
         benchmark_conditions: list[str] = []
         bench_params: dict[str, Any] = {}
         for flt in metric.get("filters") or []:
@@ -309,17 +310,14 @@ def _preaggregation_reconciliation(
             elif op in ("in", "not_in"):
                 values = flt.get("value") or []
                 if isinstance(values, list) and values:
-                    names = ", ".join(
-                        f":b{len(bench_params)}{_i}"
-                        for _i, _v in enumerate(values))
-                    for _i, _v in enumerate(values):
-                        bench_params[f"b{len(bench_params) - 1}{_i}"] = _v
-                    # 简化：用单参数占位（值列表以 JSON 形式传递不可行——
-                    # 直接用值生成 IN 占位）
-                    # 实际由执行器参数化处理
+                    names = []
+                    for value in values:
+                        param_name = f"b{len(bench_params)}"
+                        bench_params[param_name] = value
+                        names.append(f":{param_name}")
                     benchmark_conditions.append(
-                        f"{column} {op.upper().replace('_', ' ')} "
-                        f"({names})")
+                        f"{column} {'IN' if op == 'in' else 'NOT IN'} "
+                        f"({', '.join(names)})")
             else:
                 sql_op = {"eq": "=", "ne": "<>", "gt": ">",
                           "ge": ">=", "lt": "<", "le": "<="}.get(op, "=")

@@ -278,6 +278,16 @@ class SQLiteMetadataRepository(
             Column("created_at", String(40)),
             Column("payload", String(2000000)),
         )
+        self._dataset_publish_locks = Table(
+            "dataset_publish_locks",
+            self._metadata,
+            Column("dataset_id", String(64), primary_key=True),
+            Column("operation_id", String(36), nullable=False),
+            Column("operation_type", String(24), nullable=False),
+            Column("status", String(16), nullable=False),  # active|completed
+            Column("created_at", String(40)),
+            Column("released_at", String(40)),
+        )
         # 开发级建表：不存在则创建；正式迁移方案在 M8 引入。
         self._metadata.create_all(self._engine)
 
@@ -1253,9 +1263,9 @@ class SQLiteMetadataRepository(
         return [dict(_load(row.payload, {})) for row in rows]
 
     def update_dataset_status(self, dataset_id: str, version: int,
-                              status: str) -> bool:
-        """状态原子条件更新（修复轮：期望当前状态进入 WHERE——
-        并发同目标状态恰一成功，另一 rowcount=0 返回 False）。"""
+                              status: str, *,
+                              fields: dict[str, Any] | None = None) -> bool:
+        """状态原子条件更新（修复轮 3：接受可选字段更新——指纹不丢失）。"""
         current = self.get_dataset(dataset_id, version)
         if current is None:
             return False
@@ -1264,6 +1274,8 @@ class SQLiteMetadataRepository(
         if status != expected_status and status not in allowed:
             return False
         current["status"] = status
+        if fields:
+            current.update(fields)
         with self._engine.begin() as conn:
             result = conn.execute(
                 self._datasets.update().where(
@@ -1409,6 +1421,68 @@ class SQLiteMetadataRepository(
                 self._dataset_pointer.c.dataset_id == dataset_id,
             )).first()
         return int(row.version) if row else None
+
+    # -- M5 发布占用（修复轮 3：数据集级原子互斥） ------------------------------
+
+    def acquire_publish_lock(
+        self, dataset_id: str, operation_id: str, operation_type: str,
+    ) -> bool:
+        """原子取得数据集级发布占用（INSERT 或条件 UPDATE 恰一成功）。
+
+        已有 active 占用 → False（409）；completed 占用可被释放后重取。
+        """
+
+        with self._engine.begin() as conn:
+            row = conn.execute(select(self._dataset_publish_locks).where(
+                self._dataset_publish_locks.c.dataset_id == dataset_id,
+            )).first()
+            if row is None:
+                conn.execute(self._dataset_publish_locks.insert().values(
+                    dataset_id=dataset_id, operation_id=operation_id,
+                    operation_type=operation_type, status="active",
+                    created_at=_now(), released_at=None))
+                return True
+            if row.status == "active":
+                return False  # 已有活跃操作
+            # completed → 原子条件更新（只一个并发成功）
+            result = conn.execute(
+                self._dataset_publish_locks.update().where(
+                    self._dataset_publish_locks.c.dataset_id == dataset_id,
+                    self._dataset_publish_locks.c.status != "active",
+                ).values(operation_id=operation_id,
+                        operation_type=operation_type,
+                        status="active", created_at=_now(),
+                        released_at=None))
+            return result.rowcount > 0
+
+    def release_publish_lock(
+        self, dataset_id: str, operation_id: str,
+        *, outcome: str = "completed",
+    ) -> bool:
+        """释放发布占用（匹配 operation_id；不匹配不释放他方）。"""
+        result = None
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                self._dataset_publish_locks.update().where(
+                    self._dataset_publish_locks.c.dataset_id == dataset_id,
+                    self._dataset_publish_locks.c.operation_id == operation_id,
+                    self._dataset_publish_locks.c.status == "active",
+                ).values(status=outcome, released_at=_now()))
+        return result is not None and result.rowcount > 0
+
+    def get_active_publish_lock(
+        self, dataset_id: str,
+    ) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(select(self._dataset_publish_locks).where(
+                self._dataset_publish_locks.c.dataset_id == dataset_id,
+                self._dataset_publish_locks.c.status == "active",
+            )).first()
+        if row is None:
+            return None
+        return {"operation_id": row.operation_id,
+                "operation_type": row.operation_type,
+                "created_at": row.created_at}
 
 
 def _new_id() -> str:

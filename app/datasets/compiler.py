@@ -253,16 +253,14 @@ class DatasetCompiler:
             del detail_key
 
         # 中心表直接聚合指标（aggregate 类型）
-        # M4 指标过滤：首版中心直接指标的过滤与数据集 WHERE 合并
-        # （同作用于中心表；不与其他指标的过滤混淆——各指标独立编译）
-        central_metric_filters: list[str] = []
+        # 修复轮 3：各指标过滤使用**条件聚合表达式**（各自 CASE WHEN），
+        # 不合并到全局 WHERE——多指标不同过滤互不污染。
         for metric_sel in spec.metrics:
             metric = whitelist.metrics.get(metric_sel["metric_id"])
             if metric is None:
                 raise ValueError(f"指标不在模型：{metric_sel['metric_id']}")
-            central_metric_filters.extend(
-                _metric_filters_sql(metric, "c0"))
-            expr = self._metric_expression(metric, whitelist, "c0")
+            expr = self._conditional_aggregate(
+                metric, whitelist, "c0", _metric_filters_sql)
             alias = _alias(metric_sel.get("output_alias")
                            or metric_sel["metric_id"].rsplit(".", 1)[-1])
             select_parts.append(f"{expr} AS {quote(alias)}")
@@ -302,10 +300,8 @@ class DatasetCompiler:
                     extra = " AND ".join(dim_on_conditions[alias])
                     joins[index] = f"{join} AND ({extra})"
 
-        all_central_conditions = central_conditions + \
-            central_metric_filters
-        where = f" WHERE {' AND '.join(all_central_conditions)}" \
-            if all_central_conditions else ""
+        where = f" WHERE {' AND '.join(central_conditions)}" \
+            if central_conditions else ""
         with_clause = f"WITH {', '.join(ctes)}\n" if ctes else ""
         group_by = ""
         if spec.grain_keys:
@@ -336,6 +332,39 @@ class DatasetCompiler:
                     ref["column"].lower()):
                 return bool(attribute.get("sensitive"))
         return False
+
+    def _conditional_aggregate(
+        self, metric: dict[str, Any], whitelist: "Whitelist", alias: str,
+        _metric_filters_sql: Any,
+    ) -> str:
+        """带指标过滤的条件聚合（修复轮 3：各指标独立计算范围）。
+
+        无过滤时退化为普通聚合；有过滤时使用 CASE WHEN——
+        COUNT → SUM(CASE WHEN cond THEN 1 ELSE 0 END)
+        SUM  → SUM(CASE WHEN cond THEN col END)
+        AVG  → SUM(CASE WHEN cond THEN col END) / NULLIF(SUM(CASE WHEN cond THEN 1 ELSE 0 END), 0)
+        """
+        predicates = _metric_filters_sql(metric, alias)
+        if not predicates:
+            return self._metric_expression(metric, whitelist, alias)
+        condition = " AND ".join(predicates)
+        aggregation = metric.get("aggregation")
+        measure = (metric.get("measure_field") or {}).get("column")
+        if aggregation == "count_rows":
+            return f"SUM(CASE WHEN {condition} THEN 1 ELSE 0 END)"
+        if aggregation == "count_distinct":
+            keys = metric.get("distinct_keys") or []
+            cols = ", ".join(f"{alias}.{quote(k['column'])}" for k in keys)
+            return f"COUNT(DISTINCT CASE WHEN {condition} THEN {cols} END)"
+        if aggregation in ("sum", "min", "max"):
+            col = f"{alias}.{quote(measure)}"
+            return f"{aggregation.upper()}(CASE WHEN {condition} THEN {col} END)"
+        if aggregation == "avg":
+            col = f"{alias}.{quote(measure)}"
+            return (
+                f"SUM(CASE WHEN {condition} THEN {col} END) / "
+                f"NULLIF(SUM(CASE WHEN {condition} THEN 1 ELSE 0 END), 0)")
+        raise ValueError(f"不支持的聚合：{aggregation}")
 
     def _metric_expression(
         self, metric: dict[str, Any], whitelist: Whitelist, alias: str

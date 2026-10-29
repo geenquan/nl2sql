@@ -169,12 +169,29 @@ def validate_controlled_select(
                     raise SQLSafetyError("拒绝 SELECT *（要求显式列）")
 
     # 函数白名单（聚合 + 基础函数；其余拒绝）
+    # 修复轮 3：AND/OR/NOT/CASE/WHEN 等表达式节点不是函数调用——
+    # sqlglot 中 ConnectivePrcondition/Condition 系列继承自 Expression
+    # 而非 Func；但某些版本 CASE 也继承 Func——显式排除表达式节点
+    _EXPRESSION_NODES = tuple(
+        node for node in (
+            getattr(exp, name, None) for name in (
+                "And", "Or", "Not", "Case", "If", "Cast",
+                "Between", "In", "Not", "Is", "EQ", "NEQ",
+                "GT", "GTE", "LT", "LTE", "Paren", "Boolean",
+                "LogicalAnd", "LogicalOr", "Case",
+                "Exists", "Group", "Lambda",
+            )
+        ) if node is not None
+    )
     for func in tree.find_all(exp.Func):
+        if isinstance(func, _EXPRESSION_NODES):
+            continue  # 表达式节点（AND/OR/CASE 等）不是函数调用
         name = (func.sql_name() or "").lower()
-        if name in ("", "anonymous"):
+        if name in ("", "anonymous", "case"):
             inner = func.this
             name = (str(inner) if inner is not None else "").lower()
-        if not name:
+        if not name or name in ("and", "or", "not", "case", "when", "else",
+                                 "then", "end", "if"):
             continue
         if name not in _ALLOWED_FUNCTIONS:
             raise SQLSafetyError(

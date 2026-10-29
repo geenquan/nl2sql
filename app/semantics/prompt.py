@@ -69,6 +69,8 @@ _SECRET_KEY_VALUE = re.compile(
     r'(\s*[:：=]\s*(bearer\s+)?("[^"]*"|\'[^\']*\'|[^。；;！!？?]*))'
 )
 _SECRET_INLINE = re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9-]{7,}")
+# 无键名前缀的 Bearer 凭证形态（Authorization Bearer X 的子串同样命中）
+_BEARER_INLINE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
 
 
 def _mask_inline(text: str, pattern: re.Pattern[str]) -> str:
@@ -87,6 +89,7 @@ def sanitize_text_for_model(text: str, max_len: int = _MAX_COMMENT_LENGTH) -> st
     cleaned = _mask_inline(cleaned, _MOBILE_PHONE_RE)
     cleaned = _mask_inline(cleaned, _ID_CARD_18_RE)
     cleaned = _SECRET_INLINE.sub("sk-***", cleaned)
+    cleaned = _BEARER_INLINE.sub("Bearer ***", cleaned)
     # 键值敏感信息：保留键名、完整遮蔽值（含 Bearer/引号/空格，直到句界或串尾）
     cleaned = _SECRET_KEY_VALUE.sub(lambda m: m.group(1) + "=***", cleaned)
     for injection in _INJECTION_PATTERNS:

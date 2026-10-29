@@ -216,12 +216,20 @@ class SemanticModelService:
             details["m2"].append(
                 "缺少完整 M2 依赖信息（历史模型）：保守降级，重建后恢复")
         else:
+            # 收尾轮：字段语义依赖与构建时同语义——读 effective（人工确认
+            # 优先解析），不用 history[0]（latest 机器建议不改变 effective）；
+            # 按 table_id 一次缓存整表 effective 结果。
+            effective_by_table: dict[str, dict[str, Any]] = {}
             for ref, adopted_revision in field_deps.items():
                 table_id, _, column = ref.partition(".")
-                history = self._repo.get_field_semantics_history(
-                    table_id, column)
-                effective_revision = history[0].get("revision") if history \
-                    else None
+                if table_id not in effective_by_table:
+                    rows = self._repo.list_field_semantics(
+                        table_id, effective=True)
+                    effective_by_table[table_id] = {
+                        row.get("column_name"): row for row in rows}
+                effective_row = effective_by_table[table_id].get(column)
+                effective_revision = (
+                    effective_row.get("revision") if effective_row else None)
                 if effective_revision != adopted_revision:
                     details["m2"].append(
                         f"字段语义修订变化：{ref} 采用 {adopted_revision}"
@@ -282,31 +290,62 @@ class SemanticModelService:
         return enriched
 
     def _sanitize_model_text(self, model: dict[str, Any]) -> dict[str, Any]:
-        """读取/导出边界的自由文本净化（修复轮）：历史版本不改写存储行，
-        但 API/导出不得继续原样暴露敏感文本；结构性标识（Schema/表/列/
-        关系键）不净化。净化后业务名不可用时回退原始字段名并注明。"""
+        """读取/导出边界的自由文本净化（收尾轮：独立深拷贝 + 全字段覆盖）。
+
+        - 覆盖实体名/别名/用途说明/属性业务名与证据说明、主题名/描述/
+          grain 业务描述、指标名/描述/统计粒度描述/确认备注、change_note；
+        - 结构性标识（Schema/表/列/关系键/对象 ID/过滤值）不净化；
+        - 历史版本只在读取/API/导出边界净化，不改写存储行；
+        - 净化使用深拷贝，不修改调用方持有的模型对象；
+        - 净化后业务名不可用按既有策略回退原始标识。"""
+        sanitized = copy.deepcopy(model)
         sanitize = sanitize_text_for_model
-        for entity in model.get("entities", []):
-            entity["name"] = sanitize(entity.get("name") or "", 60) \
-                or entity.get("source", {}).get("table", entity["name"])
-            if entity.get("purpose_note"):
-                entity["purpose_note"] = sanitize(entity["purpose_note"], 120)
+
+        def _clean(value: Any, limit: int, fallback: str | None = None) -> Any:
+            if not isinstance(value, str) or not value:
+                return value
+            cleaned = sanitize(value, limit)
+            if fallback is not None and not cleaned.strip():
+                return fallback
+            return cleaned
+
+        sanitized["change_note"] = _clean(sanitized.get("change_note"), 200)
+        for entity in sanitized.get("entities", []):
+            entity["name"] = _clean(
+                entity.get("name"), 60,
+                fallback=(entity.get("source") or {}).get(
+                    "table", entity.get("name")))
+            entity["aliases"] = [
+                _clean(alias, 60) for alias in entity.get("aliases") or []]
+            entity["purpose_note"] = _clean(entity.get("purpose_note"), 120)
             for attribute in entity.get("attributes", []):
                 if attribute.get("name_source") != "column_name":
-                    cleaned = sanitize(attribute.get("business_name") or "", 60)
-                    if not cleaned.strip():
-                        attribute["business_name"] = attribute["field"]["column"]
+                    attribute["business_name"] = _clean(
+                        attribute.get("business_name"), 60,
+                        fallback=attribute["field"]["column"])
+                    if attribute.get("business_name") == \
+                            attribute["field"]["column"]:
                         attribute["name_source"] = "column_name"
-                    else:
-                        attribute["business_name"] = cleaned
                 for evidence in attribute.get("evidence", []):
-                    if isinstance(evidence.get("detail"), str):
-                        evidence["detail"] = sanitize(evidence["detail"], 160)
-        for metric in model.get("metrics", []):
+                    evidence["detail"] = _clean(evidence.get("detail"), 160)
+        for topic in sanitized.get("topics", []):
+            topic["name"] = _clean(topic.get("name"), 60)
+            topic["description"] = _clean(topic.get("description"), 160)
+            grain = topic.get("grain") or {}
+            grain["statement"] = _clean(grain.get("statement"), 200)
+            grain["missing"] = [_clean(m, 160) for m in grain.get("missing") or []]
+        for metric in sanitized.get("metrics", []):
+            metric["name"] = _clean(metric.get("name"), 60)
+            metric["description"] = _clean(metric.get("description"), 160)
+            metric["grain_statement"] = _clean(
+                metric.get("grain_statement"), 200)
+            confirmation = metric.get("business_confirmation")
+            if isinstance(confirmation, dict):
+                confirmation["note"] = _clean(confirmation.get("note"), 160)
             metric["display_expression"] = derive_display_expression(metric)
-            if metric.get("description"):
-                metric["description"] = sanitize(metric["description"], 160)
-        return model
+            for evidence in metric.get("evidence", []):
+                evidence["detail"] = _clean(evidence.get("detail"), 160)
+        return sanitized
 
     # -- 人工修订（新版本，服务端核验引用） ---------------------------------------
 
@@ -324,7 +363,7 @@ class SemanticModelService:
             "based_on_version": base_version,
             "created_at": now_iso(),
             "created_by": reviewer,  # 本地开发输入，不宣称身份认证
-            "change_note": note,
+            "change_note": sanitize_text_for_model(note, 200) if note else None,
         })
         self._apply_changes(revised, changes, reviewer)
         try:
@@ -393,21 +432,25 @@ class SemanticModelService:
                 raise ValueError(
                     f"grain 修订必须显式 confirm=true：{topic_id}"
                     "（无结构证明的键会被保留为待验证草稿）")
-            old_keys = list(topic["grain"].get("keys") or [])
-            old_basis = topic["grain"].get("basis")
+            # 完整旧 grain（收尾轮：业务定义=statement+keys+basis 一致判定；
+            # statement 去首尾空白比较，无意义空白不触发失效）
+            old_grain = topic["grain"] or {}
+            old_definition = (
+                (old_grain.get("statement") or "").strip(),
+                list(old_grain.get("keys") or []),
+                old_grain.get("basis"))
             topic["grain"].update({
-                "statement": statement, "keys": list(keys),
+                "statement": sanitize_text_for_model(statement, 200),
+                "keys": list(keys),
                 "basis": basis,
                 "confirmed": True, "confirmed_by": reviewer,
                 "missing": [],
             })
             # 主题与中心实体 grain 保持一致（修复轮：同一事实两处引用）
             central["grain"].update(topic["grain"])
-            if old_keys != list(keys) or old_basis != basis \
-                    or not (topic["grain"].get("confirmed") or False) \
-                    and False:
-                grain_changed_topics.add(topic_id)
-            if old_keys != list(keys) or old_basis != basis:
+            new_definition = (
+                statement.strip(), list(keys), basis)
+            if new_definition != old_definition:
                 grain_changed_topics.add(topic_id)
 
         for topic_id, name in (changes.get("topic_names") or {}).items():
@@ -424,12 +467,15 @@ class SemanticModelService:
                 raise ValueError(f"未知属性：{attribute_id}")
             attribute["status"] = "business_confirmed"
 
+        confirmed_in_request: set[str] = set()
         for metric_id, metric_change in (changes.get("metrics") or {}).items():
             metric = metrics.get(metric_id)
             if metric is None:
                 raise ValueError(f"未知指标：{metric_id}")
-            self._apply_metric_change(
-                metric, metric_change, fields_by_ref, entities_by_id, reviewer)
+            if self._apply_metric_change(
+                    metric, metric_change, fields_by_ref, entities_by_id,
+                    reviewer):
+                confirmed_in_request.add(metric_id)
 
         for topic_id, path_id in (changes.get("selected_paths") or {}).items():
             topic = topics.get(topic_id)
@@ -474,7 +520,10 @@ class SemanticModelService:
                  if t["central_entity_id"] == metric.get("entity_id")), None)
             if topic is None:
                 continue
-            if topic["topic_id"] in grain_changed_topics:
+            if (topic["topic_id"] in grain_changed_topics
+                    and metric["metric_id"] not in confirmed_in_request):
+                # grain 实质变化使旧确认失效；本请求已按新 grain 重新确认的
+                # 指标不重复撤销（确认发生在 grain 更新之后，基于新定义校验）
                 self._invalidate_metric_confirmation(
                     metric, "主题 grain 变化：统计口径需重新确认")
             metric["grain_statement"] = (
@@ -493,16 +542,24 @@ class SemanticModelService:
                 return "unique_constraint", []
         return "unknown", ["粒度键无结构证明"]
 
-    @staticmethod
+    # 待重新业务确认类阻断的稳定标记（收尾轮）：confirm 校验新定义通过后
+    # 仅解除此类条目；真正的安全/结构阻断（人工否决、扇出等）永不因确认消失。
+    _RECONFIRM_MARKER = "[待重新确认]"
+
+    @classmethod
     def _invalidate_metric_confirmation(
-        metric: dict[str, Any], reason: str
+        cls, metric: dict[str, Any], reason: str
     ) -> None:
-        """口径实质变化：撤销业务确认与不再适用的数据验证证据（修复轮）。"""
+        """口径/grain 实质变化：撤销业务确认与不再适用的数据验证证据。
+
+        写入带稳定标记的待确认条目——新定义完整校验并明确确认后解除；
+        不清空其他阻断。"""
         if metric.get("status") in ("business_confirmed", "published"):
             metric["status"] = "suggested"
             metric["business_confirmation"] = None
             metric["data_validation"] = None
-            metric.setdefault("blocking", []).append(reason)
+            metric.setdefault("blocking", []).append(
+                f"{cls._RECONFIRM_MARKER} {reason}")
             metric["blocking"] = list(dict.fromkeys(metric["blocking"]))
 
     # 口径字段（修复轮定义）：实质变化必须撤销确认重新审核；
@@ -596,7 +653,7 @@ class SemanticModelService:
             metric["business_confirmation"] = None
             metric.setdefault("blocking", []).append("人工否决（不进入正式集合）")
             metric["blocking"] = list(dict.fromkeys(metric["blocking"]))
-            return
+            return False
         if action == "confirm":
             errors = self._validate_metric_definition(metric, entities_by_id)
             if errors:
@@ -612,23 +669,28 @@ class SemanticModelService:
                 raise ValueError(
                     f"确认 {metric['metric_id']} 前必须处理状态过滤口径"
                     "（提供 filters 或显式 skip_status_filter=true）")
-            # confirm 只解除有明确依据的待确认项（口径类）；未知/安全阻断保留
+            # confirm 解除：①带稳定标记的待重新确认类（新定义已完整校验）；
+            # ②有明确依据的口径标签类。未知/安全/业务阻断保留。
             resolved = ("时间口径", "单位", "计量口径", "状态过滤", "过滤口径")
             metric["blocking"] = [
                 b for b in metric.get("blocking", [])
-                if not any(tag in b for tag in resolved)
-                or not (
-                    ("时间口径" in b and metric.get("time_basis"))
-                    or ("单位" in b and metric.get("unit"))
-                    or ("计量口径" in b and metric.get("unit"))
-                    or ("状态过滤" in b and (metric.get("filters")
-                                             or change.get("skip_status_filter")))
-                    or ("过滤口径" in b and metric.get("filters")))]
+                if not b.startswith(self._RECONFIRM_MARKER)
+                and not (
+                    any(tag in b for tag in resolved) and (
+                        ("时间口径" in b and metric.get("time_basis"))
+                        or ("单位" in b and metric.get("unit"))
+                        or ("计量口径" in b and metric.get("unit"))
+                        or (("状态过滤" in b or "过滤口径" in b)
+                            and (metric.get("filters")
+                                 or change.get("skip_status_filter")))))]
             metric["status"] = "business_confirmed"
             metric["business_confirmation"] = {
                 "confirmed_by": reviewer, "confirmed_at": now_iso(),
-                "note": change.get("note"),
+                "note": sanitize_text_for_model(
+                    str(change["note"]), 160) if change.get("note") else None,
             }
+            return True
+        return False
 
     @staticmethod
     def _is_temporal_field(attribute: dict[str, Any]) -> bool:
@@ -861,27 +923,13 @@ class SemanticModelService:
         checks["suggested_metric_count"] = sum(
             1 for m in model.get("metrics", []) if m.get("status") == "suggested")
 
-        # 路径影响判定（修复轮：结构化引用替代前缀硬编码）
+        # 路径状态如实报告（收尾轮）：风险路径保持 blocked/needs_review
+        # 且不可被选为安全路径；但首版指标只支持本实体字段（跨实体定义在
+        # _validate_metric_definition 处显式拒绝），不使用关联路径——
+        # 不得因"存在指向该实体的风险路径"阻断该实体本表指标的发布。
         checks["path_issues"] = [
             p["path_id"] for p in model.get("paths", [])
             if p.get("status") != "available"]
-        entity_id_by_table: dict[tuple[str, str], str] = {
-            (e.get("source", {}).get("schema"),
-             e.get("source", {}).get("table")): e["entity_id"]
-            for e in model.get("entities", []) if e.get("source")}
-        for path in model.get("paths", []):
-            if path.get("status") != "blocked":
-                continue
-            affected_entity = entity_id_by_table.get(
-                (path.get("to", {}).get("schema"),
-                 path.get("to", {}).get("table")))
-            if affected_entity and any(
-                    m.get("entity_id") == affected_entity
-                    and m.get("status") in ("business_confirmed", "published")
-                    for m in model.get("metrics", [])):
-                issues.append(
-                    f"阻断路径影响正式指标（重复计数风险未解决）："
-                    f"{path['path_id']} → {affected_entity}")
         return {"valid": not issues, "issues": issues, "checks": checks,
                 "dependency_info": dependency_info}
 

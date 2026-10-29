@@ -624,23 +624,18 @@ class TestPathRiskAndManualSelection:
         assert still_blocked["status"] == "blocked"  # 未选阻断路径不降级
 
     def test_validation_uses_structural_refs_non_app_schema(self, tmp_path):
-        """非 app Schema 的正式指标受阻断路径影响（结构化引用判定）。"""
+        """收尾轮 2 语义修正：风险路径不因终点同名阻断本表正式指标
+        （首版指标仅用本实体字段；跨 Schema 同名表不串用影响范围）。"""
         repo, source_id, service = _new_env(tmp_path)
         seed_relationships(repo, source_id, "snap-m4", m4_catalog(source_id), [{
             "src": "no_pk_notes", "src_cols": ["note_text"],
              "tgt": "audit_log", "tgt_cols": ["entity_type"],
              "cardinality": "many_to_many", "status": "validated"}])
         model = service.build_model(source_id)
-        # 确认一个 audit_log 指标并确认 grain
         audit_metric = next(
             (m for m in model["metrics"]
              if m["entity_id"] == f"{SCHEMA}.audit_log"
              and m["aggregation"] == "count_rows"), None)
-        if audit_metric is None:
-            audit_entity = next(
-                e for e in model["entities"]
-                if e["entity_id"] == f"{SCHEMA}.audit_log")
-            assert audit_entity  # 实体存在但无主题（log_history 不建主题）
         grains = {
             t["topic_id"]: {
                 "statement": "s", "keys": t["grain"]["keys"], "confirm": True}
@@ -654,12 +649,13 @@ class TestPathRiskAndManualSelection:
             model["model_id"], model["version"], changes, reviewer="dev")
         report = service.validate_model(
             revised["model_id"], revised["version"])
-        # 若存在阻断路径指向已确认指标实体 → 结构化判定命中（无 app 前缀硬编码）
+        # 阻断路径保持 blocked 且如实上报；但不产生“影响正式指标”误伤
         blocked_to_audit = [
-            p for p in revised["paths"] if p["status"] == "blocked"
-            and p["to"]["table"] == "audit_log"]
-        if audit_metric is not None and blocked_to_audit:
-            assert any("阻断路径影响正式指标" in i for i in report["issues"])
+            p for p in revised["paths"] if p["status"] == "blocked"]
+        assert all(p["path_id"] in report["checks"]["path_issues"]
+                   for p in blocked_to_audit)
+        assert not any("阻断路径影响正式指标" in i for i in report["issues"])
+        assert not any("audit_log" in i for i in report["issues"])
 
 
 # == P1-7：grain 依据重核 ==========================================================

@@ -1,6 +1,81 @@
 # 开发交接报告
 
-更新时间：2026-10-30（M5 恢复修复轮：恢复依据外部副作用前持久化、待恢复占用 pending/recovering 状态机与单事务恢复提交、timeout_ms/总期限/结果字节三重阻断三条链路补齐；新增 18 项回归，全量 725 passed；全部离线验证）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-30（M5 最后定点修复轮：恢复前置指针核对+别名防护、创建结果不明保留 pending、ES 请求保留有限默认超时+多请求按剩余期限递减；新增 14 项回归（10 项先在旧实现失败），全量 739 passed；全部离线验证）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M5 最后定点修复轮（2026-10-30，三项，回归先行）
+
+### 一（P1）：恢复先核对指针，再切换 ES alias
+
+- 根因（复现）：`_reconcile_locked` 先 switch_alias 再经
+  `complete_dataset_reconciliation` 检查前指针——指针已被移到 v999 时
+  返回 pointer_conflict，但 alias 已被改回 v1（实际外部副作用）。
+- 修改：`dataset_service.reconcile/_reconcile_locked`——认领 recovering+
+  验证恢复依据后**立即读取当前指针**，只允许 ==previous_pointer 或
+  ==目标版本（None＝当时无指针的明确比较条件，不是"不检查"）；其他
+  情况退回 pending 返回 pointer_conflict，**不调用 switch_alias、不改
+  状态/指针/审计**。事务内条件比较保留（前置核对避免已知冲突下的外部
+  副作用，事务比较保护本地提交）；恢复全程持有 recovering 占用。
+- 别名防护：alias 指向既非本次目标、也非原前指针对应索引的未知索引时
+  返回 alias_conflict 保留 pending（不把未知索引作为 previous_index
+  移除）；原前指针为空且 alias 不存在＝首次发布，正常恢复。
+- 回归（旧实现失败）：指针 v999+alias 无关索引 → pointer_conflict 且
+  alias_history 不增/alias 不变/指针状态审计不变；alias 无关索引 →
+  alias_conflict 不覆盖；正常恢复+幂等恢复仍通过。
+
+### 二（P1）：创建调用结果不明保留 pending
+
+- 根因（复现）：external_created 只在创建调用正常返回后为 True——
+  服务端创建成功、响应丢失/连接断开时调用抛异常，被误判为确定失败：
+  failed_publish+释放占用，下一次发布绕过结果未明的操作。
+- 修改：`_publish_es/_publish_view` 在创建调用前落库 phase
+  creating_index/creating_view（结果不明时恢复依据已持久化）；新增
+  `ExternalOutcomeUnknownError`（app/core/exceptions）与
+  `_creation_definitely_absent` 分类——传输错误/连接中断/服务端 5xx/
+  MySQL 视图 DDL 后异常 → 结果不明 → needs_reconciliation+pending；
+  明确已存在（index_exists/视图已存在）、4xx 明确拒绝
+  （index_create_rejected）、调用前参数校验（ValueError/invalid_timeout）
+  → 确定未创建 → failed_publish+释放。finally 不把 pending 改成
+  failed/completed。ESHttpPublisher.create_version_index 按异常类别
+  （HTTPStatusError 5xx/4xx、TransportError、其他 HTTPError）分类；
+  MySQLViewPublisher DDL 后异常改抛结果不明。
+- 恢复边界（保守，不自动处理）：对象明确不存在可确定失败；查询对象
+  状态失败回 pending；对象存在但导出未完整继续阻断（不自动重导出、
+  不删孤立索引、无后台恢复——创建结果不明且索引已建的极端情形需人工
+  处置，本轮如实保留该边界）。
+- 回归（旧实现失败）：ES 替身"先真实创建索引再抛响应丢失"→ 索引存在
+  +needs_reconciliation+pending，新发布/回滚 409 且无额外外部副作用；
+  视图同场景 → pending，故障移除后既有 reconcile 正确恢复。
+
+### 三（P2）：ES 请求保留默认超时，重试使用剩余期限
+
+- 根因一：`_request_timeout(None)` 返回 None 且显式传给 httpx——HTTPX
+  中 timeout=None 是**关闭超时**（不是用客户端默认），reconcile 未传
+  timeout_ms 的调用可能无限等待。根因二：HEAD/PUT 与 bulk 每次重试复用
+  同一 timeout_ms，不扣除已消耗时间。
+- 修改：`ESHttpPublisher`（`_deadline_from/_request_timeout_before/
+  _check_deadline` 替代 `_request_timeout`）：未指定 timeout_ms 用
+  构造配置的有限默认（绝不传 None）；timeout_ms≤0 在发出请求前拒绝
+  （invalid_timeout）；HEAD+PUT 与 bulk 重试在入口计算一次绝对截止，
+  每次请求前重算剩余（≤配置上限），耗尽即停止不启动下一次请求，响应
+  返回后同样检查（超期结果不得使发布继续成功）；时钟可注入
+  （构造参数 clock）。`reconcile` 建立恢复共享 run_context：
+  count/别名查询/切换/本地提交用同一剩余期限；期限耗尽→不切别名、
+  不提交指针、占用退回 pending（保留安全领域错误）。重试次数不变。
+- 回归（旧实现失败，**全部经 httpx.MockTransport 验证真实
+  ESHttpPublisher 的实际请求超时**）：A 不传 timeout_ms → 四项超时
+  均为配置的 5.0（旧实现全 None）；B HEAD 消耗 9.5s/10s → PUT 用
+  ~0.5s 剩余（旧实现复用 10s）；期限耗尽 PUT 不发出；C bulk 重试第
+  二次超时降到 ~4s、期限耗尽后第三次不发出（旧实现复用同一值）；D
+  reconcile count 耗尽 0.3s 期限 → 不切别名/不提交指针/回 pending/
+  无恢复审计。
+
+### 验证
+
+- 新增 `tests/test_m5_final_fix_round.py` 14 项（10 项在修复前失败，
+  4 项守护既有行为：正常/幂等恢复、明确已存在释放、核对网络失败保
+  pending、并发认领恰一）。
+- `python -m pytest -q` → **739 passed, 9 skipped**；ruff（app tests
+  scripts）/ pip check 通过（全部离线；真实 MySQL/ES 发布仍未验证）。
 
 ## M5 恢复修复轮（2026-10-30，三组问题，回归先行）
 

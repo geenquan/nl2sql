@@ -83,3 +83,11 @@ class ValidationResultBudgetExceededError(AppError):
 
     不返回部分超限结果（避免调用方消费超预算数据）；固定安全文案，
     不含任何业务值内容。"""
+
+
+class ExternalOutcomeUnknownError(AppError):
+    """外部目标操作结果不明：请求已发出，但响应丢失/超时/连接中断，
+    或服务端 5xx——无法确定对象是否已创建。
+
+    固定安全文案（不含响应正文/凭证/业务数据）。调用方不得把它当作
+    "确定未发生副作用"释放占用——必须保留待核对（pending）。"""

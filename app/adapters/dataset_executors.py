@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 
 from app.core.exceptions import (
     DataSourceConnectionError,
+    ExternalOutcomeUnknownError,
     ValidationDeadlineExceededError,
     ValidationQueryTimeoutError,
     ValidationResultBudgetExceededError,
@@ -445,6 +446,7 @@ class MySQLViewPublisher(ViewPublisher):
         self, target_schema: str, view_name: str, select_sql: str,
         params: dict[str, Any] | None = None,
     ) -> None:
+        # 参数字面量化/标识符校验在连接前（失败＝确定未执行 DDL）
         literal_sql = SQLiteViewPublisher._inline_params(
             select_sql, params, dialect="mysql")
         # 最终 SELECT 定义重新过 AST 白名单（目标 Schema/视图名标识符校验）
@@ -463,10 +465,12 @@ class MySQLViewPublisher(ViewPublisher):
                 raise ValueError(
                     f"目标视图已存在（不覆盖用户对象）："
                     f"{target_schema}.{view_name}") from None
-            raise DataSourceConnectionError(
-                "view_publish_failed",
-                "目标视图创建失败（view_publish_failed）；错误详情已抑制"
-            ) from None
+            # DDL 已发出后的任何失败（连接断开/读超时/响应丢失）：
+            # 服务端可能已创建——结果不明，不得当确定失败释放占用
+            raise ExternalOutcomeUnknownError(
+                "view_publish_unknown",
+                "目标视图创建结果不明（view_publish_unknown）；"
+                "请求已发出，响应未确认；详情已抑制") from None
 
     def view_exists(self, target_schema: str, view_name: str) -> bool:
         try:

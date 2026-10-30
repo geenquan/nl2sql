@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from app.core.config import Settings
 from app.core.exceptions import (
+    ExternalOutcomeUnknownError,
     ResourceNotFoundError,
     RevisionConflictError,
     ValidationDeadlineExceededError,
@@ -521,12 +522,33 @@ class DatasetService:
         recovery.update(updates)
         self._persist_run(run)
 
+    @staticmethod
+    def _creation_definitely_absent(exc: Exception) -> bool:
+        """创建调用异常是否"确定未产生外部副作用"（可 failed+释放占用）。
+
+        分类（最后修复轮）：
+        - index_exists / 明确已存在：服务端明确状态（非本次创建）；
+        - index_create_rejected：4xx 明确拒绝（未创建）；
+        - invalid_timeout：请求发出前被拒（无副作用）；
+        - ValueError（视图定义参数校验，DDL 连接前）；
+        其余（网络/响应丢失/服务端 5xx/期限中止）一律视为结果不明——
+        服务端可能已创建，不得释放占用。
+        """
+        if isinstance(exc, ExternalOutcomeUnknownError):
+            return False
+        reason = getattr(exc, "reason", "")
+        if reason in ("index_exists", "index_create_rejected",
+                      "invalid_timeout"):
+            return True
+        return isinstance(exc, ValueError) and "已存在" not in str(exc)
+
     def _finish_lock(self, dataset_id: str, run_id: str,
-                     final: str | None, external_created: bool) -> None:
-        """收尾占用：completed/failed 为终态；外部副作用后未定 → pending
-        （待核对占用，由 reconcile 认领；新发布/回滚不得绕过）。"""
+                     final: str | None, external_side: bool) -> None:
+        """收尾占用：completed/failed 为终态；外部副作用已发生或结果
+        不明 → pending（待核对占用，由 reconcile 认领；新发布/回滚不得
+        绕过；finally 不得把 pending 改成 failed/completed）。"""
         if final is None:
-            final = "pending" if external_created else "failed"
+            final = "pending" if external_side else "failed"
         if final in ("completed", "failed"):
             self._repo.release_publish_lock(dataset_id, run_id,
                                             outcome=final)
@@ -552,6 +574,7 @@ class DatasetService:
         run["result"] = {"recovery": recovery}
         self._persist_run(run)
         external_created = False
+        creation_unknown = False  # 创建请求已发出但结果不明（响应丢失等）
         lock_acquired = False
         final_lock: str | None = None
         try:
@@ -571,13 +594,16 @@ class DatasetService:
                     payload["dataset_id"], payload["version"], "publishing"):
                 raise RevisionConflictError(
                     "并发发布冲突：版本状态已被其他发布变更（publishing）")
+            # 创建阶段先落库（结果不明时恢复依据已持久化）
+            self._set_recovery_phase(run, recovery, "creating_view")
             try:
                 publisher.create_versioned_view(
                     target_schema, view_name, plan["sql"], plan["params"])
-                external_created = True
             except ValueError as exc:
                 if "已存在" not in str(exc):
                     raise
+                # 明确目标已存在：服务端确定状态（幂等复用或 409，均非
+                # 结果不明——不设置 creation_unknown）
                 pointer_version = self._repo.get_published_dataset(
                     payload["source_id"], payload["dataset_id"])
                 if (publisher.view_exists(target_schema, view_name)
@@ -600,6 +626,11 @@ class DatasetService:
                 raise RevisionConflictError(
                     "并发发布冲突：目标视图已被其他发布创建"
                     "（同版本不重复创建冲突对象）") from None
+            except Exception as exc:
+                if not self._creation_definitely_absent(exc):
+                    creation_unknown = True  # 结果不明：不得当确定失败
+                raise
+            external_created = True
             self._set_recovery_phase(run, recovery, "view_created")
             if not publisher.view_exists(target_schema, view_name):
                 raise ValueError("目标视图创建后核对失败")
@@ -622,13 +653,15 @@ class DatasetService:
             run["errors"].append({
                 "reason": "publish_failed",
                 "message": f"发布失败[{type(exc).__name__}]；错误详情已抑制"})
-            # 只有获得了锁的线程才更新状态（未获锁的 409 失败方不覆盖）
+            # 只有获得了锁的线程才更新状态（未获锁的 409 失败方不覆盖）；
+            # 外部副作用已发生**或结果不明** → 待核对（不释放占用）
             if lock_acquired:
+                external_side = external_created or creation_unknown
                 self._repo.update_dataset_status(
                     payload["dataset_id"], payload["version"],
-                    "needs_reconciliation" if external_created
+                    "needs_reconciliation" if external_side
                     else "failed_publish")
-                final_lock = ("pending" if external_created else "failed")
+                final_lock = ("pending" if external_side else "failed")
             self._safe_finish_run(run)
             raise
         finally:
@@ -636,7 +669,8 @@ class DatasetService:
             # finally 不把 pending 覆盖为 failed/released
             if lock_acquired:
                 self._finish_lock(payload["dataset_id"], run["run_id"],
-                                  final_lock, external_created)
+                                  final_lock,
+                                  external_created or creation_unknown)
             publisher.close()
         self._safe_finish_run(run)
         return {"dataset_id": payload["dataset_id"],
@@ -677,6 +711,7 @@ class DatasetService:
         run["result"] = {"recovery": recovery}
         self._persist_run(run)
         external_created = False
+        creation_unknown = False  # 创建请求已发出但结果不明（响应丢失等）
         lock_acquired = False
         final_lock: str | None = None
         try:
@@ -698,9 +733,16 @@ class DatasetService:
                     "并发发布冲突：版本状态已被其他发布变更（publishing）")
             self._require_not_expired(run_context)
             mapping = self._es_mapping(payload, plan)
-            es.create_version_index(
-                index_name, mapping,
-                timeout_ms=self._remaining_ms(run_context))
+            # 创建阶段先落库（结果不明时恢复依据已持久化）
+            self._set_recovery_phase(run, recovery, "creating_index")
+            try:
+                es.create_version_index(
+                    index_name, mapping,
+                    timeout_ms=self._remaining_ms(run_context))
+            except Exception as exc:
+                if not self._creation_definitely_absent(exc):
+                    creation_unknown = True  # 结果不明：不得当确定失败
+                raise
             external_created = True
             self._set_recovery_phase(run, recovery, "index_created")
             exported = self._export_to_es(
@@ -751,19 +793,22 @@ class DatasetService:
             run["errors"].append({
                 "reason": "publish_failed",
                 "message": f"发布失败[{type(exc).__name__}]；错误详情已抑制"})
-            # 只有获得了锁的线程才更新状态；外部副作用已发生 → 待核对
+            # 只有获得了锁的线程才更新状态；外部副作用已发生**或创建结果
+            # 不明** → 待核对（不释放占用，不得被下一次发布绕过）
             if lock_acquired:
+                external_side = external_created or creation_unknown
                 self._repo.update_dataset_status(
                     payload["dataset_id"], payload["version"],
-                    "needs_reconciliation" if external_created
+                    "needs_reconciliation" if external_side
                     else "failed_publish")
-                final_lock = ("pending" if external_created else "failed")
+                final_lock = ("pending" if external_side else "failed")
             self._safe_finish_run(run)
             raise
         finally:
             if lock_acquired:
                 self._finish_lock(payload["dataset_id"], run["run_id"],
-                                  final_lock, external_created)
+                                  final_lock,
+                                  external_created or creation_unknown)
             es.close()
         self._safe_finish_run(run)
         return {"dataset_id": payload["dataset_id"],
@@ -969,13 +1014,16 @@ class DatasetService:
                 "rolled_back": True}
 
     def reconcile(self, dataset_id: str, version: int) -> dict[str, Any]:
-        """显式核对结果不明的发布尝试（恢复修复轮）。
+        """显式核对结果不明的发布尝试（最后修复轮）。
 
         认领**原发布操作**的 pending 占用（原子 pending→recovering），
         不生成新操作 ID、不走普通 acquire；并发 reconcile 恰一成功，
         失败方不修改占用/指针/别名。核对未定时占用退回 pending（可再核对），
         不永久停在 recovering，也不释放为普通空闲状态。
         旧运行没有 pending 占用时保守拒绝（不猜测、不覆盖新发布）。
+        恢复操作共享同一 run_context：count/别名查询/别名切换/本地提交
+        使用同一剩余期限（不逐调用重新计时）；期限耗尽不切别名、不提交
+        指针，占用退回 pending。
         """
         payload = self._repo.get_dataset(dataset_id, version=version)
         if payload is None:
@@ -992,9 +1040,11 @@ class DatasetService:
                 dataset_id, lock["operation_id"]):
             raise RevisionConflictError(
                 "数据集级发布冲突：恢复占用已被并发认领")
+        run_context = self._new_run_context()
         try:
             return self._reconcile_locked(
-                dataset_id, version, payload, lock["operation_id"])
+                dataset_id, version, payload, lock["operation_id"],
+                run_context)
         except Exception:
             # 恢复未完成：退回 pending（允许之后再次核对）
             self._repo.transition_publish_lock(
@@ -1024,7 +1074,7 @@ class DatasetService:
 
     def _reconcile_locked(
         self, dataset_id: str, version: int, payload: dict[str, Any],
-        operation_id: str,
+        operation_id: str, run_context: dict[str, Any],
     ) -> dict[str, Any]:
         def _back_to_pending() -> None:
             self._repo.transition_publish_lock(
@@ -1037,6 +1087,13 @@ class DatasetService:
             self._repo.transition_publish_lock(
                 dataset_id, operation_id, "recovering", "failed")
 
+        def _pointer_conflict() -> dict[str, Any]:
+            _back_to_pending()
+            return {"dataset_id": dataset_id, "version": version,
+                    "reconciled": "pointer_conflict",
+                    "current_pointer": self._repo.get_published_dataset(
+                        payload["source_id"], dataset_id)}
+
         recovery = self._recovery_basis(
             dataset_id, version, payload, operation_id)
         if recovery is None:
@@ -1047,7 +1104,18 @@ class DatasetService:
 
         previous_pointer = recovery.get("previous_pointer")  # None＝当时无指针
 
+        # 前置指针核对（最后修复轮：在查询外部对象/切换别名**之前**——
+        # 已知冲突时不得产生任何外部副作用；previous_pointer=None 是
+        # "当时没有指针"的明确比较条件，不是"不检查"）。
+        # 最终 complete_dataset_reconciliation 中的事务条件比较仍保留
+        # （前置核对避免无谓副作用，事务比较保护本地提交）。
+        current_pointer = self._repo.get_published_dataset(
+            payload["source_id"], dataset_id)
+        if current_pointer not in (previous_pointer, version):
+            return _pointer_conflict()
+
         if payload.get("target") == "view":
+            self._require_not_expired(run_context)
             publisher = self._view_publisher_factory()
             try:
                 exists = publisher.view_exists(
@@ -1060,15 +1128,12 @@ class DatasetService:
                 _definitive_failure()
                 return {"dataset_id": dataset_id, "version": version,
                         "reconciled": "external_object_missing"}
+            self._require_not_expired(run_context)
             outcome = self._repo.complete_dataset_reconciliation(
                 payload["source_id"], dataset_id, version, operation_id,
                 previous_pointer, operator="reconcile")
             if outcome == "pointer_conflict":
-                _back_to_pending()
-                return {"dataset_id": dataset_id, "version": version,
-                        "reconciled": "pointer_conflict",
-                        "current_pointer": self._repo.get_published_dataset(
-                            payload["source_id"], dataset_id)}
+                return _pointer_conflict()
             return {"dataset_id": dataset_id, "version": version,
                     "reconciled": "external_object_exists",
                     "pointer_restored": True}
@@ -1086,8 +1151,11 @@ class DatasetService:
         alias_name = recovery.get("alias") or self._es_alias_name(payload)
         es = self._es_publisher_factory()
         try:
+            self._require_not_expired(run_context)
             try:
-                count = es.count(index_name)
+                count = es.count(
+                    index_name,
+                    timeout_ms=self._remaining_ms(run_context))
             except Exception as exc:  # noqa: BLE001 - 区分确定缺失与查询失败
                 reason = getattr(exc, "reason", "")
                 if reason == "index_not_found":
@@ -1100,16 +1168,37 @@ class DatasetService:
                 return {"dataset_id": dataset_id, "version": version,
                         "reconciled": "count_failed",
                         "documents": None, "expected": expected}
+            self._require_not_expired(run_context)
             if count != expected:
                 _back_to_pending()
                 return {"dataset_id": dataset_id, "version": version,
                         "reconciled": "external_index_incomplete",
                         "documents": count, "expected": expected}
-            # alias 核对：已指向目标版本 → 直接提交；否则显式切换
-            current_index = es.get_alias_index(alias_name)
+            # alias 核对：已指向目标版本 → 直接提交；否则显式切换。
+            # 防护（最后修复轮）：alias 指向既非本次目标、也非原前指针
+            # 对应索引的未知索引时，不把它作为 previous_index 移除——
+            # 返回 alias_conflict 保留 pending（不覆盖不属于本次操作的
+            # 外部变化）。原前指针为空且 alias 不存在＝首次发布，正常恢复。
+            current_index = es.get_alias_index(
+                alias_name, timeout_ms=self._remaining_ms(run_context))
             if current_index != index_name:
+                expected_previous_index = (
+                    self._es_index_name({**payload, "version": previous_pointer})
+                    if previous_pointer is not None else None)
+                if (current_index is not None
+                        and current_index != expected_previous_index):
+                    _back_to_pending()
+                    return {"dataset_id": dataset_id, "version": version,
+                            "reconciled": "alias_conflict",
+                            "alias": alias_name,
+                            "alias_points_to": current_index,
+                            "expected_index": index_name,
+                            "documents": count, "expected": expected}
+                self._require_not_expired(run_context)
                 try:
-                    es.switch_alias(alias_name, index_name, current_index)
+                    es.switch_alias(
+                        alias_name, index_name, current_index,
+                        timeout_ms=self._remaining_ms(run_context))
                 except Exception:  # noqa: BLE001
                     _back_to_pending()
                     return {"dataset_id": dataset_id, "version": version,
@@ -1117,15 +1206,12 @@ class DatasetService:
                             "documents": count, "expected": expected}
         finally:
             es.close()
+        self._require_not_expired(run_context)
         outcome = self._repo.complete_dataset_reconciliation(
             payload["source_id"], dataset_id, version, operation_id,
             previous_pointer, operator="reconcile")
         if outcome == "pointer_conflict":
-            _back_to_pending()
-            return {"dataset_id": dataset_id, "version": version,
-                    "reconciled": "pointer_conflict",
-                    "current_pointer": self._repo.get_published_dataset(
-                        payload["source_id"], dataset_id)}
+            return _pointer_conflict()
         return {"dataset_id": dataset_id, "version": version,
                 "reconciled": "external_index_complete",
                 "pointer_restored": True,

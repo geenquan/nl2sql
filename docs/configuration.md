@@ -128,7 +128,7 @@ python --version
 | `ES_USER` / `ES_PASSWORD` | 空，无认证时留空；`ES_USER` 兼容旧名 `ES_USERNAME` |
 | `ES_API_KEY` | 空，与用户名/密码认证二选一 |
 | `ES_INDEX_PREFIX` | `nl2sql_wide`，宽表索引命名前缀 |
-| `ES_REQUEST_TIMEOUT_SECONDS` | `30` |
+| `ES_REQUEST_TIMEOUT_SECONDS` | `30`，单请求默认超时上限（含 HEAD/PUT/bulk 每次重试/别名与计数查询）；未指定运行剩余期限的请求使用该有限超时，不会关闭超时 |
 | `ES_VERIFY_CERTS` | `true`，HTTPS 校验证书 |
 | `ES_CA_CERTS` | 可选，本机 CA 证书文件路径；不使用时保持注释 |
 | `ES_BULK_BATCH_SIZE` | `500`，批量写入条数 |

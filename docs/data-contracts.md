@@ -382,6 +382,27 @@
   → 条件切指针 → 版本状态 published → 恢复审计 → 占用 completed；
   任一步失败全部回滚；ES count 网络错误≠索引不存在（index_not_found
   独立 reason），查询失败保留待核对（recovering→pending 可再核对）
+- 恢复前置核对与别名防护（最后修复轮）：认领 recovering+验证恢复依据后
+  **先核对当前指针**（只允许 ==previous_pointer 或 ==目标版本；None＝
+  当时无指针的明确比较条件），已知冲突时**不产生任何外部副作用**（不查
+  别名、不切别名、不改状态/指针/审计）——事务内条件比较保留用于保护
+  本地提交；alias 指向既非目标也非原前指针对应索引的未知索引时返回
+  alias_conflict 保留 pending（不把未知索引作为 previous_index 移除）；
+  恢复全程持有 recovering 占用
+- 创建结果不明分类（最后修复轮）：创建调用（索引/视图）结果不明
+  （请求已发出、响应丢失/超时/连接中断/服务端 5xx）抛
+  `ExternalOutcomeUnknownError` → needs_reconciliation+pending（服务端
+  可能已创建，不得当确定失败释放占用）；明确已存在（index_exists/
+  视图已存在）、4xx 明确拒绝、调用前参数校验失败为"确定未创建"→
+  failed_publish+释放；恢复侧对象明确不存在可确定失败，查询失败回
+  pending，对象存在但导出未完整保守阻断（不自动重导出/删孤立索引）
+- ES 请求超时（最后修复轮）：未指定 timeout_ms 的请求使用配置的有限
+  默认超时（不把 timeout=None 传给 HTTPX——那是关闭超时）；timeout_ms≤0
+  在发出请求前拒绝；HEAD+PUT 创建与 bulk 重试在操作入口计算一次绝对
+  截止时间，每次请求前重算剩余（不超过配置上限），耗尽即停止不再启动
+  下一次请求，响应返回后同样检查（超期结果不得使发布继续成功）；时钟
+  可注入测试；reconcile 共享同一 run_context（count/别名查询/切换/本地
+  提交同一剩余期限，期限耗尽→pending，不切别名不提交指针）
 - 视图：独立目标 DSN/Schema（默认关闭）；应用前缀版本化视图名
   （nl2sql_ds_前缀）；不覆盖用户对象（已存在→幂等刷新或 409）；
   回滚=指针切回仍 published 的旧版本（视图不删除）

@@ -11,13 +11,15 @@
 
 import base64
 import json
+import time
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, ClassVar
 
 import httpx
 from pydantic import SecretStr
 
-from app.core.exceptions import DataSourceConnectionError
+from app.core.exceptions import DataSourceConnectionError, ExternalOutcomeUnknownError
 
 
 class ESPublishError(DataSourceConnectionError, ValueError):
@@ -29,7 +31,17 @@ class ESPublishError(DataSourceConnectionError, ValueError):
 
 
 class ESHttpPublisher:
-    """真实 ES 发布器（httpx；配置默认关闭）。"""
+    """真实 ES 发布器（httpx；配置默认关闭）。
+
+    请求超时（最后修复轮）：
+    - 未指定 timeout_ms 的请求使用构造时配置的有限超时——**不得把
+      timeout=None 传给 httpx**（那是关闭超时，不是用默认值）；
+    - timeout_ms<=0 在发出请求前拒绝（invalid_timeout，不是无限等待）；
+    - 含多个 HTTP 请求的操作（HEAD+PUT 创建、bulk 重试）在入口计算一次
+      绝对截止时间，每次请求前重算剩余时间作为单请求超时（不超过配置
+      上限），耗尽即停止、不再启动下一次请求；响应返回后同样检查，
+      超期结果不得使发布继续成功。
+    """
 
     RETRYABLE_STATUSES: ClassVar[set[int]] = {429, 502, 503, 504}
     MAX_RETRIES: ClassVar[int] = 3
@@ -38,6 +50,7 @@ class ESHttpPublisher:
         self, hosts: list[str], username: str = "", password: SecretStr | None = None,
         api_key: SecretStr | None = None, timeout_seconds: int = 30,
         verify_certs: bool = True,
+        clock: Callable[[], float] | None = None,
     ):
         headers = {"Content-Type": "application/json"}
         if api_key and api_key.get_secret_value():
@@ -47,10 +60,45 @@ class ESHttpPublisher:
             headers["Authorization"] = "Basic " + base64.b64encode(
                 f"{username}:{password.get_secret_value()}".encode()
             ).decode()
+        self._default_timeout = float(timeout_seconds)
+        # 可注入时钟（测试确定性推进期限；默认单调时钟）
+        self._monotonic = clock or time.monotonic
         self._client = httpx.Client(
             base_url=hosts[0] if hosts else "http://127.0.0.1:9200",
-            headers=headers, timeout=timeout_seconds,
+            headers=headers, timeout=self._default_timeout,
             verify=verify_certs)
+
+    # -- 期限与单请求超时 -------------------------------------------------------
+
+    def _deadline_from(self, timeout_ms: int | None) -> float | None:
+        """操作入口：校验 timeout_ms 并计算绝对截止时间（None＝无操作期限，
+        单请求仍用配置默认超时）。"""
+        if timeout_ms is None:
+            return None
+        if timeout_ms <= 0:
+            raise ESPublishError(
+                "invalid_timeout",
+                "ES 操作 timeout_ms≤0：拒绝在发出请求前（不是无限等待）")
+        return self._monotonic() + timeout_ms / 1000.0
+
+    def _request_timeout_before(self, deadline: float | None) -> float:
+        """单请求超时：不超过剩余期限与配置上限；未设期限用配置默认。
+        剩余耗尽在发出请求前拒绝（绝不返回 None——httpx 中是关闭超时）。"""
+        if deadline is None:
+            return self._default_timeout
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise ESPublishError(
+                "deadline_exhausted",
+                "ES 操作期限耗尽：不启动下一次请求")
+        return min(self._default_timeout, remaining)
+
+    def _check_deadline(self, deadline: float | None) -> None:
+        """响应返回后的检查：超期结果不得使发布继续成功。"""
+        if deadline is not None and self._monotonic() >= deadline:
+            raise ESPublishError(
+                "deadline_exhausted",
+                "ES 操作期限耗尽：响应结果不用于发布")
 
     # -- 只读检查 ---------------------------------------------------------------
 
@@ -71,19 +119,20 @@ class ESHttpPublisher:
 
     # -- 索引/别名 --------------------------------------------------------------
 
-    def _request_timeout(self, timeout_ms: int | None) -> float | None:
-        """单请求超时＝不超过运行剩余期限（None＝用客户端默认）。"""
-        if timeout_ms is None or timeout_ms <= 0:
-            return None
-        return timeout_ms / 1000.0
-
     def create_version_index(
         self, index_name: str, mapping: dict[str, Any],
         *, timeout_ms: int | None = None,
     ) -> None:
+        """创建版本索引。结果不明分类（最后修复轮）：传输层错误/连接中断/
+        5xx → ExternalOutcomeUnknownError（服务端可能已创建，不得当确定
+        失败释放占用）；明确 4xx 拒绝 → index_create_rejected（确定未创建）；
+        已存在（HEAD 200）→ index_exists（确定状态）。"""
+        deadline = self._deadline_from(timeout_ms)
         try:
             response = self._client.head(
-                f"/{index_name}", timeout=self._request_timeout(timeout_ms))
+                f"/{index_name}",
+                timeout=self._request_timeout_before(deadline))
+            self._check_deadline(deadline)
             if response.status_code == 200:
                 raise ESPublishError(
                     "index_exists",
@@ -92,8 +141,23 @@ class ESHttpPublisher:
                 "number_of_shards": 1, "number_of_replicas": 0}}
             response = self._client.put(
                 f"/{index_name}", content=json.dumps(body),
-                timeout=self._request_timeout(timeout_ms))
+                timeout=self._request_timeout_before(deadline))
+            self._check_deadline(deadline)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                raise ExternalOutcomeUnknownError(
+                    "index_create_unknown",
+                    "ES 索引创建结果不明（服务端 5xx）；详情已抑制") from None
+            raise ESPublishError(
+                "index_create_rejected",
+                "ES 索引创建被拒绝（index_create_rejected）；详情已抑制"
+            ) from None
+        except httpx.TransportError:
+            # 请求已发出但响应丢失/超时/连接中断：服务端可能已创建
+            raise ExternalOutcomeUnknownError(
+                "index_create_unknown",
+                "ES 索引创建结果不明（响应丢失/超时/连接中断）") from None
         except httpx.HTTPError:
             raise ESPublishError(
                 "index_create_failed",
@@ -103,7 +167,9 @@ class ESHttpPublisher:
         self, index_name: str, documents: list[dict[str, Any]],
         *, timeout_ms: int | None = None,
     ) -> dict[str, Any]:
-        """documents: [{"_id": grain 文档 ID, "_source": {...}}]"""
+        """documents: [{"_id": grain 文档 ID, "_source": {...}}]
+        重试每次重算剩余期限；期限耗尽不再启动下一次请求。"""
+        deadline = self._deadline_from(timeout_ms)
         lines: list[str] = []
         for doc in documents:
             lines.append(json.dumps(
@@ -118,7 +184,7 @@ class ESHttpPublisher:
                 response = self._client.post(
                     "/_bulk", content=body,
                     headers={"Content-Type": "application/x-ndjson"},
-                    timeout=self._request_timeout(timeout_ms))
+                    timeout=self._request_timeout_before(deadline))
                 response.raise_for_status()
                 payload = response.json()
             except httpx.HTTPError:
@@ -128,6 +194,7 @@ class ESHttpPublisher:
                         "ES bulk 请求失败（bulk_failed）；详情已抑制") from None
                 retried += 1
                 continue
+            self._check_deadline(deadline)  # 响应返回后：超期结果不采用
             if not payload.get("errors"):
                 return {"indexed": len(documents), "retried": retried,
                         "permanent_failures": []}
@@ -150,7 +217,8 @@ class ESHttpPublisher:
                     f"ES bulk 存在永久失败 {len(failures)} 项"
                     f"（类型={failures[0].get('type')}）；发布阻断")
             retried += 1
-            # 全部为可重试项：整体重试
+            # 全部为可重试项：整体重试（期限耗尽由 _request_timeout_before
+            # 在下一次请求前拒绝）
         raise ESPublishError(
             "bulk_retry_exhausted", "ES bulk 可重试失败重试耗尽；发布阻断")
 
@@ -159,6 +227,7 @@ class ESHttpPublisher:
         previous_index: str | None = None,
         *, timeout_ms: int | None = None,
     ) -> None:
+        deadline = self._deadline_from(timeout_ms)
         actions = [{"add": {"index": index_name, "alias": alias_name}}]
         if previous_index:
             actions.insert(0, {"remove": {"index": previous_index,
@@ -166,7 +235,8 @@ class ESHttpPublisher:
         try:
             response = self._client.post(
                 "/_aliases", content=json.dumps({"actions": actions}),
-                timeout=self._request_timeout(timeout_ms))
+                timeout=self._request_timeout_before(deadline))
+            self._check_deadline(deadline)
             response.raise_for_status()
         except httpx.HTTPError:
             raise ESPublishError(
@@ -176,10 +246,12 @@ class ESHttpPublisher:
     def get_alias_index(self, alias_name: str,
                         *, timeout_ms: int | None = None) -> str | None:
         """别名当前指向的索引（不存在返回 None；供恢复核对）。"""
+        deadline = self._deadline_from(timeout_ms)
         try:
             response = self._client.get(
                 f"/_alias/{alias_name}",
-                timeout=self._request_timeout(timeout_ms))
+                timeout=self._request_timeout_before(deadline))
+            self._check_deadline(deadline)
             if response.status_code == 404:
                 return None
             response.raise_for_status()
@@ -193,10 +265,12 @@ class ESHttpPublisher:
     def count(self, index_name: str, *, timeout_ms: int | None = None) -> int:
         """索引文档数；**索引明确不存在**抛 index_not_found（与网络/服务
         错误区分——恢复逻辑只有确定不存在才能走对象缺失分支）。"""
+        deadline = self._deadline_from(timeout_ms)
         try:
             response = self._client.get(
                 f"/{index_name}/_count",
-                timeout=self._request_timeout(timeout_ms))
+                timeout=self._request_timeout_before(deadline))
+            self._check_deadline(deadline)
             if response.status_code == 404:
                 raise ESPublishError(
                     "index_not_found", f"ES 索引不存在：{index_name}")

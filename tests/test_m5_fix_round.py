@@ -481,7 +481,12 @@ class TestPublishArbitration:
 
 class TestEsReconcileIntegrity:
     def test_partial_index_not_recovered_as_published(self, env):
-        """部分文档的索引不得仅凭存在就恢复为 published。"""
+        """部分文档的索引不得仅凭存在就恢复为 published。
+
+        恢复修复轮语义更正：直接构造 needs_reconciliation（无发布运行、
+        无 pending 占用）属旧数据场景——保守拒绝自动恢复（不猜测前指针、
+        不覆盖可能的新发布），reconcile 抛 409 且状态不被改成 published。
+        """
         from app.adapters.es_publisher import FakeESPublisher
 
         fake = FakeESPublisher(count_override=1)  # 仅 1 条文档（不完整）
@@ -499,8 +504,11 @@ class TestEsReconcileIntegrity:
         env["repo"].update_dataset_status(
             dataset["dataset_id"], dataset["version"],
             "needs_reconciliation")
-        service.reconcile(dataset["dataset_id"], dataset["version"])
-        # 文档数与预期不符 → 不恢复为 published
+        from app.core.exceptions import RevisionConflictError
+
+        with pytest.raises(RevisionConflictError):
+            service.reconcile(dataset["dataset_id"], dataset["version"])
+        # 不恢复为 published（保守拒绝：无恢复依据不自动恢复）
         after = service.get_dataset(dataset["dataset_id"], dataset["version"])
         assert after["status"] != "published"
 

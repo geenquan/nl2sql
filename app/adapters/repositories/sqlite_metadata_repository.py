@@ -284,7 +284,8 @@ class SQLiteMetadataRepository(
             Column("dataset_id", String(64), primary_key=True),
             Column("operation_id", String(36), nullable=False),
             Column("operation_type", String(24), nullable=False),
-            Column("status", String(16), nullable=False),  # active|completed
+            # active|pending|recovering|completed|failed（遗留 released=终态）
+            Column("status", String(16), nullable=False),
             Column("created_at", String(40)),
             Column("released_at", String(40)),
         )
@@ -1422,33 +1423,44 @@ class SQLiteMetadataRepository(
             )).first()
         return int(row.version) if row else None
 
-    # -- M5 发布占用（修复轮 3：数据集级原子互斥） ------------------------------
+    # -- M5 发布占用（恢复修复轮：active/pending/recovering 状态机） -----------
+
+    # 终态：可被新操作重新取得；pending/recovering 视为占用中（拒绝新操作）
+    _LOCK_TERMINAL_STATUSES = ("completed", "failed", "released")
+    _LOCK_HELD_STATUSES = ("active", "pending", "recovering")
 
     def acquire_publish_lock(
         self, dataset_id: str, operation_id: str, operation_type: str,
     ) -> bool:
-        """原子取得数据集级发布占用（INSERT 或条件 UPDATE 恰一成功）。
+        """原子取得数据集级发布占用（INSERT 或终态条件 UPDATE 恰一成功）。
 
-        已有 active 占用 → False（409）；completed 占用可被释放后重取。
+        只有明确终态（completed/failed/遗留 released）允许被新操作取得；
+        active/pending/recovering 均拒绝（False→服务返回 409）——
+        待恢复（pending）的发布不能被新发布/回滚绕过。
+        首次 INSERT 的并发唯一键冲突转换为 False。
         """
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
 
         with self._engine.begin() as conn:
             row = conn.execute(select(self._dataset_publish_locks).where(
                 self._dataset_publish_locks.c.dataset_id == dataset_id,
             )).first()
             if row is None:
-                conn.execute(self._dataset_publish_locks.insert().values(
-                    dataset_id=dataset_id, operation_id=operation_id,
-                    operation_type=operation_type, status="active",
-                    created_at=_now(), released_at=None))
-                return True
-            if row.status == "active":
-                return False  # 已有活跃操作
-            # completed → 原子条件更新（只一个并发成功）
+                try:
+                    conn.execute(self._dataset_publish_locks.insert().values(
+                        dataset_id=dataset_id, operation_id=operation_id,
+                        operation_type=operation_type, status="active",
+                        created_at=_now(), released_at=None))
+                    return True
+                except _IntegrityError:
+                    return False  # 并发首插竞争：恰一成功
+            if row.status not in self._LOCK_TERMINAL_STATUSES:
+                return False  # active/pending/recovering：占用中
             result = conn.execute(
                 self._dataset_publish_locks.update().where(
                     self._dataset_publish_locks.c.dataset_id == dataset_id,
-                    self._dataset_publish_locks.c.status != "active",
+                    self._dataset_publish_locks.c.status.in_(
+                        self._LOCK_TERMINAL_STATUSES),
                 ).values(operation_id=operation_id,
                         operation_type=operation_type,
                         status="active", created_at=_now(),
@@ -1459,7 +1471,8 @@ class SQLiteMetadataRepository(
         self, dataset_id: str, operation_id: str,
         *, outcome: str = "completed",
     ) -> bool:
-        """释放发布占用（匹配 operation_id；不匹配不释放他方）。"""
+        """释放 active 占用为终态（匹配 operation_id；不匹配不释放他方）。
+        pending/recovering 不能经本方法释放（恢复占用走认领/完成/退回）。"""
         result = None
         with self._engine.begin() as conn:
             result = conn.execute(
@@ -1470,19 +1483,197 @@ class SQLiteMetadataRepository(
                 ).values(status=outcome, released_at=_now()))
         return result is not None and result.rowcount > 0
 
+    def transition_publish_lock(
+        self, dataset_id: str, operation_id: str,
+        from_status: str, to_status: str,
+    ) -> bool:
+        """条件状态转换（单条 UPDATE；rowcount=1 才生效）。
+
+        恢复修复轮语义：active→pending（外部副作用后转入待核对）、
+        pending→recovering（认领）、recovering→pending（核对未定退回）、
+        recovering→failed（确定失败终态）。
+        """
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                self._dataset_publish_locks.update().where(
+                    self._dataset_publish_locks.c.dataset_id == dataset_id,
+                    self._dataset_publish_locks.c.operation_id == operation_id,
+                    self._dataset_publish_locks.c.status == from_status,
+                ).values(status=to_status, released_at=(
+                    _now() if to_status in self._LOCK_TERMINAL_STATUSES
+                    else None)))
+        return result.rowcount > 0
+
+    def claim_publish_reconciliation(
+        self, dataset_id: str, original_operation_id: str,
+    ) -> bool:
+        """原子认领待核对占用（pending→recovering；rowcount=1 恰一成功）。
+
+        保留原 operation_id——恢复始终对应原发布操作；并发认领只允许
+        一个成功，失败方不修改占用/指针/别名。
+        """
+        return self.transition_publish_lock(
+            dataset_id, original_operation_id, "pending", "recovering")
+
     def get_active_publish_lock(
         self, dataset_id: str,
     ) -> dict[str, Any] | None:
+        """任一占用中的锁（active/pending/recovering；含状态字段）——
+        pending 不是空闲，调用方不得绕过。"""
         with self._engine.connect() as conn:
             row = conn.execute(select(self._dataset_publish_locks).where(
                 self._dataset_publish_locks.c.dataset_id == dataset_id,
-                self._dataset_publish_locks.c.status == "active",
+                self._dataset_publish_locks.c.status.in_(
+                    self._LOCK_HELD_STATUSES),
             )).first()
         if row is None:
             return None
         return {"operation_id": row.operation_id,
                 "operation_type": row.operation_type,
+                "status": row.status,
                 "created_at": row.created_at}
+
+    # -- M5 恢复提交（单事务：指针+状态+审计+占用） ----------------------------
+
+    def complete_dataset_reconciliation(
+        self, source_id: str, dataset_id: str, version: int,
+        operation_id: str,
+        expected_previous_pointer: int | None, *,
+        operator: str = "reconcile",
+    ) -> str:
+        """单事务完成恢复提交（任一步失败全部回滚）。
+
+        同一事务内：核对 recovering 占用与 operation_id → 按
+        expected_previous_pointer（None＝当时无指针，是明确比较条件）
+        条件切换指针 → 版本状态置 published → 插入恢复审计 → 占用置
+        completed。重复调用幂等（已 completed 且指针就位 →
+        already_committed，不重复插审计）。
+
+        返回 "committed" | "already_committed" | "pointer_conflict"。
+        """
+        from uuid import uuid4 as _uuid4
+
+        with self._engine.begin() as conn:
+            lock_row = conn.execute(select(self._dataset_publish_locks).where(
+                self._dataset_publish_locks.c.dataset_id == dataset_id,
+            )).first()
+            if lock_row is None or lock_row.operation_id != operation_id:
+                raise RevisionConflictError(
+                    "恢复提交失败：占用与原发布操作不匹配")
+            if lock_row.status == "completed":
+                # 幂等重入：确认指针与状态已到位，不重复审计
+                current = self._pointer_row(conn, source_id, dataset_id)
+                if current is not None and current == int(version):
+                    self._set_dataset_status_in_conn(
+                        conn, dataset_id, version, "published",
+                        allowed_from=("needs_reconciliation", "publishing",
+                                      "published"))
+                    return "already_committed"
+                return "pointer_conflict"
+            if lock_row.status != "recovering":
+                raise RevisionConflictError(
+                    f"恢复提交失败：占用状态 {lock_row.status} 不允许提交")
+
+            current = self._pointer_row(conn, source_id, dataset_id)
+            if current is not None and current == int(version):
+                # 外部完成路径已把指针写到位：只补状态/审计/占用
+                pass
+            elif current is None:
+                if expected_previous_pointer is not None:
+                    # 原发布前存在指针而现在没有——不一致，冲突回滚
+                    return "pointer_conflict"
+                try:
+                    conn.execute(self._dataset_pointer.insert().values(
+                        source_id=source_id, dataset_id=dataset_id,
+                        version=int(version), updated_at=_now()))
+                except IntegrityError:
+                    return "pointer_conflict"
+            elif current == expected_previous_pointer:
+                result = conn.execute(
+                    self._dataset_pointer.update().where(
+                        self._dataset_pointer.c.source_id == source_id,
+                        self._dataset_pointer.c.dataset_id == dataset_id,
+                        self._dataset_pointer.c.version == current,
+                    ).values(version=int(version), updated_at=_now()))
+                if result.rowcount == 0:
+                    return "pointer_conflict"
+            else:
+                # 指针已指向其他版本（新发布/回滚）：禁止改写
+                return "pointer_conflict"
+
+            if not self._set_dataset_status_in_conn(
+                    conn, dataset_id, version, "published",
+                    allowed_from=("needs_reconciliation", "publishing",
+                                  "published")):
+                raise RevisionConflictError(
+                    "恢复提交失败：版本状态不允许转为 published")
+            conn.execute(self._dataset_plans.insert().values(
+                id=_uuid4().hex, dataset_id=dataset_id, version=int(version),
+                kind="publish_log", created_at=_now(),
+                payload=_dump({"action": "reconcile", "operator": operator,
+                               "version": version,
+                               "operation_id": operation_id,
+                               "at": _now()})))
+            conn.execute(
+                self._dataset_publish_locks.update().where(
+                    self._dataset_publish_locks.c.dataset_id == dataset_id,
+                    self._dataset_publish_locks.c.operation_id == operation_id,
+                    self._dataset_publish_locks.c.status == "recovering",
+                ).values(status="completed", released_at=_now()))
+            return "committed"
+
+    def _pointer_row(self, conn: Any, source_id: str,
+                     dataset_id: str) -> int | None:
+        row = conn.execute(select(self._dataset_pointer).where(
+            self._dataset_pointer.c.source_id == source_id,
+            self._dataset_pointer.c.dataset_id == dataset_id,
+        )).first()
+        return int(row.version) if row else None
+
+    def _set_dataset_status_in_conn(
+        self, conn: Any, dataset_id: str, version: int, status: str, *,
+        allowed_from: tuple[str, ...],
+    ) -> bool:
+        """事务内条件状态更新（与 update_dataset_status 同口径；
+        不开启新事务——供恢复提交在同一事务内调用）。"""
+        from uuid import uuid4 as _uuid4
+
+        row = conn.execute(select(self._datasets).where(
+            self._datasets.c.dataset_id == dataset_id,
+            self._datasets.c.version == int(version),
+        )).first()
+        if row is None:
+            return False
+        payload = dict(_load(row.payload, {}))
+        expected = payload.get("status")
+        if expected not in allowed_from:
+            return False
+        payload["status"] = status
+        result = conn.execute(
+            self._datasets.update().where(
+                self._datasets.c.dataset_id == dataset_id,
+                self._datasets.c.version == int(version),
+                self._datasets.c.status == expected,
+            ).values(status=status, payload=_dump(payload)))
+        if result.rowcount == 0:
+            return False
+        conn.execute(
+            self._dataset_plans.insert().values(
+                id=_uuid4().hex, dataset_id=dataset_id, version=int(version),
+                kind="status", created_at=_now(),
+                payload=_dump({"status": status, "at": _now()})))
+        return True
+
+    def get_dataset_run(self, run_id: str) -> dict[str, Any] | None:
+        """按 run_id 读取运行记录（恢复依据检索；不扫描历史列表）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(select(self._dataset_plans).where(
+                self._dataset_plans.c.id == run_id,
+                self._dataset_plans.c.kind == "run",
+            )).first()
+        if row is None:
+            return None
+        return dict(_load(row.payload, {})).get("run")
 
 
 def _new_id() -> str:

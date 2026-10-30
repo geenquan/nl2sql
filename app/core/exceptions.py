@@ -69,3 +69,17 @@ class ValidationDeadlineExceededError(AppError):
 
     与 ValidationStatementBudgetExceeded 同级的安全闸：固定文案、无细节；
     区别在于这是整次运行的时间期限，不是语句条数额度。"""
+
+
+class ValidationQueryTimeoutError(AppError):
+    """单查询执行超时（timeout_ms）：语句被中止或结果被拒绝。
+
+    超时返回的结果不得用于质量判定或发布；固定安全文案，无 SQL/参数
+    或底层异常细节。"""
+
+
+class ValidationResultBudgetExceededError(AppError):
+    """查询结果超出运行字节上限：已读取部分被整体丢弃。
+
+    不返回部分超限结果（避免调用方消费超预算数据）；固定安全文案，
+    不含任何业务值内容。"""

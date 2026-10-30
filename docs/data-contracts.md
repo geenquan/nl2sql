@@ -330,9 +330,19 @@
   独立 ViewPublisher 端口
 - 预算：预览行数（20）/质量窗口（1000）/导出批次与硬上限；**运行
   上下文三要素**（逐语句硬额度 120 + monotonic 总期限 300s + 单查询
-  结果字节上限 10MB）贯穿验证/预览/导出——每条语句发出前经单一硬闸
-  （先期限后额度；期限拒绝不消耗额度），不存在无界查询入口；截断
-  如实标记（LIMIT 不宣称限制扫描量）
+  结果字节上限 10MB）贯穿验证/预览/导出/发布——每条语句发出前经单一
+  硬闸（先期限后额度；期限拒绝不消耗额度），不存在无界查询入口。
+- 时间与字节闸（恢复修复轮）：单查询有效期限＝min(timeout_ms, 运行
+  剩余)，执行前（不消耗额度）/fetch 中/返回后三处检查——超时抛
+  `ValidationQueryTimeoutError`、总期限抛 `ValidationDeadlineExceededError`
+  （超期/超时结果被拒绝，不用于质量判定与发布）；MySQL 经
+  MAX_EXECUTION_TIME 优化器提示服务端限执行（WITH/CTE 由客户端兜底；
+  MariaDB 服务端取消限制保留），SQLite 经进度处理器执行中中止；结果
+  字节＝每行按导出序列化（Decimal/date→文本）的 **UTF-8 字节数**逐行
+  累计、加入前检查、超限抛 `ValidationResultBudgetExceededError`
+  （不返回部分超限批次；单行超限立即拒绝；中文按字节计）。预览行数
+  截断仍如实标记 truncated=True（字节预算不宣称限制扫描成本——扫描
+  时间由执行期限约束）
 
 ## M5 质量报告（dataset-quality-v1）
 
@@ -348,12 +358,30 @@
 
 ## M5 视图与 ES 发布（已实现；真实发布未验证）
 
-- 发布所有权（修复轮 2+3+最小轮）：`dataset_publish_locks` 表**原子占用**
-  （dataset_id 唯一键，INSERT/条件 UPDATE）；**只有获得了锁的线程才
-  更新版本状态**（未获锁的 409 失败方不覆盖他方状态）；全部路径
-  finally 释放锁（**含 needs_reconciliation**——保留 active 锁会卡死
-  reconcile 恢复路径，reconcile 自身经正常 acquire 取得占用）；
+- 发布所有权（恢复修复轮）：`dataset_publish_locks` 状态机
+  **active→completed/failed**（确定结束，可重新取得）｜**active→pending**
+  （外部已创建/结果不明，占用保留）｜**pending→recovering**
+  （`claim_publish_reconciliation` 原子认领，保留原 operation_id）｜
+  **recovering→completed/pending/failed**。acquire 只认终态
+  （completed/failed/遗留 released）——**待恢复（pending）不能被新发布/
+  回滚绕过**；首次 INSERT 并发唯一冲突→False（409）；get_active 覆盖
+  三种占用态并返回 status。**只有获得了锁的线程才更新版本状态**；
+  finally 以局部 outcome 收尾（不把 pending 覆盖为 failed/released）；
   状态更新原子条件（期望当前状态入 WHERE，恰一成功）
+- 恢复依据（dataset_runs JSON，不新建任务系统）：发布运行 result.recovery
+  = {operation_id, dataset_id, dataset_version, target, plan_fingerprint,
+  previous_pointer（+recorded 标记；None＝当时无指针，是明确比较条件）,
+  index/alias 或 view_schema/view_name, export_complete,
+  expected_documents（**0 是有效值，不用 truthy 判断**）, count_verified,
+  phase}；取得占用后任何外部副作用前落库 previous_pointer；导出完整/
+  count 核对/alias 切换前后逐阶段真实落库（关键阶段保存失败即停止后续
+  副作用）；恢复只接受与 dataset/version/target/指纹/原操作全匹配的记录
+- 恢复提交（`complete_dataset_reconciliation` 单事务同一 conn）：核对
+  recovering+operation_id → 前指针比较（含"预期不存在"：当前==前指针→
+  提交；当前==目标→幂等完成不重复审计；其他→pointer_conflict 不改写）
+  → 条件切指针 → 版本状态 published → 恢复审计 → 占用 completed；
+  任一步失败全部回滚；ES count 网络错误≠索引不存在（index_not_found
+  独立 reason），查询失败保留待核对（recovering→pending 可再核对）
 - 视图：独立目标 DSN/Schema（默认关闭）；应用前缀版本化视图名
   （nl2sql_ds_前缀）；不覆盖用户对象（已存在→幂等刷新或 409）；
   回滚=指针切回仍 published 的旧版本（视图不删除）
@@ -361,7 +389,10 @@
   NULL/重复 grain 阻断（不静默覆盖）；Decimal→字符串（金额精度）；
   仅导出显式选定字段；分批 bulk+逐项结果检查（永久失败阻断/可重试
   有限重试）；行数核对后原子切换应用别名；版本索引保留不删除；
-  导出硬上限触发失败（不切换别名）
+  导出硬上限触发失败（不切换别名）；写入/核对调用接受可选
+  timeout_ms（不超过运行剩余期限的单请求超时）；count 区分
+  index_not_found（明确不存在）与网络/服务错误；get_alias_index
+  供恢复核对别名指向
 - 外部目标与本地指针不跨库原子：先记录发布尝试→创建版本目标→
   验证→切换指针；外部成功本地失败→needs_reconciliation（显式
   reconcile 核对外部对象存在性后恢复）

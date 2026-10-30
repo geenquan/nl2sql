@@ -1,6 +1,101 @@
 # 开发交接报告
 
-更新时间：2026-10-30（M5 最小修复轮：条件 AVG 分母、中心指标独立对账、回滚发布占用、核对指针提交、正式预算接入五项完成；另修复执行中发现的预算双重扣减、AVG 预聚合基准列错位、ES 失败发布保留锁、超期判定被覆盖、MySQL 执行器期限/字节参数缺失五处缺陷；全部离线验证通过）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-30（M5 恢复修复轮：恢复依据外部副作用前持久化、待恢复占用 pending/recovering 状态机与单事务恢复提交、timeout_ms/总期限/结果字节三重阻断三条链路补齐；新增 18 项回归，全量 725 passed；全部离线验证）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M5 恢复修复轮（2026-10-30，三组问题，回归先行）
+
+### 修复一：恢复依据在本地指针提交前可靠保存
+
+- 根因（复现）：`_publish_es` 只在全部成功后把 documents 写入
+  run.result——本地提交失败时恢复逻辑读到 expected=None，完整成功的
+  外部发布无法恢复（reconcile 返回 expected_unknown）。
+- 修改：`dataset_service._new_recovery_record/_persist_run/
+  _set_recovery_phase`——发布运行 result.recovery 结构化对象
+  （operation_id/dataset/version/target/plan_fingerprint/
+  previous_pointer(+recorded 标记)/index+alias 或 view schema+name/
+  export_complete/expected_documents/count_verified/phase），取得占用后
+  **任何外部副作用前**读取并落库 previous_pointer；导出完整结束、count
+  核对、alias 切换前后逐阶段真实落库（`save_dataset_run`，非内存对象；
+  关键阶段保存失败即停止后续副作用）。`_export_to_es` 进度增量更新不
+  覆盖 recovery；export_complete 只由发布方在分页正常结束后设置。
+- `_reconcile_locked` 只接受与当前 dataset/version/target/指纹/原操作
+  全匹配的恢复记录；恢复要求 export_complete+expected_documents 明确
+  （**0 是有效值**）+ES 计数相等+alias 指向目标（或在指针核验后显式
+  切换）；ES count 网络错误≠索引不存在（index_not_found 为独立 reason），
+  查询失败保留待核对。
+
+### 修复二：待恢复占用 + 原始前指针恢复提交
+
+- 根因（复现）：finally 无条件释放占用——v1 待恢复可被 v2 发布绕过，
+  reconcile(v1) 可把指针从 v2 改回 v1；且 set_published_dataset 与
+  update_dataset_status 两事务不原子。
+- 仓储状态机（复用 dataset_publish_locks，无新框架）：active→completed/
+  failed（确定结束）；active→pending（外部已创建/结果不明）；
+  pending→recovering（`claim_publish_reconciliation` 原子认领，保留原
+  operation_id）；recovering→completed（恢复成功）/pending（核对未定）/
+  failed（确定失败）。`acquire_publish_lock` 只认终态（completed/failed/
+  遗留 released），active/pending/recovering 均拒绝（409），首次 INSERT
+  并发唯一冲突→False；`get_active_publish_lock` 覆盖三种占用态并返回
+  status。`_publish_view/_publish_es` 以局部 outcome 收尾：无外部副作用
+  确定失败→failed；外部已创建/不明→pending；成功→completed；finally
+  不把 pending 覆盖为 failed/released。
+- `reconcile` 认领原发布操作的 pending（不再新建操作 ID/普通 acquire）；
+  并发 reconcile 恰一认领，失败方不动占用/指针/别名；未完成退回 pending
+  （可再核对）。恢复前核对 previous_pointer（None＝当时无指针，是明确
+  比较条件）：当前==前指针→提交；当前==目标版本→幂等完成（不重复
+  审计）；其他→pointer_conflict（不改写）。旧运行无恢复依据保守拒绝。
+- `complete_dataset_reconciliation`（仓储单事务，同一 conn）：核对
+  recovering+operation_id→前指针比较（含"预期不存在"）→条件切指针→
+  版本状态 published→恢复审计→占用 completed；任一步失败全部回滚；
+  重复调用幂等（already_committed 不重复插审计）。
+
+### 修复三：期限与结果字节阻断发布
+
+- 根因（已复现）：execute 未实际使用 timeout_ms；超期仅置 truncated；
+  字节检查按字符数且先入批后检查；导出丢弃 truncated——查询返回 5 行
+  且 truncated=True、期限已过仍 published=True 且别名已切换。
+- `ControlledExecutorBase.execute`：单查询有效期限=min(timeout_ms,
+  运行剩余)——执行前（不消耗额度）、fetch 循环内、返回后三处检查；
+  MySQL 经 SELECT 优化器提示 MAX_EXECUTION_TIME 服务端限执行（WITH/
+  CTE 不注入，客户端返回后拒绝兜底；MariaDB 服务端取消限制保留）；
+  SQLite 经 sqlite3 进度处理器**执行中中止**（不用线程超时遗留后台查询）。
+  结果字节＝每行按导出序列化规则（Decimal/date→文本）的 UTF-8 字节数
+  逐行累计，加入前检查，超限抛 `ValidationResultBudgetExceededError`
+  （不返回部分超限批次）；单行超限立即拒绝；中文按字节计。超时/超期抛
+  `ValidationQueryTimeoutError`/`ValidationDeadlineExceededError`，与
+  预算类领域异常一并原样透传（不翻译为 query_failed）。时钟可注入
+  （_monotonic）供确定性测试。
+- `_export_to_es`/`_publish_es` 共享同一 run_context（不重计时）：导出
+  分页不丢弃 truncated（分页自带 LIMIT batch，意外截断即停止）；每次
+  查询/bulk 前后与 count/alias/本地提交前检查同一期限；超期不启动下一项
+  外部副作用、不设 export_complete、不返回 published=True；已发生外部
+  副作用的按修复二进 pending。ES 写入/核对调用接受 timeout_ms（不超过
+  剩余期限的单请求超时；端口向后兼容可选参数，真实适配器 httpx 按请求
+  覆盖 + 替身同步记录）；执行器/发布器关闭均在 finally。
+
+### 语义更正（既有测试预期更新，未删除恢复可达性检查）
+
+1. `test_m5_min_fix_round.py::TestESLockRelease`：原断言"ES 失败发布后
+   释放占用"改为"**pending 保留 + reconcile 可认领 + 新发布被 409 拒绝**"
+   ——上一轮"始终释放"会让待恢复状态被新发布绕过（本轮修复二的根因），
+   恢复可达性改由认领机制保证。
+2. `test_byte_cap`：字节超限从"标记截断"改为"抛领域异常拒绝结果"——
+   截断语义保留给预览行数上限，超限数据不得交回调用方。
+3. `test_partial_index_not_recovered_as_published`：直接构造
+   needs_reconciliation（无发布运行/占用）的旧数据场景，从"reconcile
+   静默返回"改为"保守拒绝（409）且不恢复 published"。
+
+### 验证
+
+- 新增 `tests/test_m5_recovery_round.py` 18 项（A 完整 ES 恢复含恢复
+  依据持久化断言/B expected=0/C 导出未完整/D pending 阻断发布+回滚且
+  无外部副作用/E 旧数据保守拒绝+指针冲突不覆盖/F 双线程恰一认领/
+  G 事务注入故障零部分提交+可再恢复+审计不重复/H 最后一页超期不
+  bulk/不切别名/不提交指针且 ES 请求超时≤剩余期限/I ASCII+中文 UTF-8
+  口径+单行超限/J timeout_ms 可注入时钟确定性触发+MySQL 提示注入/
+  K deps 正式工厂上下文真实影响执行行为/L 冒烟）。
+- `python -m pytest -q` → **725 passed, 9 skipped**；ruff（app tests
+  scripts）/ pip check 通过（全部离线；真实 MySQL/ES 发布仍未验证）。
 
 ## M5 最小修复轮（2026-10-30，五项指定 + 五处执行中发现，先复现后修复）
 

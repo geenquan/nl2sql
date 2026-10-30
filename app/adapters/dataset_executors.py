@@ -9,6 +9,7 @@
 """
 
 import time as _time
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -17,6 +18,8 @@ from sqlalchemy.engine import Engine
 from app.core.exceptions import (
     DataSourceConnectionError,
     ValidationDeadlineExceededError,
+    ValidationQueryTimeoutError,
+    ValidationResultBudgetExceededError,
 )
 from app.datasets.safety import (
     SQLSafetyError,
@@ -26,8 +29,30 @@ from app.datasets.safety import (
 from app.ports.datasets import ControlledQueryExecutor, ViewPublisher
 
 
+def _mysql_timeout_hint(sql: str, effective_ms: int) -> str:
+    """MySQL 服务端单查询期限（SELECT 优化器提示；WITH 语句不注入——
+    提示仅对顶层 SELECT 生效，CTE 场景由客户端返回后检查兜底）。"""
+    stripped = sql.lstrip()
+    if stripped[:6].upper() == "SELECT":
+        return f"SELECT /*+ MAX_EXECUTION_TIME({effective_ms}) */" \
+            + stripped[6:]
+    return sql
+
+
 class ControlledExecutorBase(ControlledQueryExecutor):
-    """共用执行逻辑：先校验后执行；参数化；截断标记。"""
+    """共用执行逻辑：先校验后执行；参数化；截断标记。
+
+    时间闸（恢复修复轮）：
+    - 单查询有效期限＝min(timeout_ms, 运行剩余时间)；执行前、读取中、
+      返回后三处检查——超时结果被拒绝（抛 ValidationQueryTimeoutError），
+      不返回给调用方消费；
+    - 运行总期限耗尽抛 ValidationDeadlineExceededError（发出前拒绝且
+      不消耗语句额度；返回后发现的同样拒绝）；
+    - 结果字节上限按"每行序列化(Decimal/date→文本)后 UTF-8 字节数"
+      逐行累计，超限抛 ValidationResultBudgetExceededError（不返回
+      部分超限批次）。
+    预算/期限/超时/字节领域异常原样透传，不翻译为 query_failed。
+    """
 
     def __init__(self, engine: Engine, dialect: str,
                  allowed_tables: set[str],
@@ -41,7 +66,38 @@ class ControlledExecutorBase(ControlledQueryExecutor):
         self._allowed_columns = allowed_columns
         self._statement_budget = statement_budget
         self._deadline = deadline_monotonic
-        self._max_result_bytes = max_result_bytes  # 可选：逐语句硬预算
+        self._max_result_bytes = max_result_bytes
+        # 可注入时钟（测试用确定性时间推进；默认单调时钟）
+        self._monotonic = _time.monotonic
+        # 当前语句的绝对期限（SQLite 进度处理器读取；见 _arm_progress）
+        self._current_query_deadline: float | None = None
+
+    # -- 时间闸 -----------------------------------------------------------------
+
+    def _effective_timeout_ms(self, timeout_ms: int) -> int | None:
+        """单查询有效期限：与运行剩余时间取小；运行已超期即拒绝。"""
+        if timeout_ms and timeout_ms > 0:
+            effective = timeout_ms
+        else:
+            effective = None  # 调用方未给单查询限制
+        if self._deadline is not None:
+            remaining_ms = int((self._deadline - self._monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise ValidationDeadlineExceededError(
+                    "验证运行总期限耗尽：后续语句在发出前被拒绝（未执行）")
+            effective = (min(effective, remaining_ms)
+                         if effective is not None else remaining_ms)
+        return effective
+
+    def _check_time(self, per_query_deadline: float | None) -> None:
+        """执行中/返回后的双重检查：先总期限后单查询期限。"""
+        now = self._monotonic()
+        if self._deadline is not None and now >= self._deadline:
+            raise ValidationDeadlineExceededError(
+                "验证运行总期限耗尽：查询结果被拒绝（不用于质量判定）")
+        if per_query_deadline is not None and now >= per_query_deadline:
+            raise ValidationQueryTimeoutError(
+                "单查询执行超时（timeout_ms）：语句被中止或结果被拒绝")
 
     def _before_statement(self) -> None:
         """语句发出前的统一硬闸：先查运行总期限（超期抛
@@ -49,11 +105,13 @@ class ControlledExecutorBase(ControlledQueryExecutor):
         ValidationStatementBudgetExceeded，保留真实 issued/limit）。
         期限已耗尽时不再消耗预算——被拒绝的语句从未发出。"""
         if self._deadline is not None and \
-                _time.monotonic() >= self._deadline:
+                self._monotonic() >= self._deadline:
             raise ValidationDeadlineExceededError(
                 "验证运行总期限耗尽：后续语句在发出前被拒绝（未执行）")
         if self._statement_budget is not None:
             self._statement_budget.allow_one()
+
+    # -- 执行 -------------------------------------------------------------------
 
     def execute(self, sql, params, *, max_rows: int, timeout_ms: int) \
             -> tuple[list[dict[str, Any]], bool]:
@@ -61,45 +119,92 @@ class ControlledExecutorBase(ControlledQueryExecutor):
         validate_controlled_select(
             sql, self._allowed_tables, self._allowed_columns,
             dialect=self._dialect)
-        fetch_cap = max_rows + 1  # 多取一行判断截断
+        effective_ms = self._effective_timeout_ms(timeout_ms)
         self._before_statement()
+        per_query_deadline = (
+            self._monotonic() + effective_ms / 1000.0
+            if effective_ms is not None else None)
+        fetch_cap = max_rows + 1  # 多取一行判断截断
         executable_sql = self._adapt_params(sql)
+        if effective_ms is not None and self._dialect == "mysql":
+            executable_sql = _mysql_timeout_hint(executable_sql,
+                                                 effective_ms)
         rows: list[dict[str, Any]] = []
-        byte_capped = False
+        byte_total = 0
         try:
             with self._engine.connect() as conn:
+                self._arm_progress(conn, per_query_deadline)
                 result = conn.execute(text(executable_sql), params or {})
                 mappings = result.mappings()
                 while len(rows) < fetch_cap:
+                    self._check_time(per_query_deadline)
                     batch = mappings.fetchmany(
                         min(500, fetch_cap - len(rows)))
                     if not batch:
                         break
-                    rows.extend(dict(row) for row in batch)
-                    # 逐批检查结果字节上限（超限即停：如实标记截断）
-                    if self._max_result_bytes is not None and \
-                            self._rows_bytes(rows) > self._max_result_bytes:
-                        byte_capped = True
-                        break
+                    for raw in batch:
+                        row = dict(raw)
+                        if self._max_result_bytes is not None:
+                            row_bytes = self._row_bytes(row)
+                            if byte_total + row_bytes \
+                                    > self._max_result_bytes:
+                                raise ValidationResultBudgetExceededError(
+                                    "查询结果超出运行字节上限："
+                                    "已读取部分被整体丢弃（不返回超限结果）")
+                            byte_total += row_bytes
+                        rows.append(row)
+                self._check_time(per_query_deadline)
         except Exception as exc:
-            if isinstance(exc, (SQLSafetyError, DataSourceConnectionError)):
+            if isinstance(exc, (SQLSafetyError, DataSourceConnectionError,
+                                ValidationDeadlineExceededError,
+                                ValidationQueryTimeoutError,
+                                ValidationResultBudgetExceededError)):
                 raise
+            # SQLite 进度中止等基础设施错误：若因期限触发则按期限归因
+            if per_query_deadline is not None:
+                now = self._monotonic()
+                if self._deadline is not None and now >= self._deadline:
+                    raise ValidationDeadlineExceededError(
+                        "验证运行总期限耗尽：查询被中止") from None
+                if now >= per_query_deadline:
+                    raise ValidationQueryTimeoutError(
+                        "单查询执行超时（timeout_ms）：语句被中止") from None
             raise DataSourceConnectionError(
                 "query_failed",
                 "数据集查询执行失败（query_failed）；错误详情已抑制"
             ) from None
-        truncated = len(rows) > max_rows or byte_capped
-        # 查询返回后检查总期限（超期结果标记截断，由上层阻断 ready）
-        if self._deadline is not None and \
-                _time.monotonic() >= self._deadline:
-            truncated = True
+        finally:
+            self._current_query_deadline = None
+        truncated = len(rows) > max_rows
         return (rows[:max_rows], truncated)
+
+    def _arm_progress(self, conn: Any,
+                      per_query_deadline: float | None) -> None:
+        """方言相关的执行中中止钩子（默认无操作；SQLite 覆盖为进度处理）。"""
+        del conn, per_query_deadline
+
+    @staticmethod
+    def _row_bytes(row: dict[str, Any]) -> int:
+        """单行结果的 UTF-8 字节数（Decimal/date 按导出序列化规则转文本；
+        不记录业务内容本身）。"""
+        total = 0
+        for value in row.values():
+            if value is None:
+                total += 4
+            elif isinstance(value, Decimal):
+                total += len(str(value).encode("utf-8"))
+            elif isinstance(value, (bytes, bytearray, memoryview)):
+                total += len(bytes(value))
+            elif hasattr(value, "isoformat"):
+                total += len(value.isoformat().encode("utf-8"))
+            else:
+                total += len(str(value).encode("utf-8"))
+        return total
 
     @staticmethod
     def _rows_bytes(rows: list[dict[str, Any]]) -> int:
-        """结果集字节的保守估计（按值文本长度下界）。"""
-        return sum(len(str(value))
-                   for row in rows for value in row.values())
+        """整批字节（兼容旧调用；逐行口径见 _row_bytes）。"""
+        return sum(ControlledExecutorBase._row_bytes(row) for row in rows)
 
     def _adapt_params(self, sql: str) -> str:
         """编译产物统一使用 pyformat %(name)s 占位（修复轮：两种方言
@@ -119,6 +224,8 @@ class SQLiteControlledExecutor(ControlledExecutorBase):
 
     attach：schema 名 → 文件路径（SQLite ATTACH 每连接执行，经连接事件
     挂载；用于模拟 MySQL 的 schema 限定名与跨 Schema 同名表）。
+    单查询期限经 sqlite3 进度处理器实现**执行中中止**（返回 1 中止语句；
+    不用线程超时后遗留后台查询的方式）。
     """
 
     def __init__(self, database_url: str, allowed_tables: set[str],
@@ -128,17 +235,35 @@ class SQLiteControlledExecutor(ControlledExecutorBase):
                  deadline_monotonic: float | None = None,
                  max_result_bytes: int | None = None):
         engine = create_engine(database_url)
-        if attach:
-            from sqlalchemy import event
+        from sqlalchemy import event
 
+        if attach:
             @event.listens_for(engine, "connect")
             def _attach_schemas(dbapi_conn, _record):
                 for schema, path in attach.items():
                     dbapi_conn.execute(
                         f"ATTACH DATABASE '{path}' AS {schema}")
+
+        @event.listens_for(engine, "connect")
+        def _install_progress_guard(dbapi_conn, _record):
+            dbapi_conn.set_progress_handler(self._progress_guard, 1000)
+
         super().__init__(engine, "sqlite", allowed_tables, allowed_columns,
                          statement_budget, deadline_monotonic,
                          max_result_bytes)
+
+    def _progress_guard(self) -> int:
+        """SQLite 进度回调：超过当前语句期限即中止（1=中断语句）。"""
+        deadline = self._current_query_deadline
+        if deadline is not None and self._monotonic() >= deadline:
+            return 1
+        return 0
+
+    def _arm_progress(self, conn: Any,
+                      per_query_deadline: float | None) -> None:
+        # 进度处理器经连接事件常驻；此处发布当前语句期限供其读取
+        del conn
+        self._current_query_deadline = per_query_deadline
 
 
 class MySQLControlledExecutor(ControlledExecutorBase):

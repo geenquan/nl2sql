@@ -71,11 +71,19 @@ class ESHttpPublisher:
 
     # -- 索引/别名 --------------------------------------------------------------
 
+    def _request_timeout(self, timeout_ms: int | None) -> float | None:
+        """单请求超时＝不超过运行剩余期限（None＝用客户端默认）。"""
+        if timeout_ms is None or timeout_ms <= 0:
+            return None
+        return timeout_ms / 1000.0
+
     def create_version_index(
         self, index_name: str, mapping: dict[str, Any],
+        *, timeout_ms: int | None = None,
     ) -> None:
         try:
-            response = self._client.head(f"/{index_name}")
+            response = self._client.head(
+                f"/{index_name}", timeout=self._request_timeout(timeout_ms))
             if response.status_code == 200:
                 raise ESPublishError(
                     "index_exists",
@@ -83,7 +91,8 @@ class ESHttpPublisher:
             body = {"mappings": mapping, "settings": {
                 "number_of_shards": 1, "number_of_replicas": 0}}
             response = self._client.put(
-                f"/{index_name}", content=json.dumps(body))
+                f"/{index_name}", content=json.dumps(body),
+                timeout=self._request_timeout(timeout_ms))
             response.raise_for_status()
         except httpx.HTTPError:
             raise ESPublishError(
@@ -92,6 +101,7 @@ class ESHttpPublisher:
 
     def bulk_index(
         self, index_name: str, documents: list[dict[str, Any]],
+        *, timeout_ms: int | None = None,
     ) -> dict[str, Any]:
         """documents: [{"_id": grain 文档 ID, "_source": {...}}]"""
         lines: list[str] = []
@@ -107,7 +117,8 @@ class ESHttpPublisher:
             try:
                 response = self._client.post(
                     "/_bulk", content=body,
-                    headers={"Content-Type": "application/x-ndjson"})
+                    headers={"Content-Type": "application/x-ndjson"},
+                    timeout=self._request_timeout(timeout_ms))
                 response.raise_for_status()
                 payload = response.json()
             except httpx.HTTPError:
@@ -146,6 +157,7 @@ class ESHttpPublisher:
     def switch_alias(
         self, alias_name: str, index_name: str,
         previous_index: str | None = None,
+        *, timeout_ms: int | None = None,
     ) -> None:
         actions = [{"add": {"index": index_name, "alias": alias_name}}]
         if previous_index:
@@ -153,16 +165,41 @@ class ESHttpPublisher:
                                           "alias": alias_name}})
         try:
             response = self._client.post(
-                "/_aliases", content=json.dumps({"actions": actions}))
+                "/_aliases", content=json.dumps({"actions": actions}),
+                timeout=self._request_timeout(timeout_ms))
             response.raise_for_status()
         except httpx.HTTPError:
             raise ESPublishError(
                 "alias_switch_failed",
                 "ES 别名切换失败（alias_switch_failed）；详情已抑制") from None
 
-    def count(self, index_name: str) -> int:
+    def get_alias_index(self, alias_name: str,
+                        *, timeout_ms: int | None = None) -> str | None:
+        """别名当前指向的索引（不存在返回 None；供恢复核对）。"""
         try:
-            response = self._client.get(f"/{index_name}/_count")
+            response = self._client.get(
+                f"/_alias/{alias_name}",
+                timeout=self._request_timeout(timeout_ms))
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            indexes = list(response.json().keys())
+            return indexes[0] if indexes else None
+        except httpx.HTTPError:
+            raise ESPublishError(
+                "alias_lookup_failed",
+                "ES 别名查询失败（alias_lookup_failed）；详情已抑制") from None
+
+    def count(self, index_name: str, *, timeout_ms: int | None = None) -> int:
+        """索引文档数；**索引明确不存在**抛 index_not_found（与网络/服务
+        错误区分——恢复逻辑只有确定不存在才能走对象缺失分支）。"""
+        try:
+            response = self._client.get(
+                f"/{index_name}/_count",
+                timeout=self._request_timeout(timeout_ms))
+            if response.status_code == 404:
+                raise ESPublishError(
+                    "index_not_found", f"ES 索引不存在：{index_name}")
             response.raise_for_status()
             return int(response.json().get("count", 0))
         except httpx.HTTPError:
@@ -194,17 +231,20 @@ class FakeESPublisher(ESHttpPublisher):
     def __init__(self, *, bulk_failure_items: int = 0,
                  retryable_failure: bool = False,
                  mapping_error: bool = False, count_override: int | None = None,
-                 fail_alias_switch: bool = False):
+                 fail_alias_switch: bool = False,
+                 count_error: bool = False):
         self.indices: dict[str, dict[str, Any]] = {}
         self.documents: dict[str, list[dict[str, Any]]] = {}
         self.aliases: dict[str, str] = {}
         self.alias_history: list[tuple[str, str | None]] = []
         self.bulk_calls = 0
+        self.request_timeouts: list[int | None] = []
         self._bulk_failure_items = bulk_failure_items
         self._retryable_failure = retryable_failure
         self._mapping_error = mapping_error
         self._count_override = count_override
         self._fail_alias_switch = fail_alias_switch
+        self._count_error = count_error
 
     def ping(self) -> dict[str, Any]:
         return {"ok": True, "version": "fake-8.0.0", "cluster_name": "fake"}
@@ -212,7 +252,8 @@ class FakeESPublisher(ESHttpPublisher):
     def close(self) -> None:
         return None
 
-    def create_version_index(self, index_name, mapping):
+    def create_version_index(self, index_name, mapping, *, timeout_ms=None):
+        self.request_timeouts.append(timeout_ms)
         if index_name in self.indices:
             raise ESPublishError(
                 "index_exists",
@@ -220,8 +261,9 @@ class FakeESPublisher(ESHttpPublisher):
         self.indices[index_name] = mapping
         self.documents[index_name] = []
 
-    def bulk_index(self, index_name, documents):
+    def bulk_index(self, index_name, documents, *, timeout_ms=None):
         self.bulk_calls += 1
+        self.request_timeouts.append(timeout_ms)
         if self._mapping_error:
             raise ESPublishError(
                 "bulk_permanent_failure",
@@ -246,7 +288,9 @@ class FakeESPublisher(ESHttpPublisher):
         return {"indexed": len(documents), "retried": 1
                 if self._retryable_failure else 0, "permanent_failures": []}
 
-    def switch_alias(self, alias_name, index_name, previous_index=None):
+    def switch_alias(self, alias_name, index_name, previous_index=None,
+                     *, timeout_ms=None):
+        self.request_timeouts.append(timeout_ms)
         if self._fail_alias_switch:
             raise ESPublishError(
                 "alias_switch_failed",
@@ -254,7 +298,20 @@ class FakeESPublisher(ESHttpPublisher):
         self.aliases[alias_name] = index_name
         self.alias_history.append((alias_name, previous_index))
 
-    def count(self, index_name):
+    def get_alias_index(self, alias_name, *, timeout_ms=None):
+        self.request_timeouts.append(timeout_ms)
+        return self.aliases.get(alias_name)
+
+    def count(self, index_name, *, timeout_ms=None):
+        self.request_timeouts.append(timeout_ms)
+        if index_name not in self.indices:
+            # 与真实实现一致：索引明确不存在 ≠ 网络错误
+            raise ESPublishError(
+                "index_not_found", f"ES 索引不存在：{index_name}")
+        if self._count_error:
+            raise ESPublishError(
+                "count_failed",
+                "ES 文档计数失败（count_failed）；详情已抑制")
         if self._count_override is not None:
             return self._count_override
         return len(self.documents.get(index_name, []))

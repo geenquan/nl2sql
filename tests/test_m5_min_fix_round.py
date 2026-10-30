@@ -346,19 +346,20 @@ class TestFormalBudget:
         finally:
             executor.close()
 
-    def test_byte_cap_marks_truncated(self, env):
-        """结果字节上限：超限即停并如实标记截断。"""
+    def test_byte_cap_rejects_over_limit_result(self, env):
+        """结果字节上限：超限抛领域异常（恢复修复轮语义更正——
+        字节超限不是预览截断，不得把超限批次交回调用方消费）。"""
         from app.adapters.dataset_executors import SQLiteControlledExecutor
+        from app.core.exceptions import ValidationResultBudgetExceededError
 
         executor = SQLiteControlledExecutor(
             env["data_url"], {f"{SCHEMA}.booking"}, {f"{SCHEMA}.booking": {"id"}},
             max_result_bytes=2, attach=_attach_map(env))
         try:
-            rows, truncated = executor.execute(
-                f"SELECT `id` FROM `{SCHEMA}`.`booking`", {},
-                max_rows=10, timeout_ms=1000)
-            assert truncated is True
-            assert len(rows) >= 1  # 已取批次如实返回
+            with pytest.raises(ValidationResultBudgetExceededError):
+                executor.execute(
+                    f"SELECT `id` FROM `{SCHEMA}`.`booking`", {},
+                    max_rows=10, timeout_ms=1000)
         finally:
             executor.close()
 
@@ -483,14 +484,18 @@ class TestFormalBudget:
         assert recorded["max_result_bytes"] == 99
 
 
-# == 附加：ES 失败发布不保留 active 锁 ===========================================
+# == 附加：ES 失败发布进入待核对占用（恢复修复轮语义更正） =======================
 
 
-class TestESLockRelease:
-    def test_needs_reconciliation_releases_lock(self, env):
-        """ES 发布外部索引已建但计数不符 → needs_reconciliation；
-        锁必须释放（否则 reconcile 永远无法取得占用，恢复路径死锁）。"""
+class TestESPendingLock:
+    def test_needs_reconciliation_keeps_pending_and_reconcile_claims(
+            self, env):
+        """ES 发布外部索引已建但计数不符 → needs_reconciliation +
+        **pending 占用保留**（语义更正：上一轮"释放锁"会让待恢复状态被
+        新发布绕过；本轮改为 pending，由 reconcile 原子认领——恢复可达
+        且不可绕过）。"""
         from app.adapters.es_publisher import FakeESPublisher
+        from app.core.exceptions import RevisionConflictError
         from tests.dataset_fixtures import aggregate_definition
 
         fake = FakeESPublisher(count_override=999)
@@ -508,8 +513,19 @@ class TestESLockRelease:
             service.publish(dataset_id, version)
         assert service.get_dataset(dataset_id, version)["status"] \
             == "needs_reconciliation"
-        # 修复点：不保留 active 锁
-        assert env["repo"].get_active_publish_lock(dataset_id) is None
-        # 恢复路径可以取得占用并运行（不被残留锁拒绝）
+        # 占用保留为 pending（不是空闲；不是 active）
+        lock = env["repo"].get_active_publish_lock(dataset_id)
+        assert lock is not None and lock["status"] == "pending"
+        # 恢复路径可以认领并运行（数量不符 → 不恢复，退回 pending）
         reconciled = service.reconcile(dataset_id, version)
-        assert reconciled["reconciled"] == "expected_unknown"
+        assert reconciled["reconciled"] == "external_index_incomplete"
+        after_lock = env["repo"].get_active_publish_lock(dataset_id)
+        assert after_lock is not None and after_lock["status"] == "pending"
+        # 待核对占用不被新版本发布绕过（v2 修订→验证→发布被 409 拒绝）
+        revised = service.revise_dataset(
+            dataset_id, version, {"join_type": "left"})
+        service.validate(revised["dataset_id"], revised["version"])
+        with pytest.raises(RevisionConflictError):
+            service.publish(revised["dataset_id"], revised["version"])
+        assert service.get_dataset(dataset_id, version)["status"] \
+            == "needs_reconciliation"

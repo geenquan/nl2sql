@@ -1,6 +1,50 @@
 # 开发交接报告
 
-更新时间：2026-10-30（M5 最后定点修复轮：恢复前置指针核对+别名防护、创建结果不明保留 pending、ES 请求保留有限默认超时+多请求按剩余期限递减；新增 14 项回归（10 项先在旧实现失败），全量 739 passed；全部离线验证）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+更新时间：2026-10-30（M5 创建超期误释放占用定点修复：收紧"确定未创建"分类——ESPublishError 继承 ValueError 使 deadline_exhausted 被误判；create_version_index 按 PUT 是否已发出区分超期（发出后超期=结果不明）；新增 3 项回归（2 项先在旧实现失败，含真实 ESHttpPublisher+MockTransport+DatasetService 跨层验证），全量 742 passed；全部离线验证）。本报告记录实际环境和验证结果，后续开发仍需按改动复验。
+
+## M5 创建超期误释放占用定点修复（2026-10-30，一项 P1，回归先行）
+
+- 根因（复现，两处叠加）：
+  1. `dataset_service._creation_definitely_absent` 末尾的
+     `isinstance(exc, ValueError)` 判断过宽——ESPublishError 继承
+     ValueError，`deadline_exhausted` 等外部操作异常被误判为"确定
+     未创建"→ failed_publish+释放占用；
+  2. `es_publisher.create_version_index` 在 PUT 返回后做期限检查并抛
+     `ESPublishError(deadline_exhausted)`——服务端已创建成功、仅响应
+     返回时超期的情形，被上层按确定失败释放，结果未明的发布被下一次
+     发布绕过。
+- 修改：
+  - `_creation_definitely_absent` 收紧为只认明确标记分类
+    （index_exists / index_create_rejected / invalid_timeout）；不再凭
+    异常文本或 ValueError 继承关系判断——deadline_exhausted 无法区分
+    发生在创建请求前后，且"方法没有正常返回"≠"服务端没有执行"，
+    一律 False 保守进 pending；视图参数校验（ValueError，DDL 前）由
+    _publish_view 的 except ValueError 分支结构化处理，不经本分类器。
+  - `create_version_index` 以局部标记 `put_issued` 区分创建 PUT 是否
+    已开始发出：PUT 未发出时超期（HEAD 前后）→ deadline_exhausted
+    （只读 HEAD 至多发出过，不声称已创建）；PUT 已发出后的超期/
+    响应丢失/连接中断/5xx/正常返回但返回后超期 →
+    ExternalOutcomeUnknownError（固定安全文案）。保留 HEAD/PUT 剩余
+    期限计算、有限默认超时、4xx 明确拒绝分类；重试次数不变。
+  - 服务层收尾不变：结果不明 → needs_reconciliation + active→pending，
+    finally 不释放为 failed/completed，不导出/不切 alias/不提交指针；
+    不自动重导出或清理索引。
+- 回归（`tests/test_m5_creation_outcome_round.py` 3 项，2 项修复前
+  失败）：
+  - 跨层（真实 ESHttpPublisher + httpx.MockTransport + DatasetService，
+    不依赖 FakeESPublisher 直接抛异常）：v1 经真实 HTTP 路径正常发布；
+    v2 的 PUT 在模拟服务端记录"索引已创建"后推进注入时钟 400s 越过
+    ~300s 操作期限并返回 200 → 断言 HEAD/PUT 确实发出、v2 索引存在、
+    异常为 ExternalOutcomeUnknownError、needs_reconciliation+pending、
+    v2 无 bulk/alias/指针提交（全局恰一次 bulk/count/alias，均属 v1）、
+    v3 发布与 rollback(v1) 均 409 且请求数与已建索引数不变；
+  - 分类守护：ESPublishError(deadline_exhausted) 判为非确定未创建
+    （修复前 True）；index_exists/rejected/invalid_timeout 仍 True；
+  - PUT 发出前耗尽（HEAD 推进 11s/10s）：不发送 PUT、异常为
+    deadline_exhausted（非结果不明）、服务端未记录创建。
+- 验证：`python -m pytest -q` → **742 passed, 9 skipped**；ruff
+  （app tests scripts）/ pip check 通过（全部离线；真实 MySQL/ES 发布
+  仍未验证）。
 
 ## M5 最后定点修复轮（2026-10-30，三项，回归先行）
 

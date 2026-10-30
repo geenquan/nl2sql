@@ -136,7 +136,11 @@ M1 接口与命令示例见 README；扫描为同步执行，后台任务、增�
   （恢复前置指针核对+别名防护——已知冲突不产生外部副作用；创建结果
   不明（响应丢失/5xx）保留 pending 不被绕过；ES 请求保留有限默认超时
   （HTTPX timeout=None 是关闭超时）+HEAD/PUT/bulk 重试按剩余期限递减
-  +reconcile 共享期限；回归 14 项，全量 739）。
+  +reconcile 共享期限；回归 14 项，全量 739）；创建超期误释放占用
+  定点修复（"确定未创建"只认明确标记分类——ESPublishError 继承
+  ValueError 不再误判 deadline_exhausted；创建 PUT 发出后超期/响应
+  丢失统一 ExternalOutcomeUnknownError 保守 pending；真实
+  ESHttpPublisher+MockTransport 跨层回归；全量 742）。
 - 已知限制：**视图/ES 真实发布未验证**（目标默认关闭，离线闭环验证）；
   一跳预聚合；时点质量证据；显式串行刷新。
 

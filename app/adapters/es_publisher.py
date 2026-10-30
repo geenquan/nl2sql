@@ -123,11 +123,20 @@ class ESHttpPublisher:
         self, index_name: str, mapping: dict[str, Any],
         *, timeout_ms: int | None = None,
     ) -> None:
-        """创建版本索引。结果不明分类（最后修复轮）：传输层错误/连接中断/
-        5xx → ExternalOutcomeUnknownError（服务端可能已创建，不得当确定
-        失败释放占用）；明确 4xx 拒绝 → index_create_rejected（确定未创建）；
-        已存在（HEAD 200）→ index_exists（确定状态）。"""
+        """创建版本索引。结果分类（创建超期定点修复轮，按 PUT 是否已
+        发出区分）：
+        - PUT 未发出时超期（HEAD 前后）：deadline_exhausted——只读 HEAD
+          至多发出过，不应声称已创建；
+        - PUT 已发出后的超期/响应丢失/连接中断/服务端 5xx：
+          ExternalOutcomeUnknownError——服务端可能已创建，"方法没有正常
+          返回"≠"服务端没有执行"；
+        - PUT 正常返回但返回后期限检查失败：同样 ExternalOutcomeUnknown
+          Error（索引可能已建成，超期结果不得当确定失败释放占用）；
+        - 明确 4xx 拒绝 → index_create_rejected（确定未创建）；
+        - 已存在（HEAD 200）→ index_exists（确定状态）。
+        """
         deadline = self._deadline_from(timeout_ms)
+        put_issued = False  # 局部标记：创建 PUT 是否已开始发出
         try:
             response = self._client.head(
                 f"/{index_name}",
@@ -139,10 +148,18 @@ class ESHttpPublisher:
                     f"版本索引已存在：{index_name}（不覆盖；不删除）")
             body = {"mappings": mapping, "settings": {
                 "number_of_shards": 1, "number_of_replicas": 0}}
+            put_timeout = self._request_timeout_before(deadline)
+            put_issued = True
             response = self._client.put(
                 f"/{index_name}", content=json.dumps(body),
-                timeout=self._request_timeout_before(deadline))
-            self._check_deadline(deadline)
+                timeout=put_timeout)
+            if put_issued and deadline is not None \
+                    and self._monotonic() >= deadline:
+                # PUT 已发出（服务端可能已创建）：超期不得当确定失败
+                raise ExternalOutcomeUnknownError(
+                    "index_create_unknown",
+                    "ES 索引创建请求已发出但操作期限耗尽：结果不明；"
+                    "详情已抑制")
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code >= 500:

@@ -526,21 +526,24 @@ class DatasetService:
     def _creation_definitely_absent(exc: Exception) -> bool:
         """创建调用异常是否"确定未产生外部副作用"（可 failed+释放占用）。
 
-        分类（最后修复轮）：
-        - index_exists / 明确已存在：服务端明确状态（非本次创建）；
+        只认**明确标记**的分类，不凭异常文本或继承关系判断——
+        ESPublishError 继承 ValueError，普通 ValueError 判断会把
+        deadline_exhausted 等外部操作异常误判为"确定未创建"（创建超期
+        定点修复轮）。保留的分类：
+        - index_exists：HEAD 明确 200（服务端确定状态，非本次创建）；
         - index_create_rejected：4xx 明确拒绝（未创建）；
-        - invalid_timeout：请求发出前被拒（无副作用）；
-        - ValueError（视图定义参数校验，DDL 连接前）；
-        其余（网络/响应丢失/服务端 5xx/期限中止）一律视为结果不明——
-        服务端可能已创建，不得释放占用。
+        - invalid_timeout：任何请求发出前被拒（无副作用）。
+        视图参数校验（ValueError，DDL 连接前）由 _publish_view 的
+        except ValueError 分支结构化处理，不经本分类器。
+        其余（含 deadline_exhausted——无法区分超期发生在创建请求前后，
+        且"方法没有正常返回"≠"服务端没有执行"）一律 False：保守进入
+        pending，不释放占用。
         """
         if isinstance(exc, ExternalOutcomeUnknownError):
             return False
         reason = getattr(exc, "reason", "")
-        if reason in ("index_exists", "index_create_rejected",
-                      "invalid_timeout"):
-            return True
-        return isinstance(exc, ValueError) and "已存在" not in str(exc)
+        return reason in ("index_exists", "index_create_rejected",
+                          "invalid_timeout")
 
     def _finish_lock(self, dataset_id: str, run_id: str,
                      final: str | None, external_side: bool) -> None:
